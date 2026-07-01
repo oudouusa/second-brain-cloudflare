@@ -3,6 +3,7 @@ import { COMPRESSION_IMPORTANCE_THRESHOLD, COMPRESSION_MIN_RECALL } from "../../
 export class D1Mock {
   entries: any[] = [];
   edges: any[] = [];
+  usageEvents: any[] = [];
 
   prepare(sql: string) {
     const s = sql.replace(/\s+/g, " ").trim();
@@ -13,6 +14,11 @@ export class D1Mock {
         if (s.startsWith("INSERT INTO entries")) {
           const [id, content, tags, source, created_at, vector_ids] = args;
           db.entries.push({ id, content, tags, source, created_at, vector_ids, recall_count: 0, importance_score: 0, contradiction_wins: 0, contradiction_losses: 0 });
+          return { meta: { changes: 1 } };
+        }
+        if (s.startsWith("INSERT INTO usage_events")) {
+          const [id, operation, model, status, input_chars, max_output_tokens, duration_ms, error, metadata, created_at] = args;
+          db.usageEvents.push({ id, operation, model, status, input_chars, max_output_tokens, duration_ms, error, metadata, created_at });
           return { meta: { changes: 1 } };
         }
         if (s.startsWith("UPDATE entries SET content = ?, vector_ids")) {
@@ -187,6 +193,25 @@ export class D1Mock {
           const results = db.entries
             .filter((e: any) => (JSON.parse(e.tags ?? "[]") as string[]).includes(tag))
             .map((e: any) => ({ id: e.id, vector_ids: e.vector_ids ?? "[]", content: e.content, tags: e.tags, source: e.source, created_at: e.created_at }));
+          return { results };
+        }
+        if (s.includes("FROM usage_events") && s.includes("ORDER BY created_at ASC")) {
+          const after = Number(args[0]);
+          const before = Number(args[1]);
+          const limit = Number(args[2]);
+          const results = [...db.usageEvents]
+            .filter((e: any) => e.created_at >= after && e.created_at <= before)
+            .sort((a: any, b: any) => a.created_at - b.created_at)
+            .slice(0, limit)
+            .map((e: any) => ({
+              operation: e.operation,
+              model: e.model,
+              status: e.status,
+              input_chars: e.input_chars,
+              max_output_tokens: e.max_output_tokens,
+              duration_ms: e.duration_ms,
+              created_at: e.created_at,
+            }));
           return { results };
         }
         if (s.includes("WHERE content LIKE") && s.includes("ORDER BY created_at DESC LIMIT")) {
@@ -406,5 +431,5 @@ export class D1Mock {
 
   async exec(_sql: string) { }
   async batch(stmts: any[]) { return Promise.all(stmts.map((s: any) => s.run())); }
-  reset() { this.entries = []; this.edges = []; }
+  reset() { this.entries = []; this.edges = []; this.usageEvents = []; }
 }

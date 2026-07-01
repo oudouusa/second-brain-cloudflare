@@ -78,6 +78,21 @@ const INSIGHT_MAX_TOKENS = 300;
 const PATTERN_MAX_TOKENS = 100;
 const DIGEST_MAX_TOKENS = 400;
 
+// ─── Usage estimation constants ──────────────────────────────────────────────
+// Cloudflare exposes Workers AI billing in Neurons, not exact token counts. The
+// Worker API response does not reliably include usage data for streaming calls, so
+// this ledger records deterministic upper-bound inputs: prompt chars and configured
+// max output tokens. The token conversion is intentionally conservative and surfaced
+// as an estimate in /usage.
+
+const WORKERS_AI_FREE_NEURONS_PER_DAY = 10000;
+const ESTIMATED_CHARS_PER_TOKEN = 4;
+
+const MODEL_NEURON_RATES: Record<string, { input: number; output: number }> = {
+  "@cf/baai/bge-small-en-v1.5": { input: 1841, output: 0 },
+  "@cf/meta/llama-4-scout-17b-16e-instruct": { input: 24545, output: 77273 },
+};
+
 // ─── Vectorize constants ──────────────────────────────────────────────────────
 
 const VECTORIZE_FIX_HINT =
@@ -540,6 +555,255 @@ function json(data: unknown, status = 200): Response {
   });
 }
 
+type AiUsageStatus = "success" | "error";
+
+interface AiUsageEventInput {
+  operation: string;
+  model: string;
+  status: AiUsageStatus;
+  inputChars: number;
+  maxOutputTokens: number;
+  durationMs: number;
+  error?: string;
+  metadata?: Record<string, unknown>;
+  createdAt?: number;
+}
+
+interface AiUsageEventRow {
+  operation: string;
+  model: string;
+  status: AiUsageStatus;
+  input_chars: number;
+  max_output_tokens: number;
+  duration_ms: number;
+  created_at: number;
+}
+
+function estimateTextChars(value: unknown): number {
+  if (typeof value === "string") return value.length;
+  if (Array.isArray(value)) return value.reduce((sum, item) => sum + estimateTextChars(item), 0);
+  if (value && typeof value === "object") {
+    const maybeText = (value as Record<string, unknown>).text;
+    if (typeof maybeText === "string") return maybeText.length;
+  }
+  return 0;
+}
+
+export function estimateAiInputChars(payload: Record<string, unknown>): number {
+  let chars = 0;
+  chars += estimateTextChars(payload.text);
+  chars += estimateTextChars(payload.prompt);
+  if (Array.isArray(payload.messages)) {
+    chars += payload.messages.reduce((sum, message) => {
+      const content = message && typeof message === "object"
+        ? (message as Record<string, unknown>).content
+        : message;
+      return sum + estimateTextChars(content);
+    }, 0);
+  }
+  return chars;
+}
+
+function estimateTokensFromChars(chars: number): number {
+  return Math.ceil(Math.max(0, chars) / ESTIMATED_CHARS_PER_TOKEN);
+}
+
+function estimateNeurons(model: string, inputChars: number, maxOutputTokens: number): number {
+  const rate = MODEL_NEURON_RATES[model];
+  if (!rate) return 0;
+  const inputTokens = estimateTokensFromChars(inputChars);
+  return (inputTokens * rate.input + Math.max(0, maxOutputTokens) * rate.output) / 1_000_000;
+}
+
+function round(value: number, digits = 3): number {
+  const factor = 10 ** digits;
+  return Math.round(value * factor) / factor;
+}
+
+async function ensureUsageEventsTable(env: Env): Promise<void> {
+  await env.DB.exec(`CREATE TABLE IF NOT EXISTS usage_events (id TEXT PRIMARY KEY, operation TEXT NOT NULL, model TEXT NOT NULL, status TEXT NOT NULL, input_chars INTEGER NOT NULL DEFAULT 0, max_output_tokens INTEGER NOT NULL DEFAULT 0, duration_ms INTEGER NOT NULL DEFAULT 0, error TEXT, metadata TEXT NOT NULL DEFAULT '{}', created_at INTEGER NOT NULL)`);
+  await env.DB.exec(`CREATE INDEX IF NOT EXISTS idx_usage_events_created_at ON usage_events(created_at DESC)`);
+  await env.DB.exec(`CREATE INDEX IF NOT EXISTS idx_usage_events_operation ON usage_events(operation, created_at DESC)`);
+}
+
+async function insertAiUsageEvent(env: Env, event: AiUsageEventInput): Promise<void> {
+  await env.DB.prepare(
+    `INSERT INTO usage_events (id, operation, model, status, input_chars, max_output_tokens, duration_ms, error, metadata, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).bind(
+    crypto.randomUUID(),
+    event.operation,
+    event.model,
+    event.status,
+    event.inputChars,
+    event.maxOutputTokens,
+    event.durationMs,
+    event.error?.slice(0, 500) ?? null,
+    JSON.stringify(event.metadata ?? {}),
+    event.createdAt ?? Date.now(),
+  ).run();
+}
+
+export async function recordAiUsageEvent(env: Env, event: AiUsageEventInput): Promise<void> {
+  try {
+    await insertAiUsageEvent(env, event);
+  } catch {
+    try {
+      await ensureUsageEventsTable(env);
+      await insertAiUsageEvent(env, event);
+    } catch (e) {
+      console.error("AI usage event write failed (non-fatal):", e);
+    }
+  }
+}
+
+async function runAi<T>(
+  env: Env,
+  operation: string,
+  model: string,
+  payload: Record<string, unknown>,
+): Promise<T> {
+  const startedAt = Date.now();
+  const inputChars = estimateAiInputChars(payload);
+  const maxOutputTokens = typeof payload.max_tokens === "number" ? payload.max_tokens : 0;
+  try {
+    const result = await (env.AI as any).run(model as any, payload as any);
+    await recordAiUsageEvent(env, {
+      operation,
+      model,
+      status: "success",
+      inputChars,
+      maxOutputTokens,
+      durationMs: Date.now() - startedAt,
+      metadata: { stream: payload.stream === true },
+    });
+    return result as T;
+  } catch (e) {
+    await recordAiUsageEvent(env, {
+      operation,
+      model,
+      status: "error",
+      inputChars,
+      maxOutputTokens,
+      durationMs: Date.now() - startedAt,
+      error: e instanceof Error ? e.message : String(e),
+      metadata: { stream: payload.stream === true },
+    });
+    throw e;
+  }
+}
+
+function utcDayStartMs(now = Date.now()): number {
+  const d = new Date(now);
+  return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate());
+}
+
+export async function summarizeAiUsage(
+  env: Env,
+  params: { after?: number; before?: number; limit?: number } = {},
+): Promise<Record<string, unknown>> {
+  const now = Date.now();
+  const after = Number.isFinite(params.after) ? params.after! : utcDayStartMs(now);
+  const before = Number.isFinite(params.before) ? params.before! : now;
+  const requestedLimit = Number.isFinite(params.limit) ? params.limit! : 5000;
+  const limit = Math.min(Math.max(requestedLimit, 1), 50000);
+  const { results } = await env.DB.prepare(
+    `SELECT operation, model, status, input_chars, max_output_tokens, duration_ms, created_at
+     FROM usage_events
+     WHERE created_at >= ? AND created_at <= ?
+     ORDER BY created_at ASC
+     LIMIT ?`
+  ).bind(after, before, limit).all() as { results: AiUsageEventRow[] };
+
+  const groups = new Map<string, {
+    operation: string;
+    model: string;
+    status: AiUsageStatus;
+    events: number;
+    input_chars: number;
+    max_output_tokens: number;
+    duration_ms: number;
+    estimated_input_tokens: number;
+    estimated_output_tokens_upper: number;
+    estimated_neurons_upper: number;
+  }>();
+
+  for (const row of results) {
+    const key = `${row.operation}\0${row.model}\0${row.status}`;
+    const group = groups.get(key) ?? {
+      operation: row.operation,
+      model: row.model,
+      status: row.status,
+      events: 0,
+      input_chars: 0,
+      max_output_tokens: 0,
+      duration_ms: 0,
+      estimated_input_tokens: 0,
+      estimated_output_tokens_upper: 0,
+      estimated_neurons_upper: 0,
+    };
+    group.events += 1;
+    group.input_chars += row.input_chars;
+    group.max_output_tokens += row.max_output_tokens;
+    group.duration_ms += row.duration_ms;
+    group.estimated_input_tokens += estimateTokensFromChars(row.input_chars);
+    group.estimated_output_tokens_upper += row.max_output_tokens;
+    group.estimated_neurons_upper += estimateNeurons(row.model, row.input_chars, row.max_output_tokens);
+    groups.set(key, group);
+  }
+
+  const byOperation = [...groups.values()].map(group => {
+    const avgNeurons = group.events ? group.estimated_neurons_upper / group.events : 0;
+    return {
+      ...group,
+      estimated_neurons_upper: round(group.estimated_neurons_upper, 4),
+      avg_duration_ms: Math.round(group.duration_ms / Math.max(1, group.events)),
+      estimated_free_day_events_at_average: avgNeurons > 0
+        ? Math.floor(WORKERS_AI_FREE_NEURONS_PER_DAY / avgNeurons)
+        : null,
+    };
+  });
+
+  const totals = byOperation.reduce((acc, group) => {
+    acc.events += group.events as number;
+    acc.input_chars += group.input_chars as number;
+    acc.max_output_tokens += group.max_output_tokens as number;
+    acc.estimated_input_tokens += group.estimated_input_tokens as number;
+    acc.estimated_output_tokens_upper += group.estimated_output_tokens_upper as number;
+    acc.estimated_neurons_upper += group.estimated_neurons_upper as number;
+    return acc;
+  }, {
+    events: 0,
+    input_chars: 0,
+    max_output_tokens: 0,
+    estimated_input_tokens: 0,
+    estimated_output_tokens_upper: 0,
+    estimated_neurons_upper: 0,
+  });
+
+  const avgTotalNeurons = totals.events ? totals.estimated_neurons_upper / totals.events : 0;
+
+  return {
+    generated_at: now,
+    window: { after, before },
+    truncated: results.length >= limit,
+    free_plan: {
+      workers_ai_neurons_per_utc_day: WORKERS_AI_FREE_NEURONS_PER_DAY,
+      reset: "00:00 UTC",
+    },
+    estimate_note: "Input tokens are estimated at 4 chars/token. Output tokens use configured max_tokens, so streaming calls without max_tokens only include input cost and bounded calls are upper-bound estimates.",
+    totals: {
+      ...totals,
+      estimated_neurons_upper: round(totals.estimated_neurons_upper, 4),
+      estimated_free_day_events_at_average: avgTotalNeurons > 0
+        ? Math.floor(WORKERS_AI_FREE_NEURONS_PER_DAY / avgTotalNeurons)
+        : null,
+      estimated_free_day_used_ratio_upper: round(totals.estimated_neurons_upper / WORKERS_AI_FREE_NEURONS_PER_DAY, 6),
+    },
+    by_operation: byOperation,
+  };
+}
+
 // Returns a 401 Response if the request lacks a valid token, otherwise null —
 // lets routes early-return with `const authErr = requireAuth(...); if (authErr) return authErr;`
 function requireAuth(request: Request, env: Env): Response | null {
@@ -605,7 +869,7 @@ function loginHtml(error?: string): string {
 
 async function embed(text: string, env: Env): Promise<number[]> {
   // Workers AI requires `as any` here — the SDK types don't cover all models
-  const result = (await env.AI.run(EMBEDDING_MODEL as any, { text: [text] })) as any;
+  const result = await runAi<any>(env, "embedding", EMBEDDING_MODEL, { text: [text] });
   return result.data[0] as number[];
 }
 
@@ -650,6 +914,7 @@ async function initializeDatabase(env: Env): Promise<void> {
     await env.DB.exec(`CREATE TABLE IF NOT EXISTS entries (id TEXT PRIMARY KEY, content TEXT NOT NULL, tags TEXT NOT NULL DEFAULT '[]', source TEXT NOT NULL DEFAULT 'api', created_at INTEGER NOT NULL, vector_ids TEXT NOT NULL DEFAULT '[]')`);
     await env.DB.exec(`CREATE INDEX IF NOT EXISTS idx_entries_created_at ON entries(created_at DESC)`);
     await env.DB.exec(`CREATE INDEX IF NOT EXISTS idx_entries_source ON entries(source)`);
+    await ensureUsageEventsTable(env);
     // Relationship graph (issue #16). One additive table — never touches existing
     // rows/queries, so old code ignores it and rollback is a no-op. Designed to never
     // need an ALTER: type/provenance are free TEXT validated in code, and metadata is
@@ -779,7 +1044,7 @@ Respond with JSON only. No text outside the JSON.
 {"action":"keep_both"} OR {"action":"contradiction","conflicting_id":"<id>","reason":"<10 words max>"} OR {"action":"replace","target_id":"<id>"} OR {"action":"merge","target_id":"<id>","merged_content":"<text>"}`;
 
           try {
-            const stream = await (env.AI as any).run(LLM_MODEL as any, {
+            const stream = await runAi<ReadableStream>(env, "smart_merge", LLM_MODEL, {
               messages: [{ role: "user", content: prompt }],
               max_tokens: SMART_MERGE_MAX_TOKENS,
               stream: true,
@@ -827,7 +1092,7 @@ Respond with JSON only. No text outside the JSON object.
 {"contradicts": false} OR {"contradicts": true, "conflicting_id": "<exact_id>", "reason": "<10 words max>"}`;
 
           try {
-            const stream = await (env.AI as any).run(LLM_MODEL as any, {
+            const stream = await runAi<ReadableStream>(env, "contradiction_check", LLM_MODEL, {
               messages: [{ role: "user", content: prompt }],
               max_tokens: CONTRADICTION_MAX_TOKENS,
               stream: true,
@@ -1050,7 +1315,7 @@ function parseClassification(text: string): { importance: number; canonical: boo
 export async function classifyEntry(content: string, env: Env): Promise<{ importance: number; canonical: boolean; kind: MemoryKind | null }> {
   let text: string;
   try {
-    const stream = await env.AI.run(LLM_MODEL as any, {
+    const stream = await runAi<ReadableStream>(env, "classify", LLM_MODEL, {
       messages: [{ role: "user", content:
         `Classify this memory. Respond with ONLY one JSON object and nothing else — no prose, no markdown, no code fences.\n` +
         `{"importance": <1-5>, "canonical": <true|false>, "kind": "episodic"|"semantic"}\n` +
@@ -1098,7 +1363,7 @@ export async function inferQueryTags(query: string, env: Env): Promise<string[]>
   if (!knownTags.length) return [];
 
   try {
-    const stream = await env.AI.run(LLM_MODEL as any, {
+    const stream = await runAi<ReadableStream>(env, "infer_query_tags", LLM_MODEL, {
       messages: [{
         role: "user",
         content: `From this list of tags: ${knownTags.slice(0, 50).join(", ")}\n\nWhich tags best match this query? Reply with only a comma-separated list of matching tag names from the list, or nothing if none apply.\n\nQuery: ${query.slice(0, 300)}`,
@@ -1323,7 +1588,7 @@ Write a brief insight (2-4 sentences).`;
 
   let insight = "";
   try {
-    const stream = await (env.AI as any).run(LLM_MODEL as any, {
+    const stream = await runAi<ReadableStream>(env, "synthesize_insight", LLM_MODEL, {
       messages: [{ role: "user", content: prompt }],
       max_tokens: INSIGHT_MAX_TOKENS,
       stream: true,
@@ -1368,10 +1633,10 @@ If you find a genuine cross-memory pattern, respond with exactly ONE sentence st
 If no genuine pattern exists across 3+ memories, respond with exactly: NONE`;
 
   try {
-    const response = await (env.AI as any).run(LLM_MODEL as any, {
+    const response = await runAi<any>(env, "derive_pattern", LLM_MODEL, {
       messages: [{ role: "user", content: prompt }],
       max_tokens: PATTERN_MAX_TOKENS,
-    }) as any;
+    });
 
     const trimmed = (
       response?.choices?.[0]?.message?.content ??
@@ -1412,7 +1677,7 @@ State of "${tag}":`;
 
   let digest = "";
   try {
-    const stream = await (env.AI as any).run(LLM_MODEL as any, {
+    const stream = await runAi<ReadableStream>(env, "synthesize_digest", LLM_MODEL, {
       messages: [{ role: "user", content: prompt }],
       max_tokens: DIGEST_MAX_TOKENS,
       stream: true,
@@ -2396,6 +2661,24 @@ function buildMcpServer(env: Env, ctx: ExecutionContext): McpServer {
     }
   );
 
+  // ── usage ────────────────────────────────────────────────────────────────
+  server.registerTool(
+    "usage",
+    {
+      description: "Show today's estimated Workers AI usage for this Second Brain Worker. Use only for quota checks or budget planning.",
+      inputSchema: {
+        after: z.number().int().optional().describe("Only include usage events after this Unix ms timestamp; defaults to current UTC day start"),
+        before: z.number().int().optional().describe("Only include usage events before this Unix ms timestamp; defaults to now"),
+        limit: z.number().int().min(1).max(50000).default(5000).describe("Maximum raw usage events to include in the summary"),
+      },
+    },
+    async ({ after, before, limit }) => {
+      await initializeDatabase(env);
+      const summary = await summarizeAiUsage(env, { after, before, limit });
+      return { content: [{ type: "text", text: JSON.stringify(summary, null, 2) }] };
+    }
+  );
+
   // ── forget ───────────────────────────────────────────────────────────────
   server.registerTool(
     "forget",
@@ -2722,6 +3005,17 @@ const defaultHandler = {
       return json({ ok: vectorize.ok, vectorize });
     }
 
+    // GET /usage — estimated Workers AI usage for quota-aware operation.
+    if (url.pathname === "/usage" && request.method === "GET") {
+      const authErr = requireAuth(request, env);
+      if (authErr) return authErr;
+      await initializeDatabase(env);
+      const after = url.searchParams.has("after") ? parseInt(url.searchParams.get("after")!, 10) : undefined;
+      const before = url.searchParams.has("before") ? parseInt(url.searchParams.get("before")!, 10) : undefined;
+      const limit = url.searchParams.has("limit") ? parseInt(url.searchParams.get("limit")!, 10) : undefined;
+      return json(await summarizeAiUsage(env, { after, before, limit }));
+    }
+
     // GET /list
     if (url.pathname === "/list" && request.method === "GET") {
       const authErr = requireAuth(request, env);
@@ -2885,7 +3179,7 @@ const defaultHandler = {
       const userMessage = `Question: ${body.query}\n\nRelevant memories:\n${body.memories}`;
 
       // Workers AI requires `as any` here — the SDK types don't cover all models
-      const stream = await env.AI.run(LLM_MODEL as any, {
+      const stream = await runAi<ReadableStream>(env, "chat", LLM_MODEL, {
         messages: [
           { role: "system", content: systemPrompt },
           { role: "user", content: userMessage }
