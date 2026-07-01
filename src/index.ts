@@ -2182,7 +2182,7 @@ function buildMcpServer(env: Env, ctx: ExecutionContext): McpServer {
   server.registerTool(
     "remember",
     {
-      description: "Store an idea, task, or note in your second brain. Call this automatically whenever the user shares context, goals, decisions, or preferences.",
+      description: "Store an idea, task, or note in your second brain. Use only when the active workspace memory policy allows a durable, reusable pointer to be saved; do not call automatically for every shared context, goal, decision, or preference.",
       inputSchema: {
         content: z.string().describe("The idea, task, or note to store"),
         tags: z.array(z.string()).optional().describe("Optional tags for filtering"),
@@ -2339,7 +2339,7 @@ function buildMcpServer(env: Env, ctx: ExecutionContext): McpServer {
   server.registerTool(
     "recall",
     {
-      description: "Recall: semantically search your second brain for relevant notes and context. Call recall automatically at the start of every conversation and every 3-4 messages.",
+      description: "Recall: semantically search your second brain for relevant notes and context. Use when the active workspace memory policy allows semantic search; do not call automatically at conversation start or on a fixed message cadence.",
       inputSchema: {
         query: z.string().describe("Natural language search query"),
         topK: z.number().int().min(1).max(20).default(5).describe("Number of results"),
