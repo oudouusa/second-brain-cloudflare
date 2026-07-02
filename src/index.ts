@@ -79,8 +79,9 @@ const PATTERN_MAX_TOKENS = 100;
 const DIGEST_MAX_TOKENS = 400;
 
 // Personal MCP clients can keep a refresh token but fail to persist refreshed
-// access tokens. Avoid hourly browser re-auth loops while keeping /mcp gated.
-const MCP_OAUTH_ACCESS_TOKEN_TTL_SECONDS = 60 * 60 * 24 * 30;
+// access tokens. Use a long-lived token to avoid repeated browser re-auth while
+// keeping /mcp gated. Existing grants/clients remain explicitly revocable in KV.
+const MCP_OAUTH_ACCESS_TOKEN_TTL_SECONDS = 60 * 60 * 24 * 365 * 10;
 
 // ─── Usage estimation constants ──────────────────────────────────────────────
 // Cloudflare exposes Workers AI billing in Neurons, not exact token counts. The
