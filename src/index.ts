@@ -78,6 +78,10 @@ const INSIGHT_MAX_TOKENS = 300;
 const PATTERN_MAX_TOKENS = 100;
 const DIGEST_MAX_TOKENS = 400;
 
+// Personal MCP clients can keep a refresh token but fail to persist refreshed
+// access tokens. Avoid hourly browser re-auth loops while keeping /mcp gated.
+const MCP_OAUTH_ACCESS_TOKEN_TTL_SECONDS = 60 * 60 * 24 * 30;
+
 // ─── Usage estimation constants ──────────────────────────────────────────────
 // Cloudflare exposes Workers AI billing in Neurons, not exact token counts. The
 // Worker API response does not reliably include usage data for streaming calls, so
@@ -3264,6 +3268,9 @@ const oauthProvider = new OAuthProvider({
   authorizeEndpoint: "/oauth/authorize",
   tokenEndpoint: "/oauth/token",
   clientRegistrationEndpoint: "/oauth/register",
+  accessTokenTTL: MCP_OAUTH_ACCESS_TOKEN_TTL_SECONDS,
+  refreshTokenTTL: undefined,
+  clientRegistrationTTL: undefined,
   // Accept the static AUTH_TOKEN for Claude Desktop + mcp-remote (no browser flow).
   resolveExternalToken: async ({ token, env }) => {
     if (token === (env as Env).AUTH_TOKEN) {
