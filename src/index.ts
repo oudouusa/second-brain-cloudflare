@@ -16,6 +16,8 @@ export interface Env {
   OAUTH_KV: KVNamespace;
   VECTORIZE_GRACE_MS?: string;
   NEURON_DAILY_BUDGET?: string;
+  POINTER_CONTRACT?: string;
+  POINTER_MAX_CHARS?: string;
 }
 
 const LLM_MODEL = "@cf/meta/llama-4-scout-17b-16e-instruct";
@@ -83,6 +85,86 @@ const DIGEST_MAX_TOKENS = 400;
 // access tokens. Use a long-lived token to avoid repeated browser re-auth while
 // keeping /mcp gated. Existing grants/clients remain explicitly revocable in KV.
 const MCP_OAUTH_ACCESS_TOKEN_TTL_SECONDS = 60 * 60 * 24 * 365 * 10;
+
+// ─── Pointer contract (opt-in) ───────────────────────────────────────────────
+
+const DEFAULT_POINTER_MAX_CHARS = 1200;
+const POINTER_STANDARD_NOTICE =
+  "pointer-contract notice: consider the standard pointer form (Source of truth / Use when / Search terms) — see SECONDBRAIN.md.";
+
+type PointerContract = { maxChars: number };
+
+const POINTER_SECRET_PATTERNS: { name: string; regex: RegExp }[] = [
+  { name: "openai_or_anthropic_key", regex: /sk-[A-Za-z0-9]{20,}/ },
+  { name: "github_token", regex: /ghp_[A-Za-z0-9]{36}/ },
+  { name: "github_token", regex: /github_pat_[A-Za-z0-9_]{20,}/ },
+  { name: "aws_access_key", regex: /AKIA[0-9A-Z]{16}/ },
+  { name: "slack_token", regex: /xox[baprs]-[A-Za-z0-9-]{10,}/ },
+  { name: "private_key", regex: /-----BEGIN [A-Z ]*PRIVATE KEY-----/ },
+  { name: "jwt", regex: /eyJ[A-Za-z0-9_-]{20,}\.eyJ/ },
+  { name: "generic_secret_assignment", regex: /(api[_-]?key|secret|password|token)["']?\s*[:=]\s*["']?[A-Za-z0-9+/_-]{16,}/i },
+];
+
+class PointerContractError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "PointerContractError";
+  }
+}
+
+function pointerContract(env: Env): PointerContract | null {
+  if (env.POINTER_CONTRACT !== "1" && env.POINTER_CONTRACT !== "true") return null;
+
+  const rawMax = env.POINTER_MAX_CHARS?.trim();
+  const parsedMax = rawMax && /^[1-9]\d*$/.test(rawMax) ? Number(rawMax) : NaN;
+  const maxChars = Number.isSafeInteger(parsedMax) && parsedMax > 0
+    ? parsedMax
+    : DEFAULT_POINTER_MAX_CHARS;
+
+  return { maxChars };
+}
+
+function pointerCharLength(content: string): number {
+  return Array.from(content).length;
+}
+
+function validatePointerContent(content: string, contract: PointerContract): void {
+  const length = pointerCharLength(content);
+  if (length > contract.maxChars) {
+    throw new PointerContractError(
+      `pointer contract: content exceeds ${contract.maxChars} chars (${length}). Store the full text in canonical docs (dev-vault / repo docs) and save a short pointer instead.`
+    );
+  }
+
+  for (const pattern of POINTER_SECRET_PATTERNS) {
+    if (pattern.regex.test(content)) {
+      throw new PointerContractError(`pointer contract: secret pattern detected (${pattern.name}). Store the secret outside second-brain and save a short pointer instead.`);
+    }
+  }
+}
+
+function pointerStandardNotice(content: string, contract: PointerContract | null): string | undefined {
+  if (!contract) return undefined;
+  return /Source of truth|Use when|Search terms/i.test(content)
+    ? undefined
+    : POINTER_STANDARD_NOTICE;
+}
+
+function pointerAppendNotice(combinedContent: string, contract: PointerContract | null): string | undefined {
+  if (!contract) return undefined;
+  const advisoryLimit = contract.maxChars * 3;
+  return pointerCharLength(combinedContent) > advisoryLimit
+    ? `pointer-contract notice: combined content now exceeds ${advisoryLimit} chars; consider update (replace) or splitting, and move the body to canonical docs.`
+    : undefined;
+}
+
+function appendPointerNotice(text: string, notice?: string): string {
+  return notice ? `${text}\n${notice}` : text;
+}
+
+function withPointerNotice<T extends object>(value: T, notice?: string): T & { notice?: string } {
+  return notice ? { ...value, notice } : value;
+}
 
 // ─── Usage estimation constants ──────────────────────────────────────────────
 // Cloudflare exposes Workers AI billing in Neurons, not exact token counts. The
@@ -561,6 +643,13 @@ function json(data: unknown, status = 200): Response {
   });
 }
 
+function pointerContractJsonError(e: unknown): Response | null {
+  if (e instanceof PointerContractError) {
+    return json({ ok: false, error: e.message }, 400);
+  }
+  return null;
+}
+
 type AiUsageStatus = "success" | "error" | "blocked";
 
 interface AiUsageEventInput {
@@ -696,6 +785,9 @@ function neuronBudgetMessage(estimatedToday: number, budget: number): string {
 }
 
 function mcpReadableError(e: unknown): { content: { type: "text"; text: string }[] } | null {
+  if (e instanceof PointerContractError) {
+    return { content: [{ type: "text", text: e.message }] };
+  }
   if (e instanceof NeuronBudgetExceededError) {
     return { content: [{ type: "text", text: e.message }] };
   }
@@ -1550,7 +1642,10 @@ async function appendToEntry(
   addition: string,
   tags: string[],
   source: string
-): Promise<void> {
+): Promise<{ notice?: string }> {
+  const contract = pointerContract(env);
+  if (contract) validatePointerContent(addition, contract);
+
   // Read existing vector_ids upfront — needed by both paths
   const row = await env.DB.prepare(
     `SELECT vector_ids FROM entries WHERE id = ?`
@@ -1561,6 +1656,7 @@ async function appendToEntry(
   const timestamp = new Date().toLocaleDateString();
   const separator = `\n\n[Update ${timestamp}]: `;
   const newContent = existingContent + separator + addition;
+  const notice = pointerAppendNotice(newContent, contract);
 
   if (newContent.length > CHUNK_MAX_CHARS) {
     // ── Full re-embed path ───────────────────────────────────────────────────
@@ -1593,7 +1689,7 @@ async function appendToEntry(
       console.error("Append auto-link failed (non-fatal):", e);
     }
 
-    return;
+    return { notice };
   }
 
   // ── Normal append-only path (combined content ≤ CHUNK_MAX_CHARS) ────────────
@@ -1632,6 +1728,8 @@ async function appendToEntry(
   } catch (e) {
     console.error("Append auto-link failed (non-fatal):", e);
   }
+
+  return { notice };
 }
 
 // ─── Synthesize insight from retrieved memories ───────────────────────────────
@@ -2322,14 +2420,15 @@ function scheduleClassifyAndTag(entryId: string, content: string, env: Env, ctx:
   );
 }
 
-export type CaptureResult =
+export type CaptureResult = (
   | { status: "blocked"; matchId: string; score: number }
   | { status: "stored"; id: string }
   | { status: "flagged"; id: string; matchId: string; score: number }
   | { status: "contradiction"; id: string; resolvedConflict: string; reason?: string }
   | { status: "contradiction_protected"; id: string; canonicalId: string; reason?: string }
   | { status: "merged"; id: string }
-  | { status: "replaced"; id: string };
+  | { status: "replaced"; id: string }
+) & { notice?: string };
 
 export async function captureEntry(
   rawContent: string,
@@ -2339,6 +2438,10 @@ export async function captureEntry(
   ctx: ExecutionContext
 ): Promise<CaptureResult> {
   const raw = rawContent.trim();
+  const contract = pointerContract(env);
+  if (contract) validatePointerContent(raw, contract);
+  const notice = pointerStandardNotice(raw, contract);
+
   const { cleanContent, hashtags } = extractHashtags(raw);
   const c = cleanContent || raw;
   const t = [...new Set([...tags.map(tag => tag.toLowerCase()), ...hashtags])];
@@ -2353,6 +2456,7 @@ export async function captureEntry(
   if (dup.status === "flagged" && mergeAction && mergeAction.action !== "keep_both") {
     const targetId = mergeAction.target_id;
     const newContent = mergeAction.action === "merge" ? mergeAction.merged_content : c;
+    if (contract) validatePointerContent(newContent, contract);
 
     const targetRow = await env.DB.prepare(
       `SELECT tags, source, vector_ids, importance_score FROM entries WHERE id = ?`
@@ -2388,8 +2492,8 @@ export async function captureEntry(
       scheduleClassifyAndTag(targetId, newContent, env, ctx);
 
       return mergeAction.action === "merge"
-        ? { status: "merged", id: targetId }
-        : { status: "replaced", id: targetId };
+        ? withPointerNotice({ status: "merged", id: targetId }, notice)
+        : withPointerNotice({ status: "replaced", id: targetId }, notice);
     }
     // target not found in DB — fall through to normal insert
   }
@@ -2432,7 +2536,7 @@ export async function captureEntry(
       } catch (e) {
         console.error("Contradiction count update failed (non-fatal):", e);
       }
-      return { status: "contradiction_protected", id, canonicalId: conflictId, reason: contradiction.reason };
+      return withPointerNotice({ status: "contradiction_protected", id, canonicalId: conflictId, reason: contradiction.reason }, notice);
     }
 
     // Non-canonical loser: the new entry wins; the incumbent loses and is deprecated
@@ -2457,7 +2561,7 @@ export async function captureEntry(
       console.error("Supersedes edge creation failed (non-fatal):", e);
     }
     ctx.waitUntil(inferEdgesOnWrite(id, neighbors.filter(n => n.id !== conflictId), env).catch(e => console.error("Edge inference failed (non-fatal):", e)));
-    return { status: "contradiction", id, resolvedConflict: conflictId, reason: contradiction.reason };
+    return withPointerNotice({ status: "contradiction", id, resolvedConflict: conflictId, reason: contradiction.reason }, notice);
   }
 
   // Reached here without contradiction handling (flagged-new-row or stored) — both
@@ -2465,10 +2569,10 @@ export async function captureEntry(
   ctx.waitUntil(inferEdgesOnWrite(id, neighbors, env).catch(e => console.error("Edge inference failed (non-fatal):", e)));
 
   if (dup.status === "flagged") {
-    return { status: "flagged", id, matchId: dup.matchId, score: dup.score };
+    return withPointerNotice({ status: "flagged", id, matchId: dup.matchId, score: dup.score }, notice);
   }
 
-  return { status: "stored", id };
+  return withPointerNotice({ status: "stored", id }, notice);
 }
 
 // ─── Shared delete path ───────────────────────────────────────────────────────
@@ -2633,21 +2737,21 @@ export function buildMcpServer(env: Env, ctx: ExecutionContext): McpServer {
         return { content: [{ type: "text", text: `Duplicate detected (${(result.score * 100).toFixed(0)}% match) — not stored. Existing entry ID: ${result.matchId}` }] };
       }
       if (result.status === "contradiction") {
-        return { content: [{ type: "text", text: `Stored. ID: ${result.id} — resolved contradiction with entry ${result.resolvedConflict}${result.reason ? `: ${result.reason}` : ""}.` }] };
+        return { content: [{ type: "text", text: appendPointerNotice(`Stored. ID: ${result.id} — resolved contradiction with entry ${result.resolvedConflict}${result.reason ? `: ${result.reason}` : ""}.`, result.notice) }] };
       }
       if (result.status === "contradiction_protected") {
-        return { content: [{ type: "text", text: `Stored as draft (ID: ${result.id}) — conflicts with a canonical memory (${result.canonicalId}), which was kept${result.reason ? `: ${result.reason}` : ""}.` }] };
+        return { content: [{ type: "text", text: appendPointerNotice(`Stored as draft (ID: ${result.id}) — conflicts with a canonical memory (${result.canonicalId}), which was kept${result.reason ? `: ${result.reason}` : ""}.`, result.notice) }] };
       }
       if (result.status === "replaced") {
-        return { content: [{ type: "text", text: `Memory updated — new content replaced outdated entry (ID: ${result.id}).` }] };
+        return { content: [{ type: "text", text: appendPointerNotice(`Memory updated — new content replaced outdated entry (ID: ${result.id}).`, result.notice) }] };
       }
       if (result.status === "merged") {
-        return { content: [{ type: "text", text: `Memories merged — combined into existing entry (ID: ${result.id}).` }] };
+        return { content: [{ type: "text", text: appendPointerNotice(`Memories merged — combined into existing entry (ID: ${result.id}).`, result.notice) }] };
       }
       if (result.status === "flagged") {
-        return { content: [{ type: "text", text: `Stored with ID: ${result.id} — note: similar entry exists (${(result.score * 100).toFixed(0)}% match, ID: ${result.matchId}). Tagged as duplicate-candidate.` }] };
+        return { content: [{ type: "text", text: appendPointerNotice(`Stored with ID: ${result.id} — note: similar entry exists (${(result.score * 100).toFixed(0)}% match, ID: ${result.matchId}). Tagged as duplicate-candidate.`, result.notice) }] };
       }
-      return { content: [{ type: "text", text: `Stored. ID: ${result.id}` }] };
+      return { content: [{ type: "text", text: appendPointerNotice(`Stored. ID: ${result.id}`, result.notice) }] };
     }
   );
 
@@ -2683,8 +2787,9 @@ export function buildMcpServer(env: Env, ctx: ExecutionContext): McpServer {
         };
       }
 
+      let result: { notice?: string };
       try {
-        await appendToEntry(env, id, existingContent, a, tags, source);
+        result = await appendToEntry(env, id, existingContent, a, tags, source);
       } catch (e) {
         const budgetError = mcpReadableError(e);
         if (budgetError) return budgetError;
@@ -2697,7 +2802,7 @@ export function buildMcpServer(env: Env, ctx: ExecutionContext): McpServer {
       return {
         content: [{
           type: "text",
-          text: `Appended to entry ${id}. The original content is preserved and your update has been added with today's date.`,
+          text: appendPointerNotice(`Appended to entry ${id}. The original content is preserved and your update has been added with today's date.`, result.notice),
         }],
       };
     }
@@ -2731,6 +2836,15 @@ export function buildMcpServer(env: Env, ctx: ExecutionContext): McpServer {
       const tags: string[] = JSON.parse(row.tags ?? "[]").filter((t: string) => t !== "rolled-up");
       const source = row.source as string;
       const oldVectorIds: string[] = JSON.parse(row.vector_ids ?? "[]");
+
+      try {
+        const contract = pointerContract(env);
+        if (contract) validatePointerContent(newContent, contract);
+      } catch (e) {
+        const readableError = mcpReadableError(e);
+        if (readableError) return readableError;
+        throw e;
+      }
 
       // Step 1: Update D1 content and tags (strip rolled-up so updated entry ranks normally)
       await env.DB.prepare(`UPDATE entries SET content = ?, tags = ? WHERE id = ?`)
@@ -3095,7 +3209,15 @@ const defaultHandler = {
       try { body = await request.json(); } catch { return json({ ok: false, error: "Invalid JSON" }, 400); }
       if (!body.content?.trim()) return json({ ok: false, error: "content is required" }, 400);
 
-      const result = await captureEntry(body.content, body.tags ?? [], body.source ?? "api", env, ctx);
+      let result: CaptureResult;
+      try {
+        result = await captureEntry(body.content, body.tags ?? [], body.source ?? "api", env, ctx);
+      } catch (e) {
+        const contractError = pointerContractJsonError(e);
+        if (contractError) return contractError;
+        throw e;
+      }
+      const notice = result.notice ? { notice: result.notice } : {};
 
       if (result.status === "blocked") {
         return json({
@@ -3107,16 +3229,16 @@ const defaultHandler = {
         });
       }
       if (result.status === "contradiction") {
-        return json({ ok: true, id: result.id, resolved_conflict: result.resolvedConflict, reason: result.reason });
+        return json({ ok: true, id: result.id, resolved_conflict: result.resolvedConflict, reason: result.reason, ...notice });
       }
       if (result.status === "contradiction_protected") {
-        return json({ ok: true, id: result.id, status: "draft", kept_canonical: result.canonicalId, reason: result.reason });
+        return json({ ok: true, id: result.id, status: "draft", kept_canonical: result.canonicalId, reason: result.reason, ...notice });
       }
       if (result.status === "replaced") {
-        return json({ ok: true, id: result.id, action: "replaced", message: "New memory replaced an outdated existing entry" });
+        return json({ ok: true, id: result.id, action: "replaced", message: "New memory replaced an outdated existing entry", ...notice });
       }
       if (result.status === "merged") {
-        return json({ ok: true, id: result.id, action: "merged", message: "Memories merged into a single combined entry" });
+        return json({ ok: true, id: result.id, action: "merged", message: "Memories merged into a single combined entry", ...notice });
       }
       if (result.status === "flagged") {
         return json({
@@ -3126,9 +3248,10 @@ const defaultHandler = {
           matchId: result.matchId,
           score: parseFloat((result.score * 100).toFixed(1)),
           message: "Stored but similar entry exists — tagged as duplicate-candidate",
+          ...notice,
         });
       }
-      return json({ ok: true, id: result.id });
+      return json({ ok: true, id: result.id, ...notice });
     }
 
     // POST /append
@@ -3156,9 +3279,12 @@ const defaultHandler = {
       const tags: string[] = JSON.parse(row.tags ?? "[]");
       const source = row.source as string;
 
+      let result: { notice?: string };
       try {
-        await appendToEntry(env, id, existingContent, addition, tags, source);
+        result = await appendToEntry(env, id, existingContent, addition, tags, source);
       } catch (e) {
+        const contractError = pointerContractJsonError(e);
+        if (contractError) return contractError;
         return json({ ok: false, error: `Append failed: ${(e as Error).message}` }, 500);
       }
 
@@ -3166,6 +3292,7 @@ const defaultHandler = {
         ok: true,
         id,
         message: "Update appended successfully with timestamp",
+        ...(result.notice ? { notice: result.notice } : {}),
       });
     }
 
@@ -3194,6 +3321,15 @@ const defaultHandler = {
       const source = row.source as string;
       const oldVectorIds: string[] = JSON.parse(row.vector_ids ?? "[]");
       const finalContent = cleanContent || newContent;
+
+      try {
+        const contract = pointerContract(env);
+        if (contract) validatePointerContent(newContent, contract);
+      } catch (e) {
+        const contractError = pointerContractJsonError(e);
+        if (contractError) return contractError;
+        throw e;
+      }
 
       await env.DB.prepare(`UPDATE entries SET content = ?, tags = ? WHERE id = ?`)
         .bind(finalContent, JSON.stringify(mergedTags), id).run();

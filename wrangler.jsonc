@@ -32,7 +32,8 @@
 	],
 	"vars": {
 		"VECTORIZE_GRACE_MS": "300000",
-		"NEURON_DAILY_BUDGET": "8000"
+		"NEURON_DAILY_BUDGET": "8000",
+		"POINTER_CONTRACT": "1"
 	},
 	"secrets": {
 		"required": ["AUTH_TOKEN"]
