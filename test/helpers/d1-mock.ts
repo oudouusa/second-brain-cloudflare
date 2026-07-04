@@ -119,6 +119,18 @@ export class D1Mock {
           }
           return { meta: { changes: 1 } };
         }
+        if (s.startsWith("DELETE FROM edges WHERE ((source_id = ? AND target_id = ?) OR (source_id = ? AND target_id = ?))")) {
+          const [sourceId, targetId, reverseSourceId, reverseTargetId, type] = args;
+          const before = db.edges.length;
+          db.edges = db.edges.filter((e: any) => {
+            const pairMatches =
+              (e.source_id === sourceId && e.target_id === targetId) ||
+              (e.source_id === reverseSourceId && e.target_id === reverseTargetId);
+            const typeMatches = args.length < 5 || e.type === type;
+            return !(pairMatches && typeMatches);
+          });
+          return { meta: { changes: before - db.edges.length } };
+        }
         if (s.startsWith("DELETE FROM edges WHERE source_id")) {
           // Cascade delete on forget: source_id = ? OR target_id = ? (both bound to the same id).
           const [sid, tid] = args;
@@ -270,6 +282,27 @@ export class D1Mock {
             .sort((a: any, b: any) => b.weight - a.weight)
             .slice(0, limit)
             .map((e: any) => ({ source_id: e.source_id, target_id: e.target_id }));
+          return { results };
+        }
+        if (s.includes("SELECT id, type, source_id, target_id, provenance, weight FROM edges WHERE ((source_id = ? AND target_id = ?) OR (source_id = ? AND target_id = ?))")) {
+          const [sourceId, targetId, reverseSourceId, reverseTargetId, type] = args;
+          const results = [...db.edges]
+            .filter((e: any) => {
+              const pairMatches =
+                (e.source_id === sourceId && e.target_id === targetId) ||
+                (e.source_id === reverseSourceId && e.target_id === reverseTargetId);
+              const typeMatches = args.length < 5 || e.type === type;
+              return pairMatches && typeMatches;
+            })
+            .sort((a: any, b: any) => (a.created_at ?? 0) - (b.created_at ?? 0) || String(a.id).localeCompare(String(b.id)))
+            .map((e: any) => ({
+              id: e.id,
+              type: e.type,
+              source_id: e.source_id,
+              target_id: e.target_id,
+              provenance: e.provenance,
+              weight: e.weight,
+            }));
           return { results };
         }
         if (s.includes("SELECT id, content, tags, importance_score, created_at FROM entries WHERE id IN")) {

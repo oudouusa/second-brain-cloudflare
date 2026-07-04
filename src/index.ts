@@ -2480,6 +2480,66 @@ export async function forgetEntry(id: string, env: Env): Promise<ForgetResult> {
   return { status: "deleted", vectorCount: vectorIds.length };
 }
 
+export interface UnlinkedEdge {
+  id: string;
+  type: EdgeType;
+  source_id: string;
+  target_id: string;
+  provenance: EdgeProvenance;
+  weight: number;
+}
+
+export type UnlinkResult =
+  | { status: "missing_entries"; missingIds: string[] }
+  | { status: "deleted"; deleted: UnlinkedEdge[] };
+
+export async function unlinkEdges(
+  sourceId: string,
+  targetId: string,
+  type: EdgeType | undefined,
+  env: Env,
+): Promise<UnlinkResult> {
+  const source = await env.DB.prepare(`SELECT id FROM entries WHERE id = ?`).bind(sourceId).first() as Record<string, any> | null;
+  const target = sourceId === targetId
+    ? source
+    : await env.DB.prepare(`SELECT id FROM entries WHERE id = ?`).bind(targetId).first() as Record<string, any> | null;
+
+  const missingIds = [...new Set([
+    ...(source ? [] : [sourceId]),
+    ...(target ? [] : [targetId]),
+  ])];
+  if (missingIds.length) return { status: "missing_entries", missingIds };
+
+  let where = `((source_id = ? AND target_id = ?) OR (source_id = ? AND target_id = ?))`;
+  const bindings: (string | number)[] = [sourceId, targetId, targetId, sourceId];
+  if (type) {
+    where += ` AND type = ?`;
+    bindings.push(type);
+  }
+
+  const { results } = await env.DB.prepare(
+    `SELECT id, type, source_id, target_id, provenance, weight
+     FROM edges
+     WHERE ${where}
+     ORDER BY created_at ASC, id ASC`
+  ).bind(...bindings).all() as { results: UnlinkedEdge[] };
+
+  const deleted = results.map(row => ({
+    id: row.id,
+    type: row.type,
+    source_id: row.source_id,
+    target_id: row.target_id,
+    provenance: row.provenance,
+    weight: row.weight,
+  }));
+
+  if (deleted.length) {
+    await env.DB.prepare(`DELETE FROM edges WHERE ${where}`).bind(...bindings).run();
+  }
+
+  return { status: "deleted", deleted };
+}
+
 // Deprecate (issue #119): keep the D1 row for audit but make the entry
 // unrecallable by deleting its vectors and tagging it status:deprecated.
 export async function deprecateEntry(id: string, env: Env): Promise<boolean> {
@@ -2806,6 +2866,39 @@ export function buildMcpServer(env: Env, ctx: ExecutionContext): McpServer {
       const edge = await createEdge(source_id, target_id, type, { provenance: "explicit", weight: 1.0 }, env);
       if (!edge) return { content: [{ type: "text", text: "Cannot link an entry to itself." }] };
       return { content: [{ type: "text", text: `Linked ${edge.source_id} → ${edge.target_id} (${edgeLabel(edge.type)}).` }] };
+    }
+  );
+
+  // ── unlink ───────────────────────────────────────────────────────────────
+  server.registerTool(
+    "unlink",
+    {
+      description: "Remove relationship edges between two memories by ID; removes relationship edges only; entry content is untouched. Get the IDs from recall or list_recent first.",
+      inputSchema: {
+        source_id: z.string().describe("Source entry ID"),
+        target_id: z.string().describe("Target entry ID"),
+        type: z.enum(Object.keys(EDGE_TYPES) as [string, ...string[]]).optional().describe("Relationship type to remove; omit to remove all relationship types between the two entries"),
+      },
+    },
+    async ({ source_id, target_id, type }) => {
+      const result = await unlinkEdges(source_id, target_id, type as EdgeType | undefined, env);
+      if (result.status === "missing_entries") {
+        const ids = result.missingIds.join(", ");
+        const text = result.missingIds.length === 1
+          ? `No entry found with ID: ${ids}`
+          : `No entries found with IDs: ${ids}`;
+        return { content: [{ type: "text", text }] };
+      }
+
+      const condition = `between ${source_id} and ${target_id}${type ? ` with type ${type}` : " across all relationship types"}`;
+      if (!result.deleted.length) {
+        return { content: [{ type: "text", text: `Deleted 0 edge(s): no relationship edges found ${condition}.` }] };
+      }
+
+      const deleted = result.deleted
+        .map(edge => `- id: ${edge.id} | type: ${edge.type} | edge: ${edge.source_id} -> ${edge.target_id} | provenance: ${edge.provenance} | weight: ${edge.weight}`)
+        .join("\n");
+      return { content: [{ type: "text", text: `Deleted ${result.deleted.length} edge(s) ${condition}:\n${deleted}` }] };
     }
   );
 
