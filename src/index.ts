@@ -15,6 +15,7 @@ export interface Env {
   AUTH_TOKEN: string;
   OAUTH_KV: KVNamespace;
   VECTORIZE_GRACE_MS?: string;
+  NEURON_DAILY_BUDGET?: string;
 }
 
 const LLM_MODEL = "@cf/meta/llama-4-scout-17b-16e-instruct";
@@ -560,7 +561,7 @@ function json(data: unknown, status = 200): Response {
   });
 }
 
-type AiUsageStatus = "success" | "error";
+type AiUsageStatus = "success" | "error" | "blocked";
 
 interface AiUsageEventInput {
   operation: string;
@@ -625,6 +626,13 @@ function round(value: number, digits = 3): number {
   return Math.round(value * factor) / factor;
 }
 
+function configuredNeuronDailyBudget(env: Env): number | null {
+  const raw = env.NEURON_DAILY_BUDGET?.trim();
+  if (!raw) return null;
+  const budget = Number(raw);
+  return Number.isFinite(budget) && budget > 0 ? budget : null;
+}
+
 async function ensureUsageEventsTable(env: Env): Promise<void> {
   await env.DB.exec(`CREATE TABLE IF NOT EXISTS usage_events (id TEXT PRIMARY KEY, operation TEXT NOT NULL, model TEXT NOT NULL, status TEXT NOT NULL, input_chars INTEGER NOT NULL DEFAULT 0, max_output_tokens INTEGER NOT NULL DEFAULT 0, duration_ms INTEGER NOT NULL DEFAULT 0, error TEXT, metadata TEXT NOT NULL DEFAULT '{}', created_at INTEGER NOT NULL)`);
   await env.DB.exec(`CREATE INDEX IF NOT EXISTS idx_usage_events_created_at ON usage_events(created_at DESC)`);
@@ -662,6 +670,38 @@ export async function recordAiUsageEvent(env: Env, event: AiUsageEventInput): Pr
   }
 }
 
+export class NeuronBudgetExceededError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "NeuronBudgetExceededError";
+  }
+}
+
+export async function getTodayEstimatedNeurons(env: Env): Promise<number> {
+  const after = utcDayStartMs();
+  const { results } = await env.DB.prepare(
+    `SELECT model, input_chars, max_output_tokens
+     FROM usage_events
+     WHERE created_at >= ?`
+  ).bind(after).all() as { results: Pick<AiUsageEventRow, "model" | "input_chars" | "max_output_tokens">[] };
+
+  return results.reduce(
+    (sum, row) => sum + estimateNeurons(row.model, row.input_chars, row.max_output_tokens),
+    0,
+  );
+}
+
+function neuronBudgetMessage(estimatedToday: number, budget: number): string {
+  return `quota-fallback: daily neuron budget exhausted (estimated ${round(estimatedToday, 1)} of ${budget} neurons used today, resets at UTC midnight). AI-backed operations are paused; use list_recent and local canonical sources.`;
+}
+
+function mcpReadableError(e: unknown): { content: { type: "text"; text: string }[] } | null {
+  if (e instanceof NeuronBudgetExceededError) {
+    return { content: [{ type: "text", text: e.message }] };
+  }
+  return null;
+}
+
 async function runAi<T>(
   env: Env,
   operation: string,
@@ -669,6 +709,29 @@ async function runAi<T>(
   payload: Record<string, unknown>,
 ): Promise<T> {
   const startedAt = Date.now();
+  const budget = configuredNeuronDailyBudget(env);
+  if (budget !== null) {
+    try {
+      const estimatedToday = await getTodayEstimatedNeurons(env);
+      if (estimatedToday >= budget) {
+        const roundedToday = round(estimatedToday, 1);
+        await recordAiUsageEvent(env, {
+          operation,
+          model: "none",
+          status: "blocked",
+          inputChars: 0,
+          maxOutputTokens: 0,
+          durationMs: Date.now() - startedAt,
+          metadata: { blocked_model: model, estimated_today: roundedToday, budget },
+        });
+        throw new NeuronBudgetExceededError(neuronBudgetMessage(estimatedToday, budget));
+      }
+    } catch (e) {
+      if (e instanceof NeuronBudgetExceededError) throw e;
+      console.error("AI neuron budget check failed (fail-open):", e);
+    }
+  }
+
   const inputChars = estimateAiInputChars(payload);
   const maxOutputTokens = typeof payload.max_tokens === "number" ? payload.max_tokens : 0;
   try {
@@ -787,6 +850,8 @@ export async function summarizeAiUsage(
   });
 
   const avgTotalNeurons = totals.events ? totals.estimated_neurons_upper / totals.events : 0;
+  const dailyNeuronBudget = configuredNeuronDailyBudget(env);
+  const estimatedToday = await getTodayEstimatedNeurons(env);
 
   return {
     generated_at: now,
@@ -806,6 +871,11 @@ export async function summarizeAiUsage(
       estimated_free_day_used_ratio_upper: round(totals.estimated_neurons_upper / WORKERS_AI_FREE_NEURONS_PER_DAY, 6),
     },
     by_operation: byOperation,
+    budget: {
+      daily_neuron_budget: dailyNeuronBudget,
+      estimated_today: round(estimatedToday, 4),
+      exhausted: dailyNeuronBudget !== null && estimatedToday >= dailyNeuronBudget,
+    },
   };
 }
 
@@ -2445,7 +2515,7 @@ export async function applyStatus(id: string, status: MemoryStatus, env: Env): P
 
 // ─── MCP Server ───────────────────────────────────────────────────────────────
 
-function buildMcpServer(env: Env, ctx: ExecutionContext): McpServer {
+export function buildMcpServer(env: Env, ctx: ExecutionContext): McpServer {
   const server = new McpServer({ name: "second-brain", version: "1.0.0" });
 
   // ── remember ────────────────────────────────────────────────────────────
@@ -2460,7 +2530,14 @@ function buildMcpServer(env: Env, ctx: ExecutionContext): McpServer {
       },
     },
     async ({ content, tags, source }) => {
-      const result = await captureEntry(content, tags ?? [], source ?? "claude", env, ctx);
+      let result: CaptureResult;
+      try {
+        result = await captureEntry(content, tags ?? [], source ?? "claude", env, ctx);
+      } catch (e) {
+        const budgetError = mcpReadableError(e);
+        if (budgetError) return budgetError;
+        throw e;
+      }
       if (result.status === "blocked") {
         return { content: [{ type: "text", text: `Duplicate detected (${(result.score * 100).toFixed(0)}% match) — not stored. Existing entry ID: ${result.matchId}` }] };
       }
@@ -2518,6 +2595,8 @@ function buildMcpServer(env: Env, ctx: ExecutionContext): McpServer {
       try {
         await appendToEntry(env, id, existingContent, a, tags, source);
       } catch (e) {
+        const budgetError = mcpReadableError(e);
+        if (budgetError) return budgetError;
         console.error("Append failed:", e);
         return {
           content: [{ type: "text", text: `Append failed: ${(e as Error).message}` }],
@@ -2571,6 +2650,8 @@ function buildMcpServer(env: Env, ctx: ExecutionContext): McpServer {
       try {
         newVectorIds = await storeEntry(env, id, newContent, tags, source, Date.now());
       } catch (e) {
+        const budgetError = mcpReadableError(e);
+        if (budgetError) return budgetError;
         console.error("Vectorize re-embed failed (non-fatal):", e);
       }
       const newVectorCount = newVectorIds.length;
@@ -2621,7 +2702,15 @@ function buildMcpServer(env: Env, ctx: ExecutionContext): McpServer {
       },
     },
     async ({ query, topK, tag, after, before, kind, hops }) => {
-      const { matches, insight, semanticUnavailable } = await recallEntries({ query, topK, tag, after, before, kind: kind as MemoryKind | undefined, hops }, env, ctx);
+      let result: RecallSearchResult;
+      try {
+        result = await recallEntries({ query, topK, tag, after, before, kind: kind as MemoryKind | undefined, hops }, env, ctx);
+      } catch (e) {
+        const budgetError = mcpReadableError(e);
+        if (budgetError) return budgetError;
+        throw e;
+      }
+      const { matches, insight, semanticUnavailable } = result;
 
       const notice = semanticUnavailable
         ? `Note: semantic search is unavailable because the Vectorize index is missing, so these are keyword matches only. Fix: ${VECTORIZE_FIX_HINT}.\n\n`
@@ -3314,8 +3403,16 @@ const oauthProvider = new OAuthProvider({
 });
 
 export default {
-  fetch: (req: Request, env: Env, ctx: ExecutionContext) =>
-    oauthProvider.fetch(req, env as any, ctx),
+  fetch: async (req: Request, env: Env, ctx: ExecutionContext) => {
+    try {
+      return await oauthProvider.fetch(req, env as any, ctx);
+    } catch (e) {
+      if (e instanceof NeuronBudgetExceededError) {
+        return json({ ok: false, error: e.message }, 429);
+      }
+      throw e;
+    }
+  },
   scheduled: async (_event: ScheduledEvent, env: Env, ctx: ExecutionContext) => {
     ctx.waitUntil(runNightlyCompression(env, ctx));
     ctx.waitUntil(runGraphPass(env, ctx));

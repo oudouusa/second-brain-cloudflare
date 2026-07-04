@@ -214,6 +214,17 @@ export class D1Mock {
             }));
           return { results };
         }
+        if (s.includes("FROM usage_events") && s.includes("WHERE created_at >=") && !s.includes("created_at <=")) {
+          const after = Number(args[0]);
+          const results = [...db.usageEvents]
+            .filter((e: any) => e.created_at >= after)
+            .map((e: any) => ({
+              model: e.model,
+              input_chars: e.input_chars,
+              max_output_tokens: e.max_output_tokens,
+            }));
+          return { results };
+        }
         if (s.includes("WHERE content LIKE") && s.includes("ORDER BY created_at DESC LIMIT")) {
           // Keyword (hybrid recall) query: content LIKE ? OR content LIKE ? ... LIMIT ?
           const limit = Number(args[args.length - 1]);
