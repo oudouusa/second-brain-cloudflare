@@ -3,6 +3,7 @@ assets/*.gif
 node_modules/
 coverage/
 .wrangler/
+.loops/journal/
 docs/
 .claude/
 .dev.vars

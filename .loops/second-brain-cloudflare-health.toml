@@ -1,0 +1,29 @@
+# elphos loop spec — 正本スキーマは ~/dev/elphos/docs/spec-v0.md §3
+[loop]
+id = "second-brain-cloudflare-health"
+level = "L1"
+description = "second-brain-cloudflare の quota-aware 運用・health surface・docs drift を read-only で観測する"
+kernel_min_version = "0.1"
+
+[contract]
+oracle = "node scripts/second-brain-improvement-oracle.mjs"
+oracle_empty_exit = 3              # 改善候補なし = exit 3 → 0 コスト終了
+oracle_timeout_seconds = 30
+gate = ["npm run typecheck", "npm test"] # L1 では未実行(昇格・採用判断用)
+journal_dir = ".loops/journal/"
+
+[budget]
+max_runs_per_day = 2
+max_tokens_per_run = 1             # agent なし(観測のみ)
+stop_on = ["quota_error"]
+
+[schedule]
+trigger = "manual"                 # まずは手動 pilot。timer 化は clean report を見て判断
+
+[a018]
+type      = "turn-based/manual L1 observation。time-based 化は現時点では過剰"
+stop      = "oracle が候補を出すか、候補なしなら oracle exit 3 で終了"
+cap       = "max_runs_per_day=2、oracle timeout 30s、1 run = read-only report 1 件"
+interval  = "Second Brain 本体変更や運用方針更新時に手動実行。変化なしは exit 3 で 0 トークン"
+review    = "L1 は報告のみ。L2 昇格時は npm run typecheck + npm test + 人間 diff review"
+cost      = "journal に tokens 0/秒数を記録。MCP recall/remember/deploy/network は使わない"

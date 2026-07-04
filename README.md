@@ -36,14 +36,19 @@ can surface the correct memory even when the original note used completely diffe
 
 ### Memory tools
 
-| Tool          | What it does                                             |
-| ------------- | -------------------------------------------------------- |
-| `remember`    | Store ideas, decisions, preferences, and project context |
-| `append`      | Add an update to an existing memory                      |
-| `update`      | Replace an existing memory                               |
-| `recall`      | Find memories by meaning rather than exact wording       |
-| `list_recent` | Browse recently saved memories                           |
-| `forget`      | Permanently delete a memory                              |
+| Tool          | What it does                                               |
+| ------------- | ---------------------------------------------------------- |
+| `remember`    | Store ideas, decisions, preferences, and project context   |
+| `append`      | Add an update to an existing memory                        |
+| `update`      | Replace an existing memory                                 |
+| `set_status`  | Mark a memory as draft, canonical, or deprecated           |
+| `recall`      | Find memories by meaning rather than exact wording         |
+| `list_recent` | Browse recently saved memories                             |
+| `link`        | Connect two related memories                               |
+| `unlink`      | Remove relationship edges between two memories             |
+| `connections` | List memories directly linked to an entry                  |
+| `usage`       | Show estimated Workers AI usage for quota and budget checks |
+| `forget`      | Permanently delete a memory                                |
 
 ## Save from anywhere
 
@@ -164,6 +169,24 @@ curl https://YOUR-WORKER-URL/health \
 ```
 
 A healthy deployment returns `"ok": true` with `vectorize.ok` also `true`. If `vectorize.ok` is `false`, the index was not created during the build. See the next section.
+
+### Optional: Check AI usage
+
+Second Brain records an estimated usage ledger for Workers AI calls. Use it to keep recall and write behavior within your free-plan or team budget:
+
+```bash
+curl https://YOUR-WORKER-URL/usage \
+  -H "Authorization: Bearer YOUR-TOKEN"
+```
+
+The response includes the current UTC-day window, total event count, grouped operations, and `estimated_neurons_upper` against Cloudflare's 10,000 Neurons/day free allocation. The estimate is intentionally conservative: input tokens are estimated from character count, and configured `max_tokens` values are counted as an upper bound for output.
+
+You can narrow the window with Unix millisecond query parameters:
+
+```bash
+curl "https://YOUR-WORKER-URL/usage?after=1783123200000&before=1783209600000&limit=1000" \
+  -H "Authorization: Bearer YOUR-TOKEN"
+```
 
 ### Enable semantic search (Vectorize index)
 
