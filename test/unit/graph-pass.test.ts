@@ -105,4 +105,53 @@ describe("scheduled handler", () => {
 
     expect(db.edges.some((e: any) => e.type === "relates_to")).toBe(true);
   });
+
+  it("keeps other cron tasks running when vectorize-pending repair throws", async () => {
+    class RepairThrowingDb extends D1Mock {
+      prepare(sql: string) {
+        const s = sql.replace(/\s+/g, " ").trim();
+        if (s.includes("SELECT id, content, tags, source, created_at FROM entries") && s.includes("vector_ids = '[]'")) {
+          throw new Error("repair query failed");
+        }
+        return super.prepare(sql);
+      }
+    }
+
+    const db = new RepairThrowingDb();
+    db.entries.push(
+      { id: "lonely", content: "x", tags: "[]", source: "api", created_at: 2, vector_ids: "[]" },
+      { id: "neighbor", content: "y", tags: "[]", source: "api", created_at: 1, vector_ids: "[]" },
+    );
+    const env = makeTestEnv(db, {
+      VECTORIZE: makeVectorizeMock({
+        query: vi.fn().mockResolvedValue({ matches: [
+          { id: "lonely", score: 1.0, metadata: { parentId: "lonely" } },
+          { id: "neighbor", score: 0.8, metadata: { parentId: "neighbor" } },
+        ] }),
+      }),
+    });
+    const pending: Promise<any>[] = [];
+    const ctx = { waitUntil: (p: Promise<any>) => pending.push(p) } as any;
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    try {
+      await (worker as any).scheduled({} as any, env, ctx);
+      const settled = await Promise.allSettled(pending);
+
+      expect(settled.every(r => r.status === "fulfilled")).toBe(true);
+      expect(db.edges.some((e: any) => e.type === "relates_to")).toBe(true);
+      const summaries = db.usageEvents.filter((e: any) => e.operation === "cron_vectorize_pending");
+      expect(summaries).toHaveLength(1);
+      expect(summaries[0].status).toBe("error");
+      expect(summaries[0].error).toBe("repair query failed");
+      expect(JSON.parse(summaries[0].metadata)).toEqual({
+        processed: 0,
+        failed: 0,
+        remaining: 0,
+        trigger: "cron",
+      });
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
 });

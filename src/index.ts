@@ -2759,6 +2759,70 @@ const apiHandler = {
   },
 };
 
+export async function runVectorizePendingRepair(env: Env): Promise<{ processed: number; failed: number; remaining: number }> {
+  const graceCutoff = Date.now() - graceMs(env);
+
+  const { results: toProcess } = await env.DB.prepare(
+    `SELECT id, content, tags, source, created_at FROM entries
+     WHERE vector_ids = '[]' AND created_at < ?
+     ORDER BY created_at DESC LIMIT 25`
+  ).bind(graceCutoff).all();
+
+  let processed = 0;
+  let failed = 0;
+
+  for (const row of toProcess as Record<string, any>[]) {
+    try {
+      await storeEntry(
+        env,
+        row.id as string,
+        row.content as string,
+        JSON.parse(row.tags as string),
+        row.source as string,
+        row.created_at as number
+      );
+      processed++;
+    } catch (e) {
+      console.error("Re-embed failed for entry", row.id, e);
+      failed++;
+    }
+  }
+
+  const remaining = await env.DB.prepare(
+    `SELECT COUNT(*) as count FROM entries WHERE vector_ids = '[]' AND created_at < ?`
+  ).bind(graceCutoff).first() as Record<string, any> | null;
+
+  return { processed, failed, remaining: (remaining?.count as number) ?? 0 };
+}
+
+async function runVectorizePendingCron(env: Env): Promise<void> {
+  const startedAt = Date.now();
+  try {
+    const result = await runVectorizePendingRepair(env);
+    await recordAiUsageEvent(env, {
+      operation: "cron_vectorize_pending",
+      model: "none",
+      status: "success",
+      inputChars: 0,
+      maxOutputTokens: 0,
+      durationMs: Date.now() - startedAt,
+      metadata: { ...result, trigger: "cron" },
+    });
+  } catch (e) {
+    console.error("Cron vectorize pending repair failed (non-fatal):", e);
+    await recordAiUsageEvent(env, {
+      operation: "cron_vectorize_pending",
+      model: "none",
+      status: "error",
+      inputChars: 0,
+      maxOutputTokens: 0,
+      durationMs: Date.now() - startedAt,
+      error: e instanceof Error ? e.message : String(e),
+      metadata: { processed: 0, failed: 0, remaining: 0, trigger: "cron" },
+    });
+  }
+}
+
 // ─── Default handler — all non-MCP routes ────────────────────────────────────
 
 const defaultHandler = {
@@ -3218,39 +3282,7 @@ const defaultHandler = {
       const authErr = requireAuth(request, env);
       if (authErr) return authErr;
 
-      const graceCutoff = Date.now() - graceMs(env);
-
-      const { results: toProcess } = await env.DB.prepare(
-        `SELECT id, content, tags, source, created_at FROM entries
-         WHERE vector_ids = '[]' AND created_at < ?
-         ORDER BY created_at DESC LIMIT 25`
-      ).bind(graceCutoff).all();
-
-      let processed = 0;
-      let failed = 0;
-
-      for (const row of toProcess as Record<string, any>[]) {
-        try {
-          await storeEntry(
-            env,
-            row.id as string,
-            row.content as string,
-            JSON.parse(row.tags as string),
-            row.source as string,
-            row.created_at as number
-          );
-          processed++;
-        } catch (e) {
-          console.error("Re-embed failed for entry", row.id, e);
-          failed++;
-        }
-      }
-
-      const remaining = await env.DB.prepare(
-        `SELECT COUNT(*) as count FROM entries WHERE vector_ids = '[]' AND created_at < ?`
-      ).bind(graceCutoff).first() as Record<string, any> | null;
-
-      return json({ processed, failed, remaining: (remaining?.count as number) ?? 0 });
+      return json(await runVectorizePendingRepair(env));
     }
 
     return new Response("Not found", { status: 404 });
@@ -3287,5 +3319,6 @@ export default {
   scheduled: async (_event: ScheduledEvent, env: Env, ctx: ExecutionContext) => {
     ctx.waitUntil(runNightlyCompression(env, ctx));
     ctx.waitUntil(runGraphPass(env, ctx));
+    ctx.waitUntil(runVectorizePendingCron(env));
   },
 };
