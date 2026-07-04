@@ -237,12 +237,26 @@ export class D1Mock {
             }));
           return { results };
         }
-        if (s.includes("WHERE content LIKE") && s.includes("ORDER BY created_at DESC LIMIT")) {
-          // Keyword (hybrid recall) query: content LIKE ? OR content LIKE ? ... LIMIT ?
+        if (s.includes("content LIKE") && s.includes("ORDER BY created_at DESC LIMIT")) {
+          // Keyword (hybrid recall) query:
+          // - semantic path: content LIKE ? OR content LIKE ? ... LIMIT ?
+          // - keyword mode: optional tags LIKE ? constraint plus content/tags token LIKEs.
           const limit = Number(args[args.length - 1]);
-          const patterns = args.slice(0, -1).map((a: any) => String(a).replace(/^%/, "").replace(/%$/, "").toLowerCase());
+          const hasExplicitTag = s.includes("WHERE tags LIKE ? AND");
+          const tag = hasExplicitTag
+            ? String(args[0]).replace(/%"/g, "").replace(/"%/g, "")
+            : null;
+          const searchArgs = args.slice(hasExplicitTag ? 1 : 0, -1);
+          const patterns = [...new Set(searchArgs.map((a: any) => String(a).replace(/^%/, "").replace(/%$/, "").toLowerCase()))];
+          const includeTags = s.includes("OR tags LIKE");
           const rows = [...db.entries]
-            .filter((e: any) => patterns.some((p: string) => String(e.content).toLowerCase().includes(p)))
+            .filter((e: any) => {
+              const tags: string[] = JSON.parse(e.tags ?? "[]");
+              if (tag && !tags.includes(tag)) return false;
+              const content = String(e.content).toLowerCase();
+              const tagText = String(e.tags).toLowerCase();
+              return patterns.some((p: string) => content.includes(p) || (includeTags && tagText.includes(p)));
+            })
             .sort((a: any, b: any) => b.created_at - a.created_at)
             .slice(0, limit)
             .map((e: any) => ({ id: e.id, content: e.content, tags: e.tags, source: e.source, created_at: e.created_at }));

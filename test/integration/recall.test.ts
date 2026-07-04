@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
-import worker, { captureEntry } from "../../src/index";
+import worker, { buildMcpServer, captureEntry } from "../../src/index";
 import { makeTestEnv, makeTestDb, makeVectorizeMock } from "../helpers/make-env";
 import { req } from "../helpers/make-request";
 import type { Env } from "../../src/index";
@@ -23,6 +23,7 @@ function makeContradictionAI(response: string): Ai {
 }
 
 const ctx = { waitUntil: (_: Promise<any>) => {} } as any;
+const LLM_MODEL = "@cf/meta/llama-4-scout-17b-16e-instruct";
 
 function makeMatch(id: string, score: number, overrides: Record<string, any> = {}) {
   return {
@@ -30,6 +31,26 @@ function makeMatch(id: string, score: number, overrides: Record<string, any> = {
     score,
     metadata: { parentId: id, isUpdate: false, ...overrides },
   };
+}
+
+function recallTool(env: Env) {
+  const server = buildMcpServer(env, ctx);
+  return (server as any)._registeredTools.recall.handler as (args: Record<string, unknown>) => Promise<{ content: { text: string }[] }>;
+}
+
+function seedBudgetExhaustion(db: D1Mock): void {
+  db.usageEvents.push({
+    id: crypto.randomUUID(),
+    operation: "seed",
+    model: LLM_MODEL,
+    status: "success",
+    input_chars: 0,
+    max_output_tokens: 1000,
+    duration_ms: 1,
+    error: null,
+    metadata: "{}",
+    created_at: Date.now(),
+  });
 }
 
 // The AI mock embeds every query as 384 dims of 0.1 (make-env.ts) —
@@ -626,5 +647,132 @@ describe("GET /recall — missing Vectorize index", () => {
     const data = await res.json() as any;
     expect(data.semantic_unavailable).toBe(false);
     expect(query).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("MCP recall — keyword mode", () => {
+  it("returns content and tag keyword matches without calling AI or Vectorize", async () => {
+    const db = makeTestDb();
+    db.entries.push(
+      { id: "content-hit", content: "Needle appears in the body", tags: "[]", source: "api", created_at: 1000, vector_ids: "[]", recall_count: 0, importance_score: 0 },
+      { id: "tag-hit", content: "Body does not contain it", tags: '["needle"]', source: "api", created_at: 2000, vector_ids: "[]", recall_count: 0, importance_score: 0 },
+    );
+    const vectorize = makeVectorizeMock();
+    const ai = { run: vi.fn() } as unknown as Ai;
+    const env = makeTestEnv(db, { AI: ai, VECTORIZE: vectorize });
+
+    const result = await recallTool(env)({ query: "needle", topK: 5, mode: "keyword" });
+    const text = result.content[0].text;
+
+    expect(text).toContain("content-hit");
+    expect(text).toContain("tag-hit");
+    expect(ai.run).not.toHaveBeenCalled();
+    for (const method of ["query", "getByIds", "insert", "upsert", "deleteByIds", "describe"]) {
+      expect((vectorize as any)[method]).not.toHaveBeenCalled();
+    }
+  });
+
+  it("applies tag filtering in keyword mode", async () => {
+    const db = makeTestDb();
+    db.entries.push(
+      { id: "finance-hit", content: "quarterly budget note", tags: '["finance"]', source: "api", created_at: 1000, vector_ids: "[]", recall_count: 0, importance_score: 0 },
+      { id: "personal-hit", content: "quarterly budget note", tags: '["personal"]', source: "api", created_at: 2000, vector_ids: "[]", recall_count: 0, importance_score: 0 },
+    );
+    const env = makeTestEnv(db);
+
+    const result = await recallTool(env)({ query: "budget", topK: 5, tag: "finance", mode: "keyword" });
+    const text = result.content[0].text;
+
+    expect(text).toContain("finance-hit");
+    expect(text).not.toContain("personal-hit");
+  });
+
+  it("applies topK in keyword mode", async () => {
+    const db = makeTestDb();
+    for (let i = 1; i <= 3; i++) {
+      db.entries.push({
+        id: `limit-${i}`,
+        content: "limitword keyword note",
+        tags: "[]",
+        source: "api",
+        created_at: 1000 + i,
+        vector_ids: "[]",
+        recall_count: 0,
+        importance_score: 0,
+      });
+    }
+    const env = makeTestEnv(db);
+
+    const result = await recallTool(env)({ query: "limitword", topK: 2, mode: "keyword" });
+    const ids = result.content[0].text.match(/^ID: /gm) ?? [];
+
+    expect(ids).toHaveLength(2);
+  });
+
+  it("includes a keyword-mode notice and entry IDs", async () => {
+    const db = makeTestDb();
+    db.entries.push({
+      id: "notice-hit",
+      content: "notice keyword note",
+      tags: "[]",
+      source: "api",
+      created_at: 1000,
+      vector_ids: "[]",
+      recall_count: 0,
+      importance_score: 0,
+    });
+    const env = makeTestEnv(db);
+
+    const result = await recallTool(env)({ query: "notice", topK: 5, mode: "keyword" });
+    const text = result.content[0].text;
+
+    expect(text).toContain("keyword mode: no AI used");
+    expect(text).toContain("ID: notice-hit");
+  });
+
+  it("does not record AI usage events in keyword mode", async () => {
+    const db = makeTestDb();
+    db.entries.push({
+      id: "usage-hit",
+      content: "usage keyword note",
+      tags: "[]",
+      source: "api",
+      created_at: 1000,
+      vector_ids: "[]",
+      recall_count: 0,
+      importance_score: 0,
+    });
+    const ai = { run: vi.fn() } as unknown as Ai;
+    const env = makeTestEnv(db, { AI: ai });
+
+    await recallTool(env)({ query: "usage", topK: 5, mode: "keyword" });
+
+    expect(ai.run).not.toHaveBeenCalled();
+    expect(db.usageEvents).toHaveLength(0);
+  });
+
+  it("succeeds under an exhausted neuron budget in keyword mode", async () => {
+    const db = makeTestDb();
+    seedBudgetExhaustion(db);
+    db.entries.push({
+      id: "budget-keyword-hit",
+      content: "budget keyword note",
+      tags: "[]",
+      source: "api",
+      created_at: 1000,
+      vector_ids: "[]",
+      recall_count: 0,
+      importance_score: 0,
+    });
+    const ai = { run: vi.fn() } as unknown as Ai;
+    const env = makeTestEnv(db, { AI: ai, NEURON_DAILY_BUDGET: "1" });
+
+    const result = await recallTool(env)({ query: "budget", topK: 5, mode: "keyword" });
+    const text = result.content[0].text;
+
+    expect(text).toContain("ID: budget-keyword-hit");
+    expect(text).not.toContain("quota-fallback");
+    expect(ai.run).not.toHaveBeenCalled();
+    expect(db.usageEvents.filter(e => e.status === "blocked")).toHaveLength(0);
   });
 });

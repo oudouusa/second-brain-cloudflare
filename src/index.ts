@@ -1938,6 +1938,8 @@ export interface RecallSearchResult {
   semanticUnavailable: boolean;
 }
 
+export type RecallMode = "semantic" | "keyword";
+
 // Render recall matches as the MCP tool's text reply. Crucially includes each entry's
 // ID so an LLM can act on a result (link, connections, append, update, forget) without
 // a second list_recent round-trip — recall used to drop the ID, which left tools unable
@@ -1972,12 +1974,20 @@ export function tokenizeQuery(query: string): string[] {
 
 // Keyword candidates: entries whose content contains any query token, bounded by
 // KEYWORD_CANDIDATE_LIMIT. Relevance ranking happens in fuseDenseAndKeyword.
-async function keywordSearch(tokens: string[], env: Env): Promise<KeywordRow[]> {
+async function keywordSearch(
+  tokens: string[],
+  env: Env,
+  options: { includeTags?: boolean; tag?: string } = {}
+): Promise<KeywordRow[]> {
   if (!tokens.length) return [];
-  const where = tokens.map(() => "content LIKE ?").join(" OR ");
+  const tokenWhere = tokens.map(() => options.includeTags ? "(content LIKE ? OR tags LIKE ?)" : "content LIKE ?").join(" OR ");
+  const bindings = options.includeTags
+    ? tokens.flatMap(t => [`%${t}%`, `%${t}%`])
+    : tokens.map(t => `%${t}%`);
+  const where = options.tag ? `tags LIKE ? AND (${tokenWhere})` : tokenWhere;
   const { results } = await env.DB.prepare(
     `SELECT id, content, tags, source, created_at FROM entries WHERE ${where} ORDER BY created_at DESC LIMIT ?`
-  ).bind(...tokens.map(t => `%${t}%`), KEYWORD_CANDIDATE_LIMIT).all();
+  ).bind(...(options.tag ? [`%"${options.tag}"%`] : []), ...bindings, KEYWORD_CANDIDATE_LIMIT).all();
   return results as unknown as KeywordRow[];
 }
 
@@ -2004,7 +2014,8 @@ function fuseDenseAndKeyword(
   denseMatches: VectorizeMatch[],
   keywordRows: KeywordRow[],
   tokens: string[],
-  allowKeywordOnly: boolean
+  allowKeywordOnly: boolean,
+  options: { includeTagsInKeywordWeight?: boolean } = {}
 ): VectorizeMatch[] {
   const denseByParent = new Map<string, VectorizeMatch>();
   for (const m of [...denseMatches].sort((a, b) => b.score - a.score)) {
@@ -2014,7 +2025,11 @@ function fuseDenseAndKeyword(
   const denseRanked = [...denseByParent.keys()];
 
   const keywordRanked = keywordRows
-    .map(r => ({ row: r, weight: tokens.reduce((n, t) => n + (r.content.toLowerCase().includes(t) ? 1 : 0), 0) }))
+    .map(r => {
+      const content = r.content.toLowerCase();
+      const tags = options.includeTagsInKeywordWeight ? r.tags.toLowerCase() : "";
+      return { row: r, weight: tokens.reduce((n, t) => n + (content.includes(t) || tags.includes(t) ? 1 : 0), 0) };
+    })
     .filter(x => x.weight > 0 && (allowKeywordOnly || denseByParent.has(x.row.id)))
     .sort((a, b) => b.weight - a.weight || b.row.created_at - a.row.created_at || (a.row.id < b.row.id ? -1 : 1));
 
@@ -2035,13 +2050,14 @@ function fuseDenseAndKeyword(
 }
 
 export async function recallEntries(
-  params: { query: string; topK: number; tag?: string; after?: number; before?: number; kind?: MemoryKind; hops?: number },
+  params: { query: string; topK: number; tag?: string; after?: number; before?: number; kind?: MemoryKind; hops?: number; mode?: RecallMode },
   env: Env,
   ctx: ExecutionContext
 ): Promise<RecallSearchResult> {
   const { query, topK } = params;
   let { tag, after, before, kind } = params;
   const hops = Math.max(0, Math.min(GRAPH_MAX_HOPS, params.hops ?? 0));
+  const mode = params.mode ?? "semantic";
   const now = Date.now();
   let semanticUnavailable = false;
 
@@ -2054,14 +2070,23 @@ export async function recallEntries(
   }
 
   const tokens = tokenizeQuery(embedQuery);
-  const [values, queryTags] = await Promise.all([
-    embed(embedQuery, env),
-    inferQueryTags(embedQuery, env),
-  ]);
 
   let keywordRows: KeywordRow[] = [];
-  let results: { matches: VectorizeMatch[] };
-  if (tag) {
+  let results: { matches: VectorizeMatch[] } = { matches: [] };
+  let values: number[] = [];
+  let queryTags: string[] = [];
+  if (mode === "keyword") {
+    keywordRows = await keywordSearch(tokens, env, { includeTags: true, tag });
+  } else {
+    const [embeddedValues, inferredTags] = await Promise.all([
+      embed(embedQuery, env),
+      inferQueryTags(embedQuery, env),
+    ]);
+    values = embeddedValues;
+    queryTags = inferredTags;
+  }
+
+  if (mode !== "keyword" && tag) {
     // Tag path: score the tag's own vectors directly. An unconstrained Vectorize
     // query caps at 50 candidates, silently dropping tagged entries whose global
     // semantic rank falls outside the top 50 (issue #141). D1 is the source of
@@ -2094,7 +2119,7 @@ export async function recallEntries(
         metadata: v.metadata,
       })) as VectorizeMatch[],
     };
-  } else {
+  } else if (mode !== "keyword") {
     // Cloudflare Vectorize caps topK at 50 when returnMetadata="all" (error 40025).
     // Run the keyword search in parallel with the dense query.
     const vectorizeTopK = Math.min(topK * VECTORIZE_TOP_K_MULTIPLIER, 50);
@@ -2128,7 +2153,13 @@ export async function recallEntries(
   // Always-on hybrid retrieval: fuse dense + keyword candidates via RRF. On the tag path
   // keyword is a re-ranking signal only (allowKeywordOnly=false); on the default path it can
   // also surface exact-identifier matches the dense top-K missed entirely.
-  const fusedMatches = fuseDenseAndKeyword(results.matches as VectorizeMatch[], keywordRows, tokens, !tag || semanticUnavailable);
+  const fusedMatches = fuseDenseAndKeyword(
+    results.matches as VectorizeMatch[],
+    keywordRows,
+    tokens,
+    mode === "keyword" || !tag || semanticUnavailable,
+    { includeTagsInKeywordWeight: mode === "keyword" }
+  );
   if (!fusedMatches.length) return { matches: [], insight: "", semanticUnavailable };
 
   // Fetch recall_count and importance_score for all candidates to use in scoring.
@@ -2256,11 +2287,11 @@ export async function recallEntries(
 
   // Synthesize over exactly what's shown (seeds + any surfaced neighbors) so the
   // insight stays grounded in the returned results.
-  const insight = matches.length > 1
+  const insight = mode !== "keyword" && matches.length > 1
     ? await synthesizeInsight(embedQuery, matches.map(m => ({ id: m.id, content: m.content })), env)
     : "";
 
-  if (d1Rows.length >= 5) {
+  if (mode !== "keyword" && d1Rows.length >= 5) {
     ctx.waitUntil(
       derivePattern(d1Rows as { id: string; content: string }[], env, ctx)
         .catch(e => console.error("derivePattern failed (non-fatal):", e))
@@ -2759,12 +2790,13 @@ export function buildMcpServer(env: Env, ctx: ExecutionContext): McpServer {
         before: z.number().int().optional().describe("Only return entries before this Unix ms timestamp"),
         kind: z.enum([...KIND_VALUES] as [string, ...string[]]).optional().describe("Filter to episodic (events) or semantic (facts/knowledge)"),
         hops: z.number().int().min(0).max(3).default(0).describe("Graph expansion depth: 0 = direct matches only (default); 1–2 also surfaces related memories linked in the graph"),
+        mode: z.enum(["semantic", "keyword"]).default("semantic").describe("semantic = AI-backed vector search (default); keyword = exact keyword/tag search with no AI"),
       },
     },
-    async ({ query, topK, tag, after, before, kind, hops }) => {
+    async ({ query, topK, tag, after, before, kind, hops, mode }) => {
       let result: RecallSearchResult;
       try {
-        result = await recallEntries({ query, topK, tag, after, before, kind: kind as MemoryKind | undefined, hops }, env, ctx);
+        result = await recallEntries({ query, topK, tag, after, before, kind: kind as MemoryKind | undefined, hops, mode: mode as RecallMode | undefined }, env, ctx);
       } catch (e) {
         const budgetError = mcpReadableError(e);
         if (budgetError) return budgetError;
@@ -2774,6 +2806,8 @@ export function buildMcpServer(env: Env, ctx: ExecutionContext): McpServer {
 
       const notice = semanticUnavailable
         ? `Note: semantic search is unavailable because the Vectorize index is missing, so these are keyword matches only. Fix: ${VECTORIZE_FIX_HINT}.\n\n`
+        : mode === "keyword"
+          ? "keyword mode: no AI used\n\n"
         : "";
 
       if (!matches.length) {
