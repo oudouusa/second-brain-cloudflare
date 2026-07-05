@@ -211,6 +211,16 @@ export const STATUS_VALUES = ["canonical", "draft", "deprecated"] as const;
 export type MemoryStatus = (typeof STATUS_VALUES)[number];
 const STATUS_PREFIX = "status:";
 
+// Vectorize rejects metadata keys that are empty, start with $, contain . or ",
+// or exceed 512 bytes (VECTOR_INSERT_ERROR 40018). Tags are user/tool input and
+// have historically contained values like "1.0", so sanitize at the key boundary.
+export function tagMetadataKey(tag: string): string | null {
+  const cleaned = tag.replace(/[."]/g, "_").replace(/^\$+/, "");
+  if (!cleaned) return null;
+  const key = `tag_${cleaned}`;
+  return new TextEncoder().encode(key).length <= 512 ? key : null;
+}
+
 export function getStatus(tags: string[]): MemoryStatus | null {
   const tag = tags.find(t => t.startsWith(STATUS_PREFIX));
   if (!tag) return null;
@@ -1596,7 +1606,8 @@ async function storeEntry(
       };
 
       tags.forEach(t => {
-        metadata[`tag_${t}`] = true;
+        const key = tagMetadataKey(t);
+        if (key) metadata[key] = true;
       });
 
       return {
@@ -1708,7 +1719,8 @@ async function appendToEntry(
   };
 
   tags.forEach(t => {
-    metadata[`tag_${t}`] = true;
+    const key = tagMetadataKey(t);
+    if (key) metadata[key] = true;
   });
 
   await env.VECTORIZE.insert([{
