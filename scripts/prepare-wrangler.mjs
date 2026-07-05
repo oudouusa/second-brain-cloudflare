@@ -37,13 +37,26 @@ const shouldCreateIndex =
 
 if (shouldCreateIndex) {
   try {
+    // stdio: "pipe" so an *expected* failure (duplicate index on re-deploy)
+    // doesn't splash wrangler's red ERROR block into every deploy log —
+    // that block has already been misread as a deploy failure once.
     execSync(
       `npx wrangler vectorize create ${INDEX} --dimensions=${DIMENSIONS} --metric=${METRIC}`,
-      { stdio: "inherit" },
+      { stdio: "pipe" },
     );
-  } catch {
-    // Index already exists (re-deploy) or the token can't create it — either
-    // way, carry on and bind to whatever index is there. Never fail install.
+    console.log(`[prepare-wrangler] created vectorize index '${INDEX}'`);
+  } catch (err) {
+    const out = `${err.stdout ?? ""}${err.stderr ?? ""}`;
+    if (out.includes("duplicate_name") || out.includes("[code: 3002]")) {
+      console.log(
+        `[prepare-wrangler] index '${INDEX}' already exists — ok (re-deploy)`,
+      );
+    } else {
+      // Unexpected failure (auth, network, quota): surface it, but still
+      // carry on and bind to whatever index is there. Never fail install.
+      process.stderr.write(out);
+      console.error("[prepare-wrangler] index create failed — continuing; binding to existing index if any");
+    }
   }
 }
 
