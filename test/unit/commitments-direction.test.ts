@@ -40,9 +40,8 @@ const FIXTURE: Fixture[] = [
 
 async function seeded(): Promise<SqliteD1> {
   const s = makeSqliteD1();
-  // valid_until is one of the columns src/db/init.ts adds by ALTER at
-  // runtime rather than in schema.sql; openLoopSql reads it.
-  s.db.prepare(`ALTER TABLE entries ADD COLUMN valid_until INTEGER`).run();
+  // schema 9の参照DDLに必要な有効期間列が含まれることを検証する。
+  expect(s.columns()).toContain("valid_until");
   FIXTURE.forEach((row, i) => s.seed({ id: row.id, content: "x", createdAt: i, tags: row.tags }));
   return s;
 }

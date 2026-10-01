@@ -1,9 +1,11 @@
+// 3.5.0: remember/appendのwhen・when_kindを共有schemaへ追加したため再固定。
 import { readdirSync, readFileSync, statSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { join, relative, resolve } from "node:path";
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { buildMcpServer } from "../../src/mcp/server";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { Client } from "@modelcontextprotocol/client";
+import { InMemoryTransport } from "@modelcontextprotocol/client";
 import { makeTestEnv, makeTestDb, makeVectorizeMock, makeMemoryKV } from "../helpers/make-env";
 import type { Env } from "../../src/env";
 import { D1Mock } from "../helpers/d1-mock";
@@ -19,27 +21,44 @@ import { createMember } from "../../src/lib/team-admin";
 const ctx = { waitUntil: (_: Promise<unknown>) => {} } as ExecutionContext;
 
 const EXPECTED_TOOLS = [
+  "list_teams",
+  "list_projects",
   "brief",
   "resolve",
   "digest",
   "history",
   "remember",
-  "recall",
-  "list_recent",
-  "list_teams",
-  "list_projects",
-  "get_prompt_capsule",
-  "get",
   "append",
+  "rollover",
   "update",
   "set_status",
+  "share",
+  "set_memory_tier",
+  "pin_memory",
+  "unpin_memory",
+  "get_prompt_capsule",
+  "get_hot_context",
+  "recall",
+  "list_recent",
+  "get",
   "forget",
   "undo",
-  "share",
   "link",
   "unlink",
   "connections",
 ];
+
+// 4.0.0統合後、保留する長文をD1へ渡すremember/append/updateのschema上限だけを拡張。
+// 新規の通常保存はruntimeの12,000文字・9chunk制限を維持する。
+const EXPECTED_TOOLS_LIST_SHA256 = "9e2250d921d4a75d081454659df1e736f70eb449fac9091a2f4b3324f9ee35fc";
+const EXTENDED_TOOL_BINDINGS = [
+  ["rollover", "rollover"],
+  ["set_memory_tier", "setMemoryTier"],
+  ["pin_memory", "pinMemory"],
+  ["unpin_memory", "unpinMemory"],
+  ["get_prompt_capsule", "promptCapsule"],
+  ["get_hot_context", "hotContext"],
+] as const;
 
 async function withMcpClient(env: Env, run: (client: Client) => Promise<void>) {
   const server = buildMcpServer(env, ctx);
@@ -80,16 +99,80 @@ describe("MCP tools contract (InMemoryTransport)", () => {
     });
   });
 
-  it("requires an authenticated identity for Prompt Capsule reads", async () => {
+  it("keeps the prompt-cache-sensitive tool registration order stable", async () => {
     await withMcpClient(env, async (client) => {
-      const result = await client.callTool({
+      const { tools } = await client.listTools();
+      expect(tools.map(tool => tool.name)).toEqual(EXPECTED_TOOLS);
+    });
+  });
+
+  it("keeps the complete prompt-cache-sensitive tools/list contract byte-stable", async () => {
+    await withMcpClient(env, async (client) => {
+      const { tools } = await client.listTools();
+      const digest = createHash("sha256").update(JSON.stringify(tools)).digest("hex");
+      expect(digest).toBe(EXPECTED_TOOLS_LIST_SHA256);
+      // schema上限を元に戻すと旧契約とbyte一致する。説明や他の引数の変更を隠さない。
+      const prior = structuredClone(tools);
+      for (const [name, property] of [["remember", "content"], ["append", "addition"], ["update", "content"]]) {
+        const input = prior.find(tool => tool.name === name)!.inputSchema.properties![property] as { maxLength: number };
+        expect(input.maxLength).toBe(131073);
+        input.maxLength = 12000;
+      }
+      expect(createHash("sha256").update(JSON.stringify(prior)).digest("hex"))
+        .toBe("75ec6c59f06e31809301a1e692ea893986b66ba50c6ccf67f7c0fcd47a696c9f");
+    });
+  });
+
+  it("routes every extracted tool through its preserved MCP response contract", async () => {
+    await withMcpClient(env, async (client) => {
+      const missingEntryCalls = [
+        { name: "rollover", arguments: { id: "missing", snapshot: "Current state", operation_id: "op-1" } },
+        { name: "set_memory_tier", arguments: { id: "missing", tier: "hot" } },
+        { name: "pin_memory", arguments: { id: "missing" } },
+        { name: "unpin_memory", arguments: { id: "missing" } },
+      ];
+      for (const call of missingEntryCalls) {
+        const result = await client.callTool(call);
+        expect((result.content as { text?: string }[])[0]?.text, call.name)
+          .toBe("No entry found with ID: missing");
+      }
+
+      const capsule = await client.callTool({
         name: "get_prompt_capsule",
         arguments: { kind: "core" },
       });
-      expect(result.isError).toBe(true);
-      const text = (result.content as { text?: string }[])[0]?.text;
-      expect(text).toContain("Prompt Capsule retrieval requires an authenticated identity.");
-      expect(JSON.parse(text ?? "null")).toMatchObject({ ok: false, code: "unauthenticated", status: 401 });
+      expect(capsule.isError).toBe(true);
+      expect((capsule.content as { text?: string }[])[0]?.text)
+        .toContain("Prompt Capsule retrieval requires an authenticated identity.");
+
+      const hot = await client.callTool({ name: "get_hot_context", arguments: {} });
+      expect((hot.content as { text?: string }[])[0]?.text).toBe("No hot or pinned memories.");
+    });
+  });
+
+  it("link enforces the edge registry's memory-kind constraint", async () => {
+    for (const id of ["decision", "outcome"]) {
+      db.entries.push({
+        id,
+        content: `${id} content`,
+        tags: JSON.stringify(["kind:semantic"]),
+        source: "api",
+        created_at: 1,
+        vector_ids: "[]",
+        recall_count: 0,
+        importance_score: 0,
+      });
+    }
+
+    await withMcpClient(env, async (client) => {
+      const result = await client.callTool({
+        name: "link",
+        arguments: { source_id: "decision", target_id: "outcome", type: "decided" },
+      });
+      const text = (result.content as { type: string; text: string }[])[0]?.text ?? "";
+
+      expect(text).toContain("Decided links only episodic memories");
+      expect(db.edges).toHaveLength(0);
     });
   });
 
@@ -347,19 +430,22 @@ describe("MCP tool descriptions teach generic recall behaviour", () => {
       expect(connections).toMatch(/once recall has already identified a relevant memory/i);
       expect(connections).toMatch(/causal history|decision lineage/i);
       expect(connections).toMatch(/skip it when direct recall already answers/i);
+      expect(connections).toMatch(/requested entry is the stored source or target/i);
+      expect(connections).toMatch(/next_cursor/i);
     });
   });
 
   describe("remember", () => {
-    it("still asks for automatic capture without permission", async () => {
+    it("captures within existing authorization without asking again for each covered note", async () => {
       const remember = (await descriptions()).remember;
-      expect(remember).toMatch(/automatically, without asking permission/i);
+      expect(remember).toMatch(/existing storage authorization/i);
+      expect(remember).toMatch(/Do not ask again for each note already covered/i);
     });
 
-    it("scopes automatic capture to durable, later-retrievable information", async () => {
+    it("scopes capture to durable outcomes rather than every response or intermediate proposal", async () => {
       const remember = (await descriptions()).remember;
-      expect(remember).toMatch(/durable enough to be worth retrieving in a later conversation/i);
-      expect(remember).toMatch(/passing conversational detail that will not matter later/i);
+      expect(remember).toMatch(/durable preferences and verified reusable outcomes/i);
+      expect(remember).toMatch(/do not save every response or intermediate proposal/i);
     });
 
     it("points a continuing thread at append instead of a near-duplicate", async () => {
@@ -393,6 +479,23 @@ describe("MCP tool descriptions teach generic recall behaviour", () => {
       const append = (await descriptions()).append;
       expect(append).toMatch(/not append unrelated information/i);
       expect(append).toMatch(/use update/i);
+    });
+
+    it("teaches the caller to act on rollover advice", async () => {
+      const append = (await descriptions()).append;
+      expect(append).toMatch(/rollover is recommended or required/i);
+      expect(append).toMatch(/before the next append/i);
+    });
+  });
+
+  describe("rollover", () => {
+    it("keeps history and requests a bounded current-state snapshot", async () => {
+      const rollover = (await descriptions()).rollover;
+      expect(rollover).toMatch(/concise current-state snapshot/i);
+      expect(rollover).toMatch(/old entry is preserved/i);
+      expect(rollover).toMatch(/follows and drawn_from/i);
+      expect(rollover).toMatch(/operation_id/i);
+      expect((await schemaFor("rollover")).operation_id).toBeDefined();
     });
   });
 
@@ -515,6 +618,18 @@ describe("tool definitions have a single source of truth", () => {
       expect(matches, name).toHaveLength(1);
     }
     expect(source.match(/registerTool\(/g) ?? []).toHaveLength(EXPECTED_TOOLS.length);
+  });
+
+  it("wires each extracted contract to the matching fork-owned callback", () => {
+    const source = readFileSync(join(SRC, "mcp/server.ts"), "utf8");
+    for (const [tool, binding] of EXTENDED_TOOL_BINDINGS) {
+      expect(source).toContain([
+        "server.registerTool(",
+        `    "${tool}",`,
+        `    extendedTools.${binding}.config,`,
+        `    extendedTools.${binding}.callback,`,
+      ].join("\n"));
+    }
   });
 });
 
@@ -702,6 +817,7 @@ describe("the layer parameter every non-browser client depends on", () => {
     let sqlite: SqliteD1;
     let httpEnv: Env;
     let token = "";
+    let personalWorkspaceId = "";
 
     /** The member's token unless one is named — `/stats` is admin-gated. */
     const call = (method: string, path: string, body?: unknown, as?: string) =>
@@ -735,7 +851,9 @@ describe("the layer parameter every non-browser client depends on", () => {
       });
       await initializeDatabase(httpEnv);
       await ensureTenantBootstrap(httpEnv);
-      token = (await createMember(httpEnv, { name: "Cli User" })).token;
+      const created = await createMember(httpEnv, { name: "Cli User" });
+      token = created.token;
+      personalWorkspaceId = created.member.personalWorkspaceId;
     });
 
     afterEach(() => sqlite?.close());
@@ -840,7 +958,11 @@ describe("the layer parameter every non-browser client depends on", () => {
       // that really exists.
       httpEnv.VECTORIZE = makeVectorizeMock({
         query: vi.fn().mockResolvedValue({
-          matches: [{ id: first.id, score: 0.97, metadata: { parentId: first.id } }],
+          matches: [{
+            id: first.id,
+            score: 0.99,
+            metadata: { parentId: first.id, workspace_id: personalWorkspaceId },
+          }],
         }),
       });
       const dup = (await (await call("POST", "/capture", {

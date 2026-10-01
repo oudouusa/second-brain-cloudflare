@@ -8,7 +8,7 @@
 import { describe, it, expect } from "vitest";
 import { extractUnambiguousDate } from "../../src/when/heuristic";
 
-const NOW = new Date(2026, 5, 1).getTime(); // June 1, 2026, local midnight
+const NOW = Date.UTC(2026, 5, 1); // June 1, 2026, local midnight
 
 describe("extractUnambiguousDate", () => {
   it("finds an ISO date", () => {

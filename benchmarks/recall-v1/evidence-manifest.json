@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "files": {
+    "corpus.json": "71e2880b9844241ad9684e77e80a6c1f7478302ab429bf9830f616c33094a6da",
+    "threshold-corpus.json": "b98ad762efa37368a9f7aa2f74403e59d789b503768e4f66138e3242f0164b9f",
+    "results-bge384.json": "4eb42909e90858e0994d8b8c7ea8f4b939bd7933eaa619af11906f2c0d307c04",
+    "results-embeddinggemma-mrl128-v1.json": "948f9223908c3eeded55d3033f60693193efed24cbe6e7d59f24c9956f015b2e",
+    "thresholds-embeddinggemma-mrl128-v1.json": "69d8b756a7c063742edec00a5c2120f19f879b4834b6f46784c1d46e01296e34",
+    "input-limits-embeddinggemma-mrl128-v1.json": "c39f67e27b8ab52d25cf6ee700b9a193ce8ab2b41579555045504c0abbb2e1ac"
+  }
+}

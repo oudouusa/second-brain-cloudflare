@@ -4,11 +4,11 @@
  * RECALL_LOG is opted on.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { Client } from "@modelcontextprotocol/client";
+import { InMemoryTransport } from "@modelcontextprotocol/client";
 import { buildMcpServer } from "../../src/mcp/server";
 import worker from "../../src/index";
-import { CONFIG_KEY } from "../../src/config";
+import { CONFIG_KEY, DEFAULTS } from "../../src/config";
 import { makeSqliteD1, type SqliteD1 } from "../helpers/sqlite-d1";
 import { makeTestEnv, makeMemoryKV, makeVectorizeMock } from "../helpers/make-env";
 import { resetDatabaseInit, initializeDatabase } from "../../src/db/init";
@@ -40,7 +40,7 @@ describe("implicit feedback (MCP)", () => {
     sqlite = makeSqliteD1();
     const kv = makeMemoryKV();
     await kv.put(CONFIG_KEY, JSON.stringify({ RECALL_LOG: "on" }));
-    env = makeTestEnv(undefined, {
+    env = sqlite.admitEnv(makeTestEnv(undefined, {
       DB: sqlite.db as unknown as Env["DB"],
       OAUTH_KV: kv,
       VECTORIZE: makeVectorizeMock({
@@ -50,13 +50,14 @@ describe("implicit feedback (MCP)", () => {
       }),
       AI: {
         run: vi.fn().mockImplementation(async (model: string) => {
-          if (model === "@cf/baai/bge-small-en-v1.5") return { data: [new Array(384).fill(0.1)] };
+          if (model === DEFAULTS.EMBEDDING_MODEL) return { data: [new Array(768).fill(0.1)] };
           return { response: '{"importance":2,"canonical":false,"kind":"semantic"}' };
         }),
       } as unknown as Ai,
-    });
+    }));
     await initializeDatabase(env);
     await ensureTenantBootstrap(env);
+    env = sqlite.admitEnv(env);
     identity = (await resolveIdentityFromToken("test-token", env))!;
   });
 
@@ -157,7 +158,7 @@ describe("implicit feedback (REST)", () => {
     sqlite = makeSqliteD1();
     const kv = makeMemoryKV();
     await kv.put(CONFIG_KEY, JSON.stringify({ RECALL_LOG: "on" }));
-    const bootEnv = makeTestEnv(undefined, { DB: sqlite.db as unknown as D1Database, OAUTH_KV: kv });
+    const bootEnv = sqlite.admitEnv(makeTestEnv(undefined, { DB: sqlite.db as unknown as D1Database, OAUTH_KV: kv }));
     await initializeDatabase(bootEnv);
     const roots = await ensureTenantBootstrap(bootEnv);
     sqlite.seed({ id: "m1", content: "REST feedback base", createdAt: 1000 });
@@ -165,7 +166,7 @@ describe("implicit feedback (REST)", () => {
     await sqlite.db.prepare(
       `INSERT INTO recall_log (id, workspace_id, created_at, channel, query, params, returned_ids) VALUES ('log-rest', ?, ?, 'rest', 'q', '{}', ?)`,
     ).bind(roots.ownerPersonalWorkspaceId, Date.now(), JSON.stringify(["m1"])).run();
-    const env: Env = makeTestEnv(undefined, { DB: sqlite.db as unknown as D1Database, OAUTH_KV: kv });
+    const env: Env = sqlite.admitEnv(makeTestEnv(undefined, { DB: sqlite.db as unknown as D1Database, OAUTH_KV: kv }));
     const deferred: Promise<unknown>[] = [];
     const ctx = { waitUntil: (p: Promise<unknown>) => deferred.push(p) } as unknown as ExecutionContext;
     return { env, ctx, deferred, db: sqlite.db };

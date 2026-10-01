@@ -1,6 +1,16 @@
 import { describe, it, expect, beforeEach } from "vitest";
-import { createEdge, edgeInsertStatement, inferEdgesOnWrite, isValidEdgeType, isSymmetric, edgeLabel } from "../../src/graph/edges";
+import {
+  createEdge,
+  decideInferredEdge,
+  edgeInsertStatement,
+  inferEdgesOnWrite,
+  isValidEdgeType,
+  isSymmetric,
+  edgeLabel,
+  replaceInferredEdgesOnWrite,
+} from "../../src/graph/edges";
 import { expandGraph } from "../../src/graph/traverse";
+import { getConnections } from "../../src/graph/traverse";
 import { makeTestEnv, makeTestDb } from "../helpers/make-env";
 import type { Env } from "../../src/env";
 import { D1Mock } from "../helpers/d1-mock";
@@ -161,10 +171,37 @@ describe("expandGraph", () => {
     expect(out.every(n => n.hop === 1)).toBe(true);
   });
 
+  it("keeps stored direction while traversing directed and undirected edges", async () => {
+    db.edges.push(
+      edge("a", "b", 0.8, "supersedes"),
+      edge("c", "a", 0.7, "caused_by"),
+      edge("a", "d", 0.6, "relates_to"),
+    );
+
+    const out = await expandGraph(["a"], { hops: 1 }, env);
+    const byId = new Map(out.map(neighbor => [neighbor.id, neighbor]));
+
+    expect(byId.get("b")).toMatchObject({ viaSourceId: "a", viaTargetId: "b", viaDirection: "outgoing" });
+    expect(byId.get("c")).toMatchObject({ viaSourceId: "c", viaTargetId: "a", viaDirection: "incoming" });
+    expect(byId.get("d")).toMatchObject({ viaSourceId: "a", viaTargetId: "d", viaDirection: "undirected" });
+  });
+
   it("never returns a seed node", async () => {
     db.edges.push(edge("a", "b"));
     const out = await expandGraph(["a", "b"], { hops: 1 }, env);
     expect(out).toHaveLength(0);
+  });
+
+  it("optionally exposes edges among seeds for recall reinforcement", async () => {
+    db.edges.push(edge("a", "b", 0.9, "follows"));
+
+    const out = await expandGraph(["a", "b"], { hops: 1, includeSeedNeighbors: true }, env);
+
+    expect(out.map(neighbor => neighbor.id).sort()).toEqual(["a", "b"]);
+    expect(out).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: "b", viaFrom: "a", viaDirection: "outgoing" }),
+      expect.objectContaining({ id: "a", viaFrom: "b", viaDirection: "incoming" }),
+    ]));
   });
 
   it("skips status:deprecated neighbors by default", async () => {
@@ -179,6 +216,39 @@ describe("expandGraph", () => {
     const out = await expandGraph(["a"], { hops: 2 }, env);
     const byId = Object.fromEntries(out.map(n => [n.id, n.hop]));
     expect(byId).toEqual({ b: 1, c: 2 });
+  });
+
+  it("keeps each frontier node's fanout when one hub has far more strong edges", async () => {
+    for (let i = 0; i < 8; i++) db.edges.push(edge("root", `frontier-${i}`, 1 - i / 100));
+    for (let i = 0; i < 140; i++) db.edges.push(edge("frontier-0", `hub-${i}`, 0.9 - i / 1000));
+    for (let i = 1; i < 8; i++) db.edges.push(edge(`frontier-${i}`, `leaf-${i}`, 0.4));
+
+    const out = await expandGraph(["root"], { hops: 2, fanoutCap: 8, maxNodes: 100 }, env);
+
+    for (let i = 1; i < 8; i++) expect(out.map(row => row.id)).toContain(`leaf-${i}`);
+    expect(out.filter(row => row.id.startsWith("hub-")).length).toBe(7);
+  });
+
+  it("filters the legacy connections API before node dedupe and keeps direction", async () => {
+    db.entries.push(
+      { id: "a", content: "A", tags: "[]", source: "api", created_at: 1, vector_ids: "[]" },
+      { id: "b", content: "B", tags: "[]", source: "api", created_at: 2, vector_ids: "[]" },
+    );
+    db.edges.push(
+      edge("a", "b", 0.95, "relates_to"),
+      edge("a", "b", 0.4, "supersedes"),
+    );
+
+    const connections = await getConnections("a", "supersedes", env);
+
+    expect(connections).toHaveLength(1);
+    expect(connections[0]).toMatchObject({
+      id: "b",
+      type: "supersedes",
+      sourceId: "a",
+      targetId: "b",
+      direction: "outgoing",
+    });
   });
 });
 
@@ -205,12 +275,21 @@ describe("inferEdgesOnWrite", () => {
     env = makeTestEnv(db);
   });
 
+  function seed(...rows: { id: string; tags?: string[] }[]) {
+    for (const row of rows) {
+      db.entries.push({
+        id: row.id, content: row.id, tags: JSON.stringify(row.tags ?? []), source: "api",
+        created_at: 1, vector_ids: "[]",
+      });
+    }
+  }
+
   it("auto-links only genuinely-related neighbors, not loose keyword-overlap ones", async () => {
-    present("new", "strong", "loose", "weak");
+    seed({ id: "new" }, { id: "strong" }, { id: "loose" }, { id: "weak" });
     await inferEdgesOnWrite("new", [
       { id: "strong", score: 0.84 }, // clearly related — link
-      { id: "loose", score: 0.66 },  // shares a keyword but not really related — must NOT link
-      { id: "weak", score: 0.4 },    // unrelated
+      { id: "loose", score: 0.4 },   // shares a keyword but stays below the calibrated floor
+      { id: "weak", score: 0.2 },    // unrelated
     ], env);
     expect(db.edges).toHaveLength(1);
     const linked = db.edges.flatMap((e: any) => [e.source_id, e.target_id]).filter((id: string) => id !== "new");
@@ -235,14 +314,14 @@ describe("inferEdgesOnWrite", () => {
   });
 
   it("never links the new entry to itself", async () => {
-    present("new", "a");
+    seed({ id: "new" }, { id: "a" });
     await inferEdgesOnWrite("new", [{ id: "new", score: 0.99 }, { id: "a", score: 0.8 }], env);
     expect(db.edges).toHaveLength(1);
     expect([db.edges[0].source_id, db.edges[0].target_id].sort()).toEqual(["a", "new"]);
   });
 
   it("caps at the top 3 strongest neighbors", async () => {
-    present("new", "a", "b", "c", "d", "e");
+    seed({ id: "new" }, ...["a", "b", "c", "d", "e"].map(id => ({ id })));
     await inferEdgesOnWrite("new", [
       { id: "a", score: 0.9 }, { id: "b", score: 0.85 }, { id: "c", score: 0.8 },
       { id: "d", score: 0.75 }, { id: "e", score: 0.7 },
@@ -253,14 +332,60 @@ describe("inferEdgesOnWrite", () => {
   });
 
   it("uses the similarity score as the edge weight", async () => {
-    present("new", "a");
+    seed({ id: "new" }, { id: "a" });
     await inferEdgesOnWrite("new", [{ id: "a", score: 0.82 }], env);
     expect(db.edges[0].weight).toBeCloseTo(0.82);
   });
 
   it("writes nothing when there are no qualifying neighbors", async () => {
-    present("new", "a");
+    seed({ id: "new" }, { id: "a" });
     await inferEdgesOnWrite("new", [{ id: "a", score: 0.3 }], env);
     expect(db.edges).toHaveLength(0);
+  });
+
+  it("admits Gemma's calibrated lower band only for a shared concrete project tag", async () => {
+    seed(
+      { id: "new", tags: ["work", "second-brain"] },
+      { id: "same-project", tags: ["context", "second-brain"] },
+      { id: "generic-only", tags: ["work"] },
+      { id: "other-project", tags: ["work", "upwork"] },
+    );
+    await inferEdgesOnWrite("new", [
+      { id: "same-project", score: 0.55 },
+      { id: "generic-only", score: 0.69 },
+      { id: "other-project", score: 0.69 },
+    ], env);
+
+    expect(db.edges).toHaveLength(1);
+    expect([db.edges[0].source_id, db.edges[0].target_id].sort()).toEqual(["new", "same-project"].sort());
+    expect(JSON.parse(db.edges[0].metadata)).toMatchObject({
+      inference_policy: "embeddinggemma-mrl128-v2",
+      basis: "shared-topic-tag",
+      shared_topic_tags: ["second-brain"],
+    });
+  });
+
+  it("does not treat mandated axis tags as project compatibility", () => {
+    expect(decideInferredEdge(0.69, ["work", "task"], ["work", "context"]).eligible).toBe(false);
+    expect(decideInferredEdge(0.70, ["work"], ["personal"]).eligible).toBe(true);
+  });
+
+  it("replaces stale inferred relates_to edges while preserving explicit and typed edges", async () => {
+    seed({ id: "entry", tags: ["second-brain"] }, { id: "old" }, { id: "fresh", tags: ["second-brain"] }, { id: "explicit" });
+    db.edges.push(
+      { ...edge("entry", "old", 0.8), id: "old-inferred" },
+      { ...edge("entry", "explicit", 0.5), id: "explicit", provenance: "explicit" },
+      { ...edge("entry", "old", 1, "supersedes"), id: "typed", provenance: "system" },
+    );
+
+    await replaceInferredEdgesOnWrite([
+      { entryId: "entry", neighbors: [{ id: "fresh", score: 0.55 }] },
+    ], env);
+
+    expect(db.edges.map((item: any) => item.id)).not.toContain("old-inferred");
+    expect(db.edges.some((item: any) => item.provenance === "explicit")).toBe(true);
+    expect(db.edges.some((item: any) => item.type === "supersedes")).toBe(true);
+    expect(db.edges.some((item: any) => item.type === "relates_to"
+      && [item.source_id, item.target_id].includes("fresh") && item.provenance === "inferred")).toBe(true);
   });
 });

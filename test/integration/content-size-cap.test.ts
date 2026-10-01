@@ -5,8 +5,8 @@
  * Tested at exactly the limit (must succeed) and one byte over (must be refused).
  */
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { Client } from "@modelcontextprotocol/client";
+import { InMemoryTransport } from "@modelcontextprotocol/client";
 import worker from "../../src/index";
 import { buildMcpServer } from "../../src/mcp/server";
 import { makeSqliteD1, type SqliteD1 } from "../helpers/sqlite-d1";
@@ -43,7 +43,7 @@ async function mcpCall(name: string, args: Record<string, unknown> = {}) {
 beforeEach(async () => {
   resetDatabaseInit();
   sqlite = makeSqliteD1();
-  env = makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV() });
+  env = sqlite.admitEnv(makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV() }));
   await initializeDatabase(env);
   await ensureTenantBootstrap(env);
   identity = (await resolveIdentityFromToken("test-token", env))!;
@@ -106,13 +106,13 @@ describe("REST POST /append size cap (checks the resulting total)", () => {
   });
 
   it("accepts when existing plus addition sums to exactly the limit", async () => {
-    sqlite.seed({ id: "e1", content: "a".repeat(MAX_CONTENT_BYTES - 5), createdAt: Date.now() });
+    sqlite.seed({ id: "e1", content: "a".repeat(MAX_CONTENT_BYTES - 5), tags: ["quarantine:too_long", "status:draft"], createdAt: Date.now() });
     const res = await worker.fetch(req("POST", "/append", { body: { id: "e1", addition: "bbbbb" } }), env, ctx);
     expect(res.status).toBe(200);
   });
 
   it("refuses when existing plus addition sums to one byte over the limit", async () => {
-    sqlite.seed({ id: "e1", content: "a".repeat(MAX_CONTENT_BYTES - 5), createdAt: Date.now() });
+    sqlite.seed({ id: "e1", content: "a".repeat(MAX_CONTENT_BYTES - 5), tags: ["quarantine:too_long", "status:draft"], createdAt: Date.now() });
     const res = await worker.fetch(req("POST", "/append", { body: { id: "e1", addition: "bbbbbb" } }), env, ctx);
     expect(res.status).toBe(413);
   });

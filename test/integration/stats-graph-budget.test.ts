@@ -48,7 +48,7 @@ describe("GET /stats/graph read budget", () => {
       batch: (s: any) => inner.batch(s),
       exec: (s: string) => inner.exec(s),
     };
-    env = makeTestEnv(undefined, { DB: DB as unknown as Env["DB"], OAUTH_KV: makeMemoryKV() });
+    env = sqlite.admitEnv(makeTestEnv(undefined, { DB: DB as unknown as Env["DB"], OAUTH_KV: makeMemoryKV() }));
     await initializeDatabase(env);
     await ensureTenantBootstrap(env);
     issued.length = 0;

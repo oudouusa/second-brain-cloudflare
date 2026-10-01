@@ -1,5 +1,5 @@
 /**
- * GET /digest must not cross tenant boundaries: manual rollups are scoped to the
+ * POST /digest must not cross tenant boundaries: manual rollups are scoped to the
  * caller's readable workspaces and must not mark or synthesize from a colleague's
  * private rows.
  */
@@ -25,7 +25,7 @@ function digestAI(prompts: string[]): Ai {
   });
   return {
     run: vi.fn().mockImplementation(async (model: string, opts: any) => {
-      if (model === "@cf/baai/bge-small-en-v1.5") return { data: [new Array(384).fill(0.1)] };
+      if (model === "@cf/google/embeddinggemma-300m") return { data: [new Array(768).fill(0.1)] };
       if (opts?.stream) {
         prompts.push(String(opts?.messages?.[0]?.content ?? ""));
         return sse("Bob's digest paragraph.");
@@ -35,7 +35,7 @@ function digestAI(prompts: string[]): Ai {
   } as unknown as Ai;
 }
 
-describe("GET /digest tenancy", () => {
+describe("POST /digest tenancy", () => {
   let sqlite: SqliteD1;
   let env: Env;
   let bobToken = "";
@@ -81,8 +81,10 @@ describe("GET /digest tenancy", () => {
     ).bind(aliceWorkspaceId).all() as { results: { id: string; tags: string; content: string }[] };
 
     const res = await worker.fetch(
-      new Request("http://localhost/digest?tag=proj", {
-        headers: { Authorization: `Bearer ${bobToken}` },
+      new Request("http://localhost/digest", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${bobToken}` },
+        body: JSON.stringify({ tag: "proj", workspace: "personal" }),
       }),
       env,
       ctx,
@@ -111,8 +113,10 @@ describe("GET /digest tenancy", () => {
 
   it("admin digest stays scoped to readable workspaces, not every member private row", async () => {
     const res = await worker.fetch(
-      new Request("http://localhost/digest?tag=proj", {
-        headers: { Authorization: `Bearer ${ADMIN}` },
+      new Request("http://localhost/digest", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${ADMIN}` },
+        body: JSON.stringify({ tag: "proj", workspace: "personal" }),
       }),
       env,
       ctx,

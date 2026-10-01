@@ -45,14 +45,14 @@ describe("sqlite-d1 facade batch()", () => {
   // default include glob never collects tests written inside it — this lives
   // here instead, exercising the facade the same way the schema tests above
   // do, against the table this task adds.
-  it("counts a batch as one subrequest", async () => {
+  it("counts every statement inside a batch as a D1 query", async () => {
     const sqlite = makeSqliteD1();
     const before = sqlite.issued.length;
     await sqlite.db.batch([
       sqlite.db.prepare(`INSERT INTO insight_candidates (id, a_id, b_id, similarity, gap_ms, score, signal, status, created_at) VALUES ('x', 'a', 'b', 1, 1, 1, 'vector', 'pending', 1)`),
       sqlite.db.prepare(`INSERT INTO insight_candidates (id, a_id, b_id, similarity, gap_ms, score, signal, status, created_at) VALUES ('y', 'c', 'd', 1, 1, 1, 'vector', 'pending', 1)`),
     ]);
-    expect(sqlite.issued.length - before).toBe(1);
+    expect(sqlite.issued.length - before).toBe(2);
     sqlite.close();
   });
 });

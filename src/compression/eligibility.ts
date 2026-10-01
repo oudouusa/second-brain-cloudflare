@@ -56,8 +56,13 @@ export const RESERVED_TAG_PREFIXES = [
 ];
 const RESERVED_TAGS = [STALE_AS_OF];
 
-/** Bookkeeping tags that mark an entry's role in compression rather than its subject. */
-const NON_TOPIC_TAGS = ["synthesized", "auto-pattern", "auto-insight", "duplicate-candidate", "contradiction-resolved", "rolled-up", "user-edited", "conflict-held", OWED_TO_ME_TAG, RETRACTED_SOURCE_TAG];
+const NON_TOPIC_TAGS = [
+  "synthesized", "auto-pattern", "auto-insight", "duplicate-candidate", "contradiction-resolved", "rolled-up", "user-edited", "conflict-held", OWED_TO_ME_TAG, RETRACTED_SOURCE_TAG,
+];
+// 汎用分類タグは検索に残し、案件をまとめるdigestの対象からだけ外す。
+const GENERIC_CLASSIFICATION_TAGS = [
+  "personal", "work", "task", "idea", "context", "codex-response",
+];
 
 export function isReservedTag(tag: string): boolean {
   const t = tag.toLowerCase();
@@ -88,6 +93,16 @@ export function isTopicTagSql(column = "value"): string {
     ...RESERVED_TAG_PREFIXES.map(prefix => `${column} NOT LIKE '${prefix}%'`),
     ...RESERVED_TAGS.map(t => `${column} NOT LIKE '${t}'`),
   ].join("\n      AND ");
+}
+
+/** 検索用の話題判定へ、要約に限った汎用タグ除外を追加する。 */
+export function isCompressionTag(tag: string): boolean {
+  return isTopicTag(tag) && !GENERIC_CLASSIFICATION_TAGS.includes(tag.toLowerCase());
+}
+
+/** 直接実行と候補SQLが同じ一覧・大文字小文字を無視する完全一致を使う。 */
+export function isCompressionTagSql(column = "value"): string {
+  return `${isTopicTagSql(column)}\n      AND lower(${column}) NOT IN (${GENERIC_CLASSIFICATION_TAGS.map(t => `'${t}'`).join(", ")})`;
 }
 
 // Returns a SQL boolean fragment for "this entry is eligible for compression".

@@ -43,14 +43,20 @@ describe("GET /stats/graph", () => {
   let readable: string[] = [];
 
   /** Edges are inserted directly: seed() has no workspace column and scope is what is under test. */
-  function edge(id: string, source: string, target: string, type: string, workspaceId: string): void {
-    sqlite.db
+  async function edge(id: string, source: string, target: string, type: string, workspaceId: string): Promise<void> {
+    // Historical graph-health fixtures intentionally include missing endpoints;
+    // production keeps the stricter fork trigger throughout normal requests.
+    const guard: any = await sqlite.db.prepare("SELECT sql FROM sqlite_master WHERE name = 'trg_edges_endpoint_guard_v1'").first();
+    await sqlite.db.exec("DROP TRIGGER trg_edges_endpoint_guard_v1");
+    try {
+    await sqlite.db
       .prepare(
         `INSERT INTO edges (id, source_id, target_id, type, weight, provenance, metadata, created_at, updated_at, workspace_id)
          VALUES (?, ?, ?, ?, 0.5, 'inferred', '{}', 0, 0, ?)`,
       )
       .bind(id, source, target, type, workspaceId)
       .run();
+    } finally { await sqlite.db.exec(guard.sql); }
   }
 
   /** entries.seed() has no workspace column, and workspace placement is under test. */
@@ -67,10 +73,10 @@ describe("GET /stats/graph", () => {
   beforeEach(async () => {
     resetDatabaseInit();
     sqlite = makeSqliteD1();
-    env = makeTestEnv(undefined, {
+    env = sqlite.admitEnv(makeTestEnv(undefined, {
       DB: sqlite.db as unknown as Env["DB"],
       OAUTH_KV: makeMemoryKV(),
-    });
+    }));
     await initializeDatabase(env);
     await ensureTenantBootstrap(env);
     memberToken = (await createMember(env, { name: "Bob" })).token;
@@ -93,9 +99,9 @@ describe("GET /stats/graph", () => {
   });
 
   it("counts edges by type for an admin", async () => {
-    edge("e1", "a", "b", "relates_to", readable[0]);
-    edge("e2", "b", "c", "relates_to", readable[0]);
-    edge("e3", "c", "d", "follows", readable[0]);
+    await edge("e1", "a", "b", "relates_to", readable[0]);
+    await edge("e2", "b", "c", "relates_to", readable[0]);
+    await edge("e3", "c", "d", "follows", readable[0]);
 
     const res = await worker.fetch(get("/stats/graph", ADMIN), env, ctx);
     expect(res.status).toBe(200);
@@ -104,7 +110,7 @@ describe("GET /stats/graph", () => {
   });
 
   it("omits the deep sections unless ?deep=1 is asked for", async () => {
-    edge("e1", "a", "b", "relates_to", readable[0]);
+    await edge("e1", "a", "b", "relates_to", readable[0]);
 
     const body = await (await worker.fetch(get("/stats/graph", ADMIN), env, ctx)).json() as any;
     expect(body.deep).toBe(false);
@@ -117,8 +123,8 @@ describe("GET /stats/graph", () => {
   // the UNION ALL still reports the hub correctly.
   it("counts inbound edges towards a node's degree", async () => {
     entry("sink", 1000, readable[0]);
-    edge("e1", "a", "sink", "relates_to", readable[0]);
-    edge("e2", "b", "sink", "relates_to", readable[0]);
+    await edge("e1", "a", "sink", "relates_to", readable[0]);
+    await edge("e2", "b", "sink", "relates_to", readable[0]);
 
     const body = await (await worker.fetch(get("/stats/graph?deep=1", ADMIN), env, ctx)).json() as any;
     expect(body.topDegree[0]).toEqual({ id: "sink", degree: 2 });
@@ -128,8 +134,8 @@ describe("GET /stats/graph", () => {
     sqlite.seed({ id: "hub", content: "hub", createdAt: 1000 });
     sqlite.seed({ id: "leaf1", content: "leaf1", createdAt: 1001 });
     sqlite.seed({ id: "leaf2", content: "leaf2", createdAt: 1002 });
-    edge("e1", "hub", "leaf1", "relates_to", readable[0]);
-    edge("e2", "hub", "leaf2", "relates_to", readable[0]);
+    await edge("e1", "hub", "leaf1", "relates_to", readable[0]);
+    await edge("e2", "hub", "leaf2", "relates_to", readable[0]);
 
     const body = await (await worker.fetch(get("/stats/graph?deep=1", ADMIN), env, ctx)).json() as any;
     expect(body.deep).toBe(true);
@@ -138,8 +144,8 @@ describe("GET /stats/graph", () => {
 
   it("counts an edge whose target has no entries row under ?deep=1", async () => {
     entry("real", 1000, readable[0]);
-    edge("kept", "real", "real", "relates_to", readable[0]);
-    edge("missing-target", "real", "deleted-entry", "relates_to", readable[0]);
+    await edge("kept", "real", "real", "relates_to", readable[0]);
+    await edge("missing-target", "real", "deleted-entry", "relates_to", readable[0]);
 
     const body = await (await worker.fetch(get("/stats/graph?deep=1", ADMIN), env, ctx)).json() as any;
     expect(body.invalidEndpointEdges).toBe(1);
@@ -149,7 +155,7 @@ describe("GET /stats/graph", () => {
   // pointing both subqueries at target_id still returns the right number.
   it("counts an edge whose SOURCE has no entries row", async () => {
     entry("real", 1000, readable[0]);
-    edge("missing-source", "deleted-entry", "real", "relates_to", readable[0]);
+    await edge("missing-source", "deleted-entry", "real", "relates_to", readable[0]);
 
     const body = await (await worker.fetch(get("/stats/graph?deep=1", ADMIN), env, ctx)).json() as any;
     expect(body.invalidEndpointEdges).toBe(1);
@@ -160,7 +166,7 @@ describe("GET /stats/graph", () => {
   // count must not depend on the caller's membership.
   it("counts an edge whose endpoint sits in a different workspace from the edge", async () => {
     entry("elsewhere", 1000, "ws-somewhere-else");
-    edge("crossing", "elsewhere", "elsewhere", "relates_to", readable[0]);
+    await edge("crossing", "elsewhere", "elsewhere", "relates_to", readable[0]);
 
     const body = await (await worker.fetch(get("/stats/graph?deep=1", ADMIN), env, ctx)).json() as any;
     expect(body.invalidEndpointEdges).toBe(1);
@@ -222,11 +228,11 @@ describe("GET /stats/graph", () => {
     // as invalid and the assertion below is about scope alone.
     entry("mine", 1000, readable[0]);
     sqlite.seed({ id: "theirs", content: "theirs", createdAt: 1001 });
-    edge("in", "mine", "mine", "relates_to", readable[0]);
+    await edge("in", "mine", "mine", "relates_to", readable[0]);
     // Same shape, higher degree, outside the caller's scope: it would top the
     // ranking and double the type count if the scope clause were dropped.
-    edge("out1", "theirs", "mine", "relates_to", OUTSIDE);
-    edge("out2", "theirs", "mine", "follows", OUTSIDE);
+    await edge("out1", "theirs", "mine", "relates_to", OUTSIDE);
+    await edge("out2", "theirs", "mine", "follows", OUTSIDE);
 
     const body = await (await worker.fetch(get("/stats/graph?deep=1", ADMIN), env, ctx)).json() as any;
     expect(body.edgeTypes).toEqual({ relates_to: 1 });

@@ -1,3 +1,4 @@
+import { assertMemoryWritesAllowed, memoryWriteMarker } from "../migration/write-lock";
 import type { Env } from "../env";
 import type { Identity } from "../lib/identity";
 import type { ChangeContext } from "../lib/audit";
@@ -196,7 +197,7 @@ async function releaseHeldAfterEdit(
         guard: p2 => buildCasGuard(p2, casColumns),
       }),
       // versioning: snapshot
-      env.DB.prepare(`UPDATE entries AS e SET tags = ${tagsIdx}, vector_ids = ${vectorIdsIdx}, updated_at = MAX(${nowIdx}, COALESCE(e.updated_at, e.created_at) + 1) WHERE e.id = ${idIdx} AND ${buildCasGuard(p, casColumns)}`)
+      env.DB.prepare(`UPDATE entries AS e SET write_marker = ${p.add(memoryWriteMarker(env))}, tags = ${tagsIdx}, vector_ids = ${vectorIdsIdx}, pending_append_passages = '[]', updated_at = MAX(${nowIdx}, COALESCE(e.updated_at, e.created_at) + 1) WHERE e.id = ${idIdx} AND ${buildCasGuard(p, casColumns)}`)
         .bind(...p.values()),
       pruneStatement(env, id, config.VERSION_KEEP),
     ]);
@@ -530,11 +531,11 @@ export async function revertEntry(
   const validitySet = restoreValidity
     ? `, valid_from = ${p.add(nextValidity!.valid_from ?? null)}, valid_until = ${p.add(nextValidity!.valid_until ?? null)}`
     : "";
-  const vectorIdsSet = nextVectorIds !== undefined ? `, vector_ids = ${p.add(nextVectorIds)}` : "";
+  const vectorIdsSet = nextVectorIds !== undefined ? `, vector_ids = ${p.add(nextVectorIds)}, pending_append_passages = '[]'` : "";
   // updated_at clamped strictly past its own previous value (the digest mark guard trusts it
   // plus byte length; a same-millisecond, same-length revert with no clamp would leave it unmoved).
   // versioning: snapshot
-  const updateSql = `UPDATE entries AS e SET content = ${p.add(restoredContent)}, tags = ${p.add(JSON.stringify(restoredTags))}, updated_at = MAX(${p.add(now)}, COALESCE(e.updated_at, e.created_at) + 1)${vectorIdsSet}${whenSet}${validitySet} WHERE e.id = ${p.add(id)} AND ${revertGuard(p)} AND ${ownSnapshotLandedSql(p, id, newest.seq, nonce)}`;
+  const updateSql = `UPDATE entries AS e SET write_marker = ${p.add(memoryWriteMarker(env))}, content = ${p.add(restoredContent)}, tags = ${p.add(JSON.stringify(restoredTags))}, updated_at = MAX(${p.add(now)}, COALESCE(e.updated_at, e.created_at) + 1)${vectorIdsSet}${whenSet}${validitySet} WHERE e.id = ${p.add(id)} AND ${revertGuard(p)} AND ${ownSnapshotLandedSql(p, id, newest.seq, nonce)}`;
 
   // Embedded before the batch, like the main content above, so the insert below can carry its own
   // vector_ids the way restoreEntry does (U14). Each insert is guarded by the SAME "this request's own
@@ -570,8 +571,8 @@ export async function revertEntry(
     const ip = new Params();
     // versioning: exempt: creation — a re-created row has no prior state to keep
     incomingStatements.push(env.DB.prepare(
-      `INSERT INTO entries (id, content, tags, source, created_at, updated_at, vector_ids, workspace_id, actor_id)
-       SELECT ${ip.add(create.id)}, ${ip.add(incoming)}, ${ip.add(JSON.stringify(incomingTags))}, ${ip.add(incomingSource)}, ${ip.add(insertedAt)}, ${ip.add(insertedAt)}, ${ip.add(JSON.stringify(vectorIds))}, ${ip.add(row.workspace_id)}, ${ip.add(create.merge.actor_id)}
+      `INSERT INTO entries (id, content, tags, source, created_at, updated_at, vector_ids, workspace_id, actor_id, write_marker)
+       SELECT ${ip.add(create.id)}, ${ip.add(incoming)}, ${ip.add(JSON.stringify(incomingTags))}, ${ip.add(incomingSource)}, ${ip.add(insertedAt)}, ${ip.add(insertedAt)}, ${ip.add(JSON.stringify(vectorIds))}, ${ip.add(row.workspace_id)}, ${ip.add(create.merge.actor_id)}, ${ip.add(memoryWriteMarker(env))}
         WHERE ${ownSnapshotLandedSql(ip, id, newest.seq, nonce)}`,
     ).bind(...ip.values()));
   }

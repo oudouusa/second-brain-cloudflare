@@ -110,7 +110,7 @@ describe("gemini-cli-hooks/session-start.js", () => {
     // Only JSON on stdout - no plain-text fallback like Codex allows.
     expect(r.stdout.trimStart().startsWith("{")).toBe(true);
 
-    const recalls = captured.filter(c => c.url.startsWith("/recall?"));
+    const recalls = captured.filter(c => c.url === "/recall" && c.method === "POST");
     expect(recalls.length).toBeGreaterThanOrEqual(1);
   });
 
@@ -128,7 +128,7 @@ describe("gemini-cli-hooks/session-start.js", () => {
     captured = [];
     const clear = await runHook(payload("clear"));
     expect(clear.stdout).toContain("Context recalled");
-    expect(captured.filter(c => c.url.startsWith("/recall?")).length).toBeGreaterThanOrEqual(1);
+    expect(captured.filter(c => c.url === "/recall" && c.method === "POST").length).toBeGreaterThanOrEqual(1);
   });
 
   it("emits nothing when there is no context to recall", async () => {

@@ -78,6 +78,7 @@ type Opts = {
 function setup(opts: Opts = {}) {
   const byId = new Map<string, any>();
   const urls: string[] = [];
+  const listBodies: Record<string, string>[] = [];
   const listAtRosterTime: Array<string | null> = [];
   const absent = new Set(opts.missing ?? []);
   // A real store: the coach mark below is dismissed through it, and the
@@ -93,7 +94,12 @@ function setup(opts: Opts = {}) {
     removeItem: (k: string) => void store.delete(k),
   };
 
-  const fetchImpl = async (url: string) => {
+  const fetchImpl = async (url: string, init: RequestInit = {}) => {
+    if (new URL(url).pathname === "/list") {
+      expect(init.method).toBe("POST");
+      expect(new URL(url).search).toBe("");
+      listBodies.push(JSON.parse(String(init.body)));
+    }
     urls.push(url);
     if (url.includes("/team/roster")) {
       // What the memories list held at the moment the roster was asked for.
@@ -147,7 +153,7 @@ function setup(opts: Opts = {}) {
   ctx.initI18n("en");
 
   const el = (id: string) => ctx.document.getElementById(id);
-  const lists = () => urls.filter((u) => u.includes("/list?"));
+  const lists = () => listBodies;
   const rosters = () => urls.filter((u) => u.includes("/team/roster"));
   /** Drain the promise chain an onchange handler starts but does not return. */
   const settle = async () => {
@@ -168,7 +174,7 @@ const row = (over: Record<string, unknown> = {}) => ({
 });
 
 /** The query string of the most recent GET /list. */
-const q = (url: string) => url.slice(url.indexOf("/list?") + "/list?".length);
+const q = (body: Record<string, string>) => new URLSearchParams(body).toString();
 
 describe("memories author filter", () => {
   it("reveals the filter on the shared layer and fetches the roster once", async () => {

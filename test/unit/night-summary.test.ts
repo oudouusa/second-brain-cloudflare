@@ -80,3 +80,22 @@ describe("readNightSummary", () => {
     expect(await readNightSummary(env, "ws-a")).toBeNull();
   });
 });
+
+
+describe("complete record validation", () => {
+  it.each([-1, 0.5, "3", null, Number.MAX_SAFE_INTEGER + 1])("refuses invalid counter %j without overwriting a good record", async invalid => {
+    const kv = makeMemoryKV(); const env = makeTestEnv(undefined, { OAUTH_KV: kv });
+    const counts = { whenExtracted: 0, whenJudged: 0, whenSkipped: 0, linksInferred: 1, insightsProposed: 0, digestsWritten: 2, claimsFlagged: 3 };
+    await recordNightSummary(env, "ws-a", counts);
+    const previous = await kv.get(nightSummaryKey("ws-a"));
+    await recordNightSummary(env, "ws-a", { ...counts, linksInferred: invalid } as never);
+    expect(await kv.get(nightSummaryKey("ws-a"))).toBe(previous);
+    await kv.put(nightSummaryKey("ws-a"), JSON.stringify({ ...counts, ranAt: 1, linksInferred: invalid }));
+    expect(await readNightSummary(env, "ws-a")).toBeNull();
+  });
+  it("treats missing fields as unknown rather than inventing completed zero counts", async () => {
+    const kv = makeMemoryKV(); const env = makeTestEnv(undefined, { OAUTH_KV: kv });
+    await kv.put(nightSummaryKey("ws-a"), JSON.stringify({ ranAt: 1, digestsWritten: 2 }));
+    expect(await readNightSummary(env, "ws-a")).toBeNull();
+  });
+});

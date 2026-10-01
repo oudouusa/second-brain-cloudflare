@@ -1,37 +1,33 @@
 import type { Env } from "../env";
 import { DEFAULTS, type Config } from "../config";
 import { D1_MAX_BOUND_PARAMS, WRITE_PATH_TOPK } from "../constants";
-import { nearestParents } from "../vectorize/parents";
+import { assertVectorProfiles } from "../embedding/profile";
 import { getKind } from "../memory/kind";
 import { getStatus } from "../memory/status";
-import { layerOf, scopeWhereForIdRead, scopeWhereForRead } from "../lib/scope";
+import { layerOf, scopeWhere, scopeWhereForIdRead, scopeWhereForRead } from "../lib/scope";
+import { nearestParents } from "../vectorize/parents";
 import { resolveActorLabel } from "../lib/actors";
 import type { Identity } from "../lib/identity";
 import { projectFilterSql } from "../projects/filter";
 import type { ProjectRow } from "../projects/registry";
 import { edgeLabel } from "./edges";
-import type { Connection, EdgeProvenance, GraphNeighbor, GraphView } from "./types";
-import { isHeld, NOT_HELD_SQL } from "../quarantine/tags";
+import { EDGE_TYPES, type Connection, type ConnectionPage, type EdgeDirection, type EdgeProvenance, type EdgeType, type GraphNeighbor, type GraphView } from "./types";
+import { isHeld, NOT_HELD_SQL, notHeldSqlFor } from "../quarantine/tags";
 
 export const GRAPH_MAX_HOPS = 3;
 const GRAPH_FANOUT_CAP = 8;
 const GRAPH_MAX_NODES = 50;
 // Ceiling on the /graph view's node set, applied even when the caller asks for
-// no cap. The binding constraint is this codebase's self-imposed D1 budget of
-// 50 calls per invocation — NOT the platform's actual ceiling, which is 1,000
-// D1/KV/Vectorize calls per invocation (see
-// https://developers.cloudflare.com/workers/platform/limits/#subrequests). The
-// self-imposed budget is kept this tight for cost and 10 ms-CPU reasons, not
-// because the platform would throw at these counts. buildGraph costs
+// no cap. The binding constraint is the Workers free-plan limit of 50
+// subrequests per invocation, not row reads. buildGraph costs
 //
 //   1 (edge scan) + ceil(N/D1_MAX_BOUND_PARAMS) (node hydration)
 //                 + ceil(N/EDGE_QUERY_BATCH)    (edge hydration)
 //
 // D1 queries for N nodes, plus one KV read for the config. At N=1500 that is
 // 1 + 15 + 30 = 46, or 47 with the KV read. N=1600 lands on exactly 50 with
-// nothing spare, and anything from 1634 up exceeds this codebase's self-imposed
-// budget outright — which would be a graph tab costing more D1 calls and CPU
-// than this codebase allows itself for every free-plan brain that large, and
+// nothing spare, and anything from 1634 up exceeds it outright — which would be
+// a deterministically dead graph tab for every free-plan brain that large, and
 // runGraphPass backfills edges nightly, so a brain arrives there on its own.
 //
 // That formula is the IDENTITY-LESS arithmetic — the cron callers. A scoped
@@ -48,7 +44,7 @@ const GRAPH_MAX_NODES = 50;
 // in the hydration's projection and the author's name arrives through a LEFT
 // JOIN on it, so there is no per-view statement and no per-author bound
 // parameter. A whole served request adds the identity batch and the KV config
-// read: 50 for a member at N=1500, the entire self-imposed budget with nothing
+// read: 50 for a member at N=1500, the entire free-plan budget with nothing
 // spare. THAT TOTAL IS PINNED by "costs exactly this many subrequests at
 // GRAPH_VIEW_MAX_NODES" in test/integration/graph-team-aware.test.ts — change it
 // deliberately or not at all, and remember a cold isolate still pays
@@ -56,17 +52,16 @@ const GRAPH_MAX_NODES = 50;
 //
 // 47 is the WARM figure for the identity-less path. On a cold isolate the
 // budget is shared with initializeDatabase, which fires under waitUntil and spends about 12 more on
-// its DDL, so the first request against a fresh isolate costs ~59 — over this
-// codebase's self-imposed budget, though still far under the platform's real
-// 1,000-call ceiling — and 1500 buys margin on the warm path, it does not clear
-// the cold one. That is #282 (probe sqlite_master once instead of issuing
-// twelve blind statements, taking cold /graph from 59 to 48), not something a
-// lower cap here can fix: the tax is fixed, so it eats any N.
+// its DDL, so the first request against a fresh isolate costs ~59 and is over
+// the limit — 1500 buys margin on the warm path, it does not clear the cold one.
+// That is #282 (probe sqlite_master once instead of issuing twelve blind
+// statements, taking cold /graph from 59 to 48), not something a lower cap here
+// can fix: the tax is fixed, so it eats any N.
 //
 // Recompute the formula above before raising this, and count the cold case as
 // well as the warm one. D1's 5M rows/day cap is the secondary bound and is
 // nowhere near binding here; sizing against it is what produced a number that
-// blew this codebase's self-imposed cost budget (though not the platform's).
+// broke the free plan.
 //
 // It is a legibility limit too: the packed-cluster canvas is unreadable well
 // before 1500 nodes.
@@ -88,6 +83,32 @@ export const GRAPH_VIEW_MAX_NODES = 1500;
  */
 const MACHINE_AUTHORED_TAGS = new Set(["auto-pattern", "auto-insight", "synthesized"]);
 export const GRAPH_HOP_DECAY = 0.6;
+// A filtered traversal binds the type once in each UNION arm in addition to
+// the two frontier copies and rank cap.
+const EDGE_QUERY_BATCH = Math.floor((D1_MAX_BOUND_PARAMS - 3) / 2);
+const GRAPH_EDGE_VIEW_PER_NODE = 8;
+export const CONNECTIONS_DEFAULT_LIMIT = 20;
+export const CONNECTIONS_MAX_LIMIT = 100;
+export const CONNECTIONS_MAX_OFFSET = 10_000;
+const CONNECTION_CURSOR_PREFIX = "c1.";
+
+function directionFrom(fromId: string, sourceId: string, type: EdgeType): EdgeDirection {
+  if (!EDGE_TYPES[type]?.directed) return "undirected";
+  return fromId === sourceId ? "outgoing" : "incoming";
+}
+
+export function parseConnectionsCursor(cursor: string | undefined): number | null {
+  if (cursor === undefined) return 0;
+  if (!cursor.startsWith(CONNECTION_CURSOR_PREFIX)) return null;
+  const raw = cursor.slice(CONNECTION_CURSOR_PREFIX.length);
+  if (!/^(0|[1-9]\d*)$/.test(raw)) return null;
+  const offset = Number(raw);
+  return Number.isSafeInteger(offset) && offset <= CONNECTIONS_MAX_OFFSET ? offset : null;
+}
+
+function connectionsCursor(offset: number): string {
+  return `${CONNECTION_CURSOR_PREFIX}${offset}`;
+}
 /**
  * Ids one edge-fetch batch can carry. Each binds TWICE (source_id IN (…) OR
  * target_id IN (…)), and a scoped caller's workspace bindings come out of the
@@ -96,7 +117,7 @@ export const GRAPH_HOP_DECAY = 0.6;
  * hop costs two statements instead of one (src/recall/neighborhood.ts).
  */
 export const edgeScanBatchSize = (scopeBindings: number): number =>
-  Math.max(1, Math.floor((D1_MAX_BOUND_PARAMS - scopeBindings) / 2));
+  Math.max(1, Math.min(EDGE_QUERY_BATCH, Math.floor((D1_MAX_BOUND_PARAMS - scopeBindings * 2 - 1) / 2)));
 
 /**
  * Two verdicts about a hop's candidate ids, from ONE scoped statement: which of
@@ -106,8 +127,8 @@ export const edgeScanBatchSize = (scopeBindings: number): number =>
  * already restricts the rows to the caller's readable workspaces, so the ids that
  * come back ARE the readable ones — reading that off costs nothing beyond the
  * statement the deprecation check was issuing anyway, which is what keeps the
- * per-endpoint check inside the self-imposed D1 budget GRAPH_VIEW_MAX_NODES is
- * sized against. Absent an Identity there is nothing to be readable *to*, and the
+ * per-endpoint check inside the subrequest budget GRAPH_VIEW_MAX_NODES is sized
+ * against. Absent an Identity there is nothing to be readable *to*, and the
  * `readable` set is not consulted.
  */
 async function readableAndDeprecatedAmong(
@@ -167,24 +188,7 @@ async function readableAndDeprecatedAmong(
  */
 export async function expandGraph(
   seedIds: string[],
-  opts: {
-    hops: number; fanoutCap?: number; maxNodes?: number; includeDeprecated?: boolean;
-    /**
-     * T-0089.2.1: false drops a hop candidate whose validity window already
-     * ended. Defaults to includeDeprecated's own value when absent — the two
-     * are the same "show it anyway" request for every caller today (a graph
-     * or connections view wants both; recall and the cron/backfill callers
-     * that pre-date validity want neither) — so an existing caller that only
-     * ever set includeDeprecated keeps its old behavior and its old D1 cost.
-     */
-    includeSuperseded?: boolean;
-    only?: "personal" | "company"; teamId?: string;
-    /**
-     * As-of (spec 14 5.7 item 4): expand as of this moment T instead of now, and never expand a
-     * belief (a deprecated node) whatever includeDeprecated/includeSuperseded say.
-     */
-    asOf?: number;
-  },
+  opts: { hops: number; fanoutCap?: number; maxNodes?: number; includeDeprecated?: boolean; includeSuperseded?: boolean; asOf?: number; includeSeedNeighbors?: boolean; type?: EdgeType; only?: "personal" | "company"; teamId?: string; project?: readonly ProjectRow[] },
   env: Env,
   config: Readonly<Config> = DEFAULTS,
   identity?: Identity,
@@ -195,27 +199,55 @@ export async function expandGraph(
   const now = opts.asOf ?? Date.now();
   const fanoutCap = opts.fanoutCap ?? GRAPH_FANOUT_CAP;
   const maxNodes = opts.maxNodes ?? GRAPH_MAX_NODES;
-  const scope = identity ? scopeWhereForRead(identity, { layer: opts.only, teamId: opts.teamId }) : null;
+  const scope = identity
+    ? scopeWhereForRead(identity, { layer: opts.only, teamId: opts.teamId })
+    : null;
 
+  const seedSet = new Set(seedIds);
   const visited = new Set(seedIds);
+  const emittedSeedNeighbors = new Set<string>();
   const out: GraphNeighbor[] = [];
   let frontier = [...seedIds];
 
   for (let hop = 1; hop <= hops && frontier.length && out.length < maxNodes; hop++) {
-    const edgeRows: { source_id: string; target_id: string; type: string; weight: number; provenance: EdgeProvenance; created_at: number }[] = [];
-    const edgeTake = edgeScanBatchSize(scope?.bindings.length ?? 0);
+    const edgeRows: { from_id: string; source_id: string; target_id: string; type: string; weight: number; provenance: EdgeProvenance; created_at: number }[] = [];
+    const scopeBindings = scope?.bindings ?? [];
+    const fixedBindings = (opts.type ? 2 : 0) + scopeBindings.length * 2 + 1;
+    const edgeTake = Math.max(1, Math.min(
+      EDGE_QUERY_BATCH,
+      Math.floor((D1_MAX_BOUND_PARAMS - fixedBindings) / 2),
+    ));
     for (let i = 0; i < frontier.length; i += edgeTake) {
       const batch = frontier.slice(i, i + edgeTake);
       const ph = batch.map(() => "?").join(", ");
-      // The OR group is parenthesised only in the scoped form: appending a bare
-      // `AND workspace_id IN (...)` to the unparenthesised OR would bind to the
-      // right arm alone (`a OR b AND c` ≡ `a OR (b AND c)`).
-      const sql = scope
-        ? `SELECT source_id, target_id, type, weight, provenance, created_at FROM edges WHERE (source_id IN (${ph}) OR target_id IN (${ph})) AND ${scope.clause} ORDER BY weight DESC`
-        // scope-exempt: identity-less branch: pre-tenancy callers; the scoped arm is the line above
-        : `SELECT source_id, target_id, type, weight, provenance, created_at FROM edges WHERE source_id IN (${ph}) OR target_id IN (${ph}) ORDER BY weight DESC`;
-      const { results } = await env.DB.prepare(sql)
-        .bind(...batch, ...batch, ...(scope?.bindings ?? [])).all() as { results: any[] };
+      const typeClause = opts.type ? " AND type = ?" : "";
+      const scopeClause = scope ? ` AND ${scope.clause}` : "";
+      const bindings: (string | number)[] = [...batch];
+      if (opts.type) bindings.push(opts.type);
+      bindings.push(...scopeBindings);
+      bindings.push(...batch);
+      if (opts.type) bindings.push(opts.type);
+      bindings.push(...scopeBindings);
+      bindings.push(fanoutCap);
+      const { results } = await env.DB.prepare(
+        // scope-checked: scopeClause is assembled from the resolved identity and appended to both UNION arms; identity-less internal callers preserve the legacy graph helper
+        `WITH incident AS (
+           SELECT source_id AS from_id, source_id, target_id, type, weight, provenance, created_at
+             FROM edges WHERE source_id IN (${ph})${typeClause}${scopeClause}
+           UNION ALL
+           SELECT target_id AS from_id, source_id, target_id, type, weight, provenance, created_at
+             FROM edges WHERE target_id IN (${ph})${typeClause}${scopeClause}
+         ), ranked AS (
+           SELECT *, ROW_NUMBER() OVER (
+             PARTITION BY from_id
+             ORDER BY weight DESC, created_at DESC, source_id ASC, target_id ASC
+           ) AS rank
+             FROM incident
+         )
+         SELECT from_id, source_id, target_id, type, weight, provenance, created_at
+           FROM ranked WHERE rank <= ?
+          ORDER BY weight DESC, created_at DESC`
+      ).bind(...bindings).all() as { results: any[] };
       edgeRows.push(...results);
     }
 
@@ -225,13 +257,29 @@ export async function expandGraph(
     for (const e of edgeRows) {
       let from: string | null = null;
       let to: string | null = null;
-      if (frontierSet.has(e.source_id)) { from = e.source_id; to = e.target_id; }
-      else if (frontierSet.has(e.target_id)) { from = e.target_id; to = e.source_id; }
-      if (!from || !to || visited.has(to)) continue;
+      if (frontierSet.has(e.from_id)) {
+        from = e.from_id;
+        to = from === e.source_id ? e.target_id : from === e.target_id ? e.source_id : null;
+      }
+      if (!from || !to) continue;
+      const seedNeighbor = hop === 1 && opts.includeSeedNeighbors === true && seedSet.has(to);
+      if ((!seedNeighbor && visited.has(to)) || (seedNeighbor && emittedSeedNeighbors.has(to))) continue;
       const n = perNodeCount.get(from) ?? 0;
       if (n >= fanoutCap) continue;
       perNodeCount.set(from, n + 1);
-      candidates.push({ id: to, hop, viaWeight: e.weight, viaType: e.type as GraphNeighbor["viaType"], viaProvenance: e.provenance, viaLinkedAt: e.created_at, viaFrom: from });
+      const viaType = e.type as GraphNeighbor["viaType"];
+      candidates.push({
+        id: to,
+        hop,
+        viaWeight: e.weight,
+        viaType,
+        viaProvenance: e.provenance,
+        viaLinkedAt: e.created_at,
+        viaFrom: from,
+        viaSourceId: e.source_id,
+        viaTargetId: e.target_id,
+        viaDirection: directionFrom(from, e.source_id, viaType),
+      });
     }
 
     let allowed = candidates;
@@ -269,8 +317,14 @@ export async function expandGraph(
 
     const nextFrontier: string[] = [];
     for (const c of allowed) {
-      if (visited.has(c.id)) continue;
+      const seedNeighbor = seedSet.has(c.id);
+      if ((!seedNeighbor && visited.has(c.id)) || (seedNeighbor && emittedSeedNeighbors.has(c.id))) continue;
       if (out.length >= maxNodes) break;
+      if (seedNeighbor) {
+        emittedSeedNeighbors.add(c.id);
+        out.push(c);
+        continue;
+      }
       visited.add(c.id);
       out.push(c);
       nextFrontier.push(c.id);
@@ -281,7 +335,13 @@ export async function expandGraph(
   return out;
 }
 
-async function hydrateGraphEntries(ids: string[], env: Env, identity?: Identity, only?: "personal" | "company", teamId?: string): Promise<Map<string, Record<string, any>>> {
+async function hydrateGraphEntries(
+  ids: string[],
+  env: Env,
+  identity?: Identity,
+  only?: "personal" | "company",
+  teamId?: string,
+): Promise<Map<string, Record<string, any>>> {
   const map = new Map<string, Record<string, any>>();
   const scope = identity ? scopeWhereForRead(identity, { layer: only, teamId }) : null;
   const scopeSql = scope ? ` AND ${scopeWhereForIdRead(scope).clause}` : "";
@@ -300,10 +360,17 @@ async function hydrateGraphEntries(ids: string[], env: Env, identity?: Identity,
   return map;
 }
 
-export async function getConnections(id: string, type: string | undefined, env: Env, config: Readonly<Config> = DEFAULTS, identity?: Identity): Promise<Connection[]> {
-  // "any" validity (5.5): a replaced or wrong memory's link is still part of
-  // this memory's own history, so connections shows it, with valid_until.
-  let neighbors = await expandGraph([id], { hops: 1, includeDeprecated: true, includeSuperseded: true }, env, config, identity);
+/** Legacy array API retained for internal callers; public REST/MCP use the page API below. */
+export async function getConnections(
+  id: string,
+  type: string | undefined,
+  env: Env,
+  config: Readonly<Config> = DEFAULTS,
+  identity?: Identity,
+): Promise<Connection[]> {
+  const edgeType = type && type in EDGE_TYPES ? type as EdgeType : undefined;
+  if (type && !edgeType) return [];
+  let neighbors = await expandGraph([id], { hops: 1, type: edgeType, includeDeprecated: true, includeSuperseded: true }, env, config, identity);
   if (type) neighbors = neighbors.filter(n => n.viaType === type);
   if (!neighbors.length) return [];
 
@@ -323,13 +390,96 @@ export async function getConnections(id: string, type: string | undefined, env: 
       weight: n.viaWeight,
       provenance: n.viaProvenance,
       linkedAt: n.viaLinkedAt,
+      sourceId: n.viaSourceId,
+      targetId: n.viaTargetId,
+      direction: n.viaDirection,
       validUntil: (row.valid_until as number | null | undefined) ?? null,
     });
   }
   return out;
 }
 
-export async function buildGraph(opts: { seed?: string; limit?: number; only?: "personal" | "company"; teamId?: string; project?: readonly ProjectRow[] }, env: Env, config: Readonly<Config> = DEFAULTS, identity?: Identity): Promise<GraphView> {
+/**
+ * Page incident edges directly instead of filtering expandGraph's node-deduped
+ * output. A pair may carry more than one relationship type; applying `type`
+ * inside this SQL keeps a stronger relationship of another type from hiding
+ * the requested one.
+ */
+export async function getConnectionsPage(
+  id: string,
+  type: string | undefined,
+  opts: { limit?: number; cursor?: string },
+  env: Env,
+  _config: Readonly<Config>,
+  identity?: Identity,
+): Promise<ConnectionPage> {
+  const parsedOffset = parseConnectionsCursor(opts.cursor);
+  if (parsedOffset === null) throw new RangeError("Invalid connections cursor");
+  const limit = Math.max(1, Math.min(CONNECTIONS_MAX_LIMIT, Math.floor(opts.limit ?? CONNECTIONS_DEFAULT_LIMIT)));
+  const typeClause = type ? " AND type = ?" : "";
+  const edgeScope = identity ? scopeWhere(identity) : null;
+  const edgeScopeClause = edgeScope ? ` AND ${edgeScope.clause}` : "";
+  const nodeScope = identity ? scopeWhere(identity, undefined, "n.workspace_id") : null;
+  const nodeScopeClause = nodeScope ? ` AND ${nodeScope.clause}` : "";
+  const bindings: (string | number)[] = [id];
+  if (type) bindings.push(type);
+  bindings.push(...(edgeScope?.bindings ?? []));
+  bindings.push(id);
+  if (type) bindings.push(type);
+  bindings.push(...(edgeScope?.bindings ?? []));
+  bindings.push(...(nodeScope?.bindings ?? []));
+  bindings.push(limit + 1, parsedOffset);
+
+  const { results } = await env.DB.prepare(
+    // scope-checked: edgeScopeClause is appended to both edge arms and nodeScopeClause filters the joined memory rows, all from the resolved identity
+    `WITH incident_connections AS (
+       SELECT source_id, target_id, type, weight, provenance, created_at, target_id AS neighbor_id
+         FROM edges WHERE source_id = ?${typeClause}${edgeScopeClause}
+       UNION ALL
+       SELECT source_id, target_id, type, weight, provenance, created_at, source_id AS neighbor_id
+         FROM edges WHERE target_id = ?${typeClause}${edgeScopeClause}
+     )
+     SELECT e.source_id, e.target_id, e.type, e.weight, e.provenance, e.created_at,
+            n.id, n.content, n.tags, n.source, n.created_at AS entry_created_at, n.valid_until
+       FROM incident_connections e
+       JOIN entries n ON n.id = e.neighbor_id
+      WHERE ${notHeldSqlFor("n")}${nodeScopeClause}
+      ORDER BY e.weight DESC, e.created_at DESC, e.source_id ASC, e.target_id ASC, e.type ASC
+      LIMIT ? OFFSET ?`
+  ).bind(...bindings).all() as { results: Record<string, any>[] };
+
+  const hasMore = results.length > limit;
+  const connections = results.slice(0, limit).map((row): Connection => {
+    const edgeType = row.type as EdgeType;
+    return {
+      id: row.id as string,
+      content: row.content as string,
+      tags: JSON.parse(row.tags ?? "[]"),
+      source: row.source as string,
+      created_at: row.entry_created_at as number,
+      type: edgeType,
+      label: edgeLabel(edgeType),
+      weight: row.weight as number,
+      provenance: row.provenance as EdgeProvenance,
+      linkedAt: row.created_at as number,
+      sourceId: row.source_id as string,
+      targetId: row.target_id as string,
+      direction: directionFrom(id, row.source_id as string, edgeType),
+      validUntil: (row.valid_until as number | null | undefined) ?? null,
+    };
+  });
+  return {
+    connections,
+    nextCursor: hasMore ? connectionsCursor(parsedOffset + limit) : null,
+  };
+}
+
+export async function buildGraph(
+  opts: { seed?: string; limit?: number; only?: "personal" | "company"; teamId?: string; project?: readonly ProjectRow[] },
+  env: Env,
+  config: Readonly<Config> = DEFAULTS,
+  identity?: Identity,
+): Promise<GraphView> {
   // "No cap" resolves to GRAPH_VIEW_MAX_NODES, never to Infinity. Anything that
   // is not a positive finite number — absent, 0, negative, NaN — takes that
   // branch, so a caller who reaches here past the route's own validation still
@@ -346,13 +496,18 @@ export async function buildGraph(opts: { seed?: string; limit?: number; only?: "
   const limit = Math.min(asked, GRAPH_VIEW_MAX_NODES);
 
   let nodeIds: string[];
-  // `only` narrows every one of the three scoped statements below — the edge
-  // scan, the seed walk and the node hydration. Narrowing one and not the rest
-  // would answer with nodes from one layer joined by edges from both.
-  const scope = identity ? scopeWhereForRead(identity, { layer: opts.only, teamId: opts.teamId }) : null;
+  let strongestEdges: { source_id: string; target_id: string; type: string; weight: number; provenance: EdgeProvenance; created_at: number }[] | null = null;
+  const scope = identity
+    ? scopeWhereForRead(identity, { layer: opts.only, teamId: opts.teamId })
+    : null;
   if (opts.seed) {
-    // "any" validity (5.5): the graph view dims a superseded node, it does not hide it.
-    const neighbors = await expandGraph([opts.seed], { hops: 2, maxNodes: limit, includeDeprecated: true, includeSuperseded: true, only: opts.only, teamId: opts.teamId }, env, config, identity);
+    const neighbors = await expandGraph([opts.seed], {
+      hops: 2,
+      maxNodes: limit,
+      includeDeprecated: true, includeSuperseded: true,
+      only: opts.only,
+      teamId: opts.teamId,
+    }, env, config, identity);
     nodeIds = [opts.seed, ...neighbors.map(n => n.id)].slice(0, limit);
   } else {
     // A project view seeds only from edges with at least one member endpoint (its tag or an
@@ -362,16 +517,16 @@ export async function buildGraph(opts: { seed?: string; limit?: number; only?: "
     const project = scope && opts.project ? projectFilterSql(opts.project) : null;
     // validity: any: member ids only, feeding the same node hydration below that carries valid_until (5.5)
     const { results } = await env.DB.prepare(
+      // scope-checked: when an identity is present the selected ternary arm applies its resolved scope; the identity-less arm is retained only for internal/legacy whole-graph calls
       project && scope
         ? `WITH member AS (SELECT id FROM entries WHERE ${project.clause} AND ${scope.clause})
-           SELECT source_id, target_id FROM edges
-            WHERE ${scope.clause} AND (source_id IN (SELECT id FROM member) OR target_id IN (SELECT id FROM member))
-            ORDER BY weight DESC LIMIT ${limit * 4}`
+           SELECT source_id, target_id, type, weight, provenance, created_at FROM edges WHERE ${scope.clause} AND (source_id IN (SELECT id FROM member) OR target_id IN (SELECT id FROM member)) ORDER BY weight DESC LIMIT ${limit * 4}`
         : scope
-        ? `SELECT source_id, target_id FROM edges WHERE ${scope.clause} ORDER BY weight DESC LIMIT ${limit * 4}`
-        // scope-exempt: identity-less branch: pre-tenancy callers; the scoped arm is the line above
-        : `SELECT source_id, target_id FROM edges ORDER BY weight DESC LIMIT ${limit * 4}`
-    ).bind(...(project && scope ? [...project.bindings, ...scope.bindings] : []), ...(scope?.bindings ?? [])).all() as { results: { source_id: string; target_id: string }[] };
+        ? `SELECT source_id, target_id, type, weight, provenance, created_at FROM edges WHERE ${scope.clause} ORDER BY weight DESC LIMIT ${limit * 4}`
+        // scope-exempt: identityなしの内部グラフ処理だけが全体を読む。公開routeはidentityを渡す。
+        : `SELECT source_id, target_id, type, weight, provenance, created_at FROM edges ORDER BY weight DESC LIMIT ${limit * 4}`
+    ).bind(...(project && scope ? [...project.bindings, ...scope.bindings] : []), ...(scope?.bindings ?? [])).all() as { results: { source_id: string; target_id: string; type: string; weight: number; provenance: EdgeProvenance; created_at: number }[] };
+    strongestEdges = results;
     const ids: string[] = [];
     const seenIds = new Set<string>();
     for (const r of results) {
@@ -476,17 +631,7 @@ export async function buildGraph(opts: { seed?: string; limit?: number; only?: "
   const presentIds = [...nodeIdSet];
   const edgeSeen = new Set<string>();
   const edges: GraphView["edges"] = [];
-  // Same bound-parameter arithmetic as expandGraph: ids bound twice plus scope.
-  const edgeTake = edgeScanBatchSize(scope?.bindings.length ?? 0);
-  for (let i = 0; i < presentIds.length; i += edgeTake) {
-    const batch = presentIds.slice(i, i + edgeTake);
-    const ph = batch.map(() => "?").join(", ");
-    const sql = scope
-      ? `SELECT source_id, target_id, type, weight, provenance, created_at FROM edges WHERE (source_id IN (${ph}) OR target_id IN (${ph})) AND ${scope.clause} ORDER BY weight DESC`
-      // scope-exempt: identity-less branch: pre-tenancy callers; the scoped arm is the line above
-      : `SELECT source_id, target_id, type, weight, provenance, created_at FROM edges WHERE source_id IN (${ph}) OR target_id IN (${ph}) ORDER BY weight DESC`;
-    const { results } = await env.DB.prepare(sql)
-      .bind(...batch, ...batch, ...(scope?.bindings ?? [])).all() as { results: any[] };
+  const collect = (results: any[]) => {
     for (const e of results) {
       if (!nodeIdSet.has(e.source_id) || !nodeIdSet.has(e.target_id)) continue;
       const key = `${e.source_id}|${e.target_id}|${e.type}`;
@@ -494,13 +639,58 @@ export async function buildGraph(opts: { seed?: string; limit?: number; only?: "
       edgeSeen.add(key);
       edges.push({ source: e.source_id, target: e.target_id, type: e.type, weight: e.weight, provenance: e.provenance });
     }
+  };
+  if (strongestEdges) {
+    // The full-graph node selection already materialized a globally bounded strongest
+    // edge set. Reuse it instead of issuing incident-edge queries whose dense-graph
+    // result can grow quadratically and duplicate rows across batches.
+    collect(strongestEdges);
+  } else {
+    for (let i = 0; i < presentIds.length; i += EDGE_QUERY_BATCH) {
+      const batch = presentIds.slice(i, i + EDGE_QUERY_BATCH);
+      const ph = batch.map(() => "?").join(", ");
+      const { results } = await env.DB.prepare(
+        // scope-exempt: presentIds were already selected through the scoped seeded graph walk and scoped node hydration, so this query only returns edges incident to that closed set
+        `SELECT source_id, target_id, type, weight, provenance, created_at FROM edges WHERE source_id IN (${ph}) OR target_id IN (${ph}) ORDER BY weight DESC LIMIT ${batch.length * GRAPH_EDGE_VIEW_PER_NODE}`
+      ).bind(...batch, ...batch).all() as { results: any[] };
+      collect(results);
+    }
   }
 
   return { nodes, edges };
 }
 
 export async function neighborsFromVectorQuery(values: number[], env: Env): Promise<{ id: string; score: number }[]> {
-  // A wider window collapsed to five distinct notes: one long note is several vectors and could fill topK 5 alone.
-  const { matches } = await env.VECTORIZE.query(values, { topK: WRITE_PATH_TOPK, returnMetadata: "all" });
-  return nearestParents(matches).map(m => ({ id: ((m.metadata as any)?.parentId ?? m.id) as string, score: m.score }));
+  return neighborsFromVectorQueries([values], env);
+}
+
+/** Keep graph refresh bounded while still sampling the beginning, middle and end. */
+export function representativeVectors<T>(items: readonly T[], limit = 3): T[] {
+  if (limit <= 0) return [];
+  if (items.length <= limit) return [...items];
+  if (limit === 1) return items.length ? [items[0]] : [];
+  const indexes = new Set<number>();
+  for (let i = 0; i < limit; i++) {
+    indexes.add(Math.round(i * (items.length - 1) / (limit - 1)));
+  }
+  return [...indexes].map(index => items[index]);
+}
+
+/** Merge the strongest parent-level score across representative entry chunks. */
+export async function neighborsFromVectorQueries(
+  vectors: number[][],
+  env: Env,
+): Promise<{ id: string; score: number }[]> {
+  const scores = new Map<string, number>();
+  const results = await Promise.all(
+    vectors.map(values => env.VECTORIZE.query(values, { topK: WRITE_PATH_TOPK, returnMetadata: "all" })),
+  );
+  for (const { matches } of results) {
+    assertVectorProfiles(matches);
+    for (const m of nearestParents(matches)) {
+      const pid = (m.metadata as any)?.parentId ?? m.id;
+      scores.set(pid, Math.max(scores.get(pid) ?? 0, m.score));
+    }
+  }
+  return [...scores.entries()].map(([id, score]) => ({ id, score }));
 }

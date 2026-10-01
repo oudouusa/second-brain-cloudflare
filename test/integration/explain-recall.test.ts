@@ -1,8 +1,8 @@
 /**
  * T-0089.5.1: `explain` says why each memory came back, and asking costs nothing else.
  *
- * The golden file was captured from the source as it stood before the feature (git archive of the
- * parent commit, same fixture), so "explain off is byte-identical" is checked against real old output.
+ * 上流の説明なしgoldenにforkのgraph診断・relative score表示を反映している。
+ * explainの追加で順位・本文・検索コストが変わらないことを固定出力と比較する。
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import golden from "../fixtures/explain-off-golden.json";
@@ -20,7 +20,7 @@ const stripWhy = (body: any) => ({ ...body, results: body.results.map(({ why: _w
 // response, predating this golden (captured before it existed). Stripped the same way `why`
 // is, so this file keeps testing what it is for — explain's own isolation — not receipt.
 const stripReceipt = (body: any) => { const { receipt: _r, ...rest } = body; return rest; };
-const noReceiptLine = (text: string) => text.replace(/\n\nreceipt: \S+$/, "");
+const noReceiptLine = (text: string) => text.replace(/\n\nreceipt: \S+/, "");
 
 describe("explain off (the default)", () => {
   it("REST JSON is byte-identical to the pre-feature output, receipt aside", async () => {

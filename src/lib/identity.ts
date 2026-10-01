@@ -1,5 +1,6 @@
 import type { Env } from "../env";
 import { json } from "./http";
+import { VERIFIED_AUTH_HEADER } from "./http";
 import { ensureTenantBootstrap } from "./tenancy";
 
 /** Request identity resolved at the edge and passed into domain code. */
@@ -171,10 +172,18 @@ export async function resolveIdentityByUserId(env: Env, userId: string): Promise
   return rowToIdentity(row);
 }
 
+const requestIdentityCache = new WeakMap<Request, Identity | null>();
+
 export async function resolveIdentity(request: Request, env: Env): Promise<Identity | null> {
+  if (requestIdentityCache.has(request)) return requestIdentityCache.get(request) ?? null;
   const token = extractToken(request);
-  if (!token) return null;
-  return resolveIdentityFromToken(token, env);
+  const identity = token
+    ? await resolveIdentityFromToken(token, env)
+    : request.headers.get(VERIFIED_AUTH_HEADER) === "1"
+      ? await resolveIdentityFromToken(env.AUTH_TOKEN, env)
+      : null;
+  requestIdentityCache.set(request, identity);
+  return identity;
 }
 
 /**

@@ -11,7 +11,7 @@ import {
 describe("graph-aware recall neighborhood policy", () => {
   it("bounds the dense arm's graph seeds at its overfetch scale and the Vectorize ceiling", () => {
     expect(graphSeedLimit(5, 40)).toBe(15);
-    expect(graphSeedLimit(20, 90)).toBe(50);
+    expect(graphSeedLimit(20, 90)).toBe(48);
     expect(graphSeedLimit(5, 8)).toBe(8);
   });
 
@@ -59,9 +59,9 @@ describe("graph-aware recall neighborhood policy", () => {
   // expandGraph binds each frontier id twice, and a scoped caller's bindings come out
   // of the same budget, so the ceiling is the edge scan's own batch size.
   it("sizes the seed ceiling from the bound-parameter budget the edge scan has left", () => {
-    expect(graphSeedCeiling(0)).toBe(50);
-    expect(graphSeedCeiling(2)).toBe(49);
-    expect(graphSeedCeiling(3)).toBe(48);
+    expect(graphSeedCeiling(0)).toBe(48);
+    expect(graphSeedCeiling(2)).toBe(47);
+    expect(graphSeedCeiling(3)).toBe(46);
   });
 
   it("keeps a scoped caller's seats inside one edge-scan statement", () => {
@@ -238,6 +238,61 @@ describe("deterministic linked-evidence scoring", () => {
     expect(score.coverageGain).toBeGreaterThan(0.1);
   });
 
+  it("uses a directionally compatible explicit follows edge as chronology evidence", () => {
+    const score = scoreLinkedEvidence({
+      ...base,
+      parentContent: "Worlddoc second brain check",
+      content: "The dashboard repair completed successfully",
+      queryTokens: ["worlddoc", "check"],
+      evidenceTokens: ["worlddoc", "check"],
+      replacementCoverage: 1,
+      intent: "chronology",
+      edgeType: "follows",
+      edgeDirection: "incoming",
+      queryDirection: "incoming",
+    });
+
+    expect(score.eligible).toBe(true);
+    expect(score.score).toBeGreaterThanOrEqual(0.5);
+  });
+
+  it("does not use a structured edge when its direction is opposite to the question", () => {
+    const score = scoreLinkedEvidence({
+      ...base,
+      parentContent: "Worlddoc second brain check",
+      content: "The dashboard repair completed successfully",
+      queryTokens: ["worlddoc", "check"],
+      evidenceTokens: ["worlddoc", "check"],
+      replacementCoverage: 1,
+      intent: "chronology",
+      edgeType: "follows",
+      edgeDirection: "outgoing",
+      queryDirection: "incoming",
+    });
+
+    expect(score.eligible).toBe(false);
+    expect(score.rejection).toBe("no-linked-evidence");
+  });
+
+  it("does not treat an inferred edge as self-authenticating structured evidence", () => {
+    const score = scoreLinkedEvidence({
+      ...base,
+      parentContent: "Worlddoc second brain check",
+      content: "The dashboard repair completed successfully",
+      queryTokens: ["worlddoc", "check"],
+      evidenceTokens: ["worlddoc", "check"],
+      provenance: "inferred",
+      replacementCoverage: 1,
+      intent: "chronology",
+      edgeType: "follows",
+      edgeDirection: "incoming",
+      queryDirection: "incoming",
+    });
+
+    expect(score.eligible).toBe(false);
+    expect(score.rejection).toBe("no-linked-evidence");
+  });
+
   it("uses full-query tokens for complementary evidence without weakening the precision gate", () => {
     const score = scoreLinkedEvidence({
       ...base,
@@ -325,6 +380,22 @@ describe("deterministic linked-evidence scoring", () => {
     expect(score.coverage).toBe(1);
   });
 
+  it("keeps a late compatibility-form match as linked evidence", () => {
+    const score = scoreLinkedEvidence({
+      ...base,
+      parentScore: 1,
+      parentContent: "root context",
+      content: `${"unrelated ".repeat(80)}設定 Ｃｌｏｕｄｆｌａｒｅ target`,
+      queryTokens: ["cloudflare"],
+      evidenceTokens: ["cloudflare"],
+      corpus: { df: new Map([["cloudflare", 1]]), total: 100 },
+      replacementCoverage: 0,
+    });
+
+    expect(score.eligible).toBe(true);
+    expect(score.rejection).toBeUndefined();
+  });
+
   it("abstains when the neighborhood does not improve on the replaced direct evidence", () => {
     const score = scoreLinkedEvidence({ ...qualifying, replacementCoverage: 1 });
 
@@ -354,23 +425,13 @@ describe("query coverage details", () => {
     });
   });
 
-  it("looks up corpus df by the original token casing, not lowercased (#326 raw-surface probe)", () => {
-    // Full-width compatibility form; toLowerCase() maps it to its own
-    // full-width lowercase script, NOT ASCII "terraform" and NOT the
-    // original raw-uppercase form the tokenizer emits into distilled.df.
+  it("matches a full-width surface using the canonical corpus token (#326 compatibility probe)", () => {
     const raw = "Ｔｅｒｒａｆｏｒｍ";
-    expect(raw.toLowerCase()).not.toBe("terraform");
-    expect(raw.toLowerCase()).not.toBe(raw);
+    const corpus = { df: new Map([["terraform", 5]]), total: 100 };
 
-    // df is keyed by the RAW token, exactly as distillToRareTerms emits it.
-    const corpus = { df: new Map([[raw, 5]]), total: 100 };
-
-    const result = queryCoverage(`We standardized on ${raw} for infra`, [raw], corpus);
+    const result = queryCoverage(`We standardized on ${raw} for infra`, ["terraform"], corpus);
 
     expect(result.score).toBe(1);
-    // Only reachable if the df lookup used the raw (original-case) token: a
-    // lowercased lookup misses the map entirely, corpus-wide IDF is
-    // discarded, and exactHighIdf can never become true.
     expect(result.exactHighIdf).toBe(true);
   });
 });

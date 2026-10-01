@@ -252,7 +252,6 @@ describe("POST /update", () => {
     expect(upsertMock).toHaveBeenCalledOnce();
     const upsertedVectors = upsertMock.mock.calls[0][0] as any[];
     expect(upsertedVectors[0].id).not.toBe("entry-abc");
-    expect(parentIdOfVectorId(upsertedVectors[0].id)).toBe("entry-abc");
     expect(upsertedVectors[0].metadata).toMatchObject({ content: "Brand new content", parentId: "entry-abc" });
     expect(JSON.parse(db.entries.find((e: any) => e.id === "entry-abc").vector_ids)).toEqual([upsertedVectors[0].id]);
     expect(insertMock).not.toHaveBeenCalled();
@@ -262,7 +261,7 @@ describe("POST /update", () => {
     const { store, mock } = makeStatefulVectorize([
       {
         id: "entry-abc",
-        values: new Array(384).fill(0.1),
+        values: new Array(128).fill(0.1),
         metadata: { content: "Original content", parentId: "entry-abc", chunkIndex: 0, totalChunks: 1 },
       },
     ]);
@@ -354,8 +353,8 @@ describe("POST /update", () => {
     expect(data.ok).toBe(false);
     // D1 content stays as it was — the update did not commit.
     expect(db.entries[0].content).toBe("Original content");
-    // The old vectors were never deleted.
-    expect(deleteByIdsMock).not.toHaveBeenCalled();
+    // Cleanup may delete a partially accepted new vector, but never the old live id.
+    expect(deleteByIdsMock.mock.calls.flatMap(call => call[0])).not.toContain("entry-abc");
   });
 
   it("returns ok:true even when deleteByIds throws", async () => {

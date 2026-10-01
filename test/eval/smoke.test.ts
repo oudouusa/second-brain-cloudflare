@@ -1,3 +1,5 @@
+import { syntheticGemmaPricing } from "./fork-synthetic";
+syntheticGemmaPricing();
 import { afterEach, describe, expect, it } from "vitest";
 import { DEFAULTS } from "../../src/config";
 import { ReplayStore, makeReplayAi } from "./ai-replay";

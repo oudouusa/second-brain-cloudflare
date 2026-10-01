@@ -10,17 +10,25 @@
  * review queue becomes something its owner stops opening.
  */
 import type { Env } from "../env";
+import { chatGptEnvForWorkspaces } from "../lib/chatgpt";
+import { memoryWriteMarker } from "../migration/write-lock";
 import { resolveConfig } from "../config";
 import { initializeDatabase } from "../db/init";
 import { captureEntry } from "../capture/entry";
-import { reasonOverPair, restatesRecent } from "./reason";
+import { reasonOverPair, restatesRecent, INSIGHT_VALIDATION_VERSION, type TypedRelationship } from "./reason";
 import { PENDING_INSIGHT_SQL, WRITTEN_INSIGHT_SQL } from "../memory/patterns";
-import { edgeInsertStatement, kindsAllowEdge, sameWorkspaceEdge } from "../graph/edges";
-import { getKind } from "../memory/kind";
-import type { TypedRelationship } from "./reason";
+import { edgeInsertManyStatements, edgeInsertRow, edgeInsertStatement, kindsAllowEdge, sameWorkspaceEdge, retireInferredRelatesToStatements } from "../graph/edges";
 import { isEligiblePair, parseTags } from "./candidates";
+import { logEvent } from "../lib/observability";
+import { getKind } from "../memory/kind";
 import { D1_MAX_BOUND_PARAMS, SYSTEM_SOURCE } from "../constants";
 import { notHeldSqlFor } from "../quarantine/tags";
+
+// 既存TEXT状態に版と試行段階を残す。各版で検証失敗を1回だけ再試行する。
+export const INSIGHT_RETRY_STATUS = `retry:${INSIGHT_VALIDATION_VERSION}`;
+const INSIGHT_INVALID_PREFIX = `invalid:${INSIGHT_VALIDATION_VERSION}:`;
+export const INSIGHT_CANDIDATE_SQL = `(c.status = 'pending' OR c.status LIKE 'retry:%'
+  OR (c.status LIKE 'invalid:%' AND c.status NOT LIKE '${INSIGHT_INVALID_PREFIX}%'))`;
 
 /**
  * Weight for an edge the reasoning model proposed.
@@ -92,15 +100,14 @@ export const RECENT_INSIGHT_WINDOW = 10;
 /**
  * The most candidate statements one run will spend on a workspace slice.
  *
- * Chunking the slice (below) trades the bound-parameter ceiling for a D1-call
- * one: each statement past the first is one more against this codebase's
- * self-imposed ~50-call budget per invocation (the platform's real ceiling is
- * 1,000 D1/KV/Vectorize calls), and the team invocation measures 47 of 50 at
- * its worst slate on one workspace and 48 of 50 at 50 and at 98 — both
- * MEASURED end to end through scheduled() in
- * test/integration/insight-cron-budget.test.ts, not inferred from the 47 by
- * adding one. The slack survives, and a regression past 50 is now a red test
- * rather than a silent cost-discipline regression. Two covers 98 company workspaces —
+ * Chunking the slice (below) trades the bound-parameter ceiling for a
+ * D1-query one: each statement past the first is one more of the invocation's
+ * 50-query D1 allowance. The team invocation measures 40 of 50 at its refusal
+ * slate on one workspace and 41 of 50 at 50 and at 98 — both MEASURED end to
+ * end through scheduled() in test/integration/insight-cron-budget.test.ts, not
+ * inferred by adding one. 検証失敗を混ぜた98ワークスペースの試験は45/50。
+ * The slack survives, and a regression past 50 is
+ * now a red test rather than a production incident. Two covers 98 company workspaces —
  * far past any brain this ships to — and leaves the novelty floor's own slice
  * (which binds each id ONCE, so 98 + 1 = 99) inside the bound-parameter
  * ceiling without a second statement of its own.
@@ -115,6 +122,7 @@ export const MAX_SLICE_STATEMENTS = 2;
 
 interface CandidateRow {
   id: string;
+  status: string;
   score: number;
   a_id: string;
   b_id: string;
@@ -195,10 +203,9 @@ export async function runWeeklyInsights(
     //
     // ceil(N / 49) statements, capped at MAX_SLICE_STATEMENTS, so a brain with
     // one or two teams — every brain that exists — pays exactly what it paid
-    // before: one D1 call. Each extra chunk is one more call out of this
-    // codebase's self-imposed ~50-call budget the model calls also come from,
-    // which is why the chunk is as large as the bound-parameter ceiling allows
-    // rather than a round number.
+    // before: one subrequest. Each extra chunk is one more subrequest out of
+    // the same 50 the model calls come from, which is why the chunk is as
+    // large as the ceiling allows rather than a round number.
     //
     // One consequence worth naming: past 49 workspaces a candidate whose two
     // sides sit in DIFFERENT chunks is no longer drawn at all, where before it
@@ -221,7 +228,7 @@ export async function runWeeklyInsights(
       : [[]];   // no slice asked for: one statement over the whole corpus
 
     // One statement per chunk rather than a select-then-hydrate: the join is what keeps
-    // this inside the self-imposed D1 budget, and a candidate whose entries have
+    // this inside the subrequest budget, and a candidate whose entries have
     // since been forgotten drops out of the result rather than needing a guard.
     //
     // The deprecation check is the same reasoning applied to a candidate whose
@@ -255,14 +262,14 @@ export async function runWeeklyInsights(
       // validity: current: a replaced side of a candidate pair is not insight material (5.5)
       const { results: chunkRows } = await env.DB.prepare(
         // scope-exempt: cron: no caller to scope to. Both workspaces are projected, and the loop below compares them BEFORE the pair reaches the model: a candidate whose two entries sit in different workspaces is skipped and settled, never reasoned over and never written anywhere. Accrual refuses to pair across workspaces (candidates.ts), so that only fires for pre-tenancy candidate rows. sliceClause is optionally present and is a list of workspace IDS read from the `workspaces` table (companyWorkspaceIds, below), never from a request — it narrows this cron's slate, it does not scope it to a caller, and there is no caller to scope to on either invocation
-        `SELECT c.id, c.score, c.a_id, c.b_id, a.content AS a_content, b.content AS b_content,
+        `SELECT c.id, c.status, c.score, c.a_id, c.b_id, a.content AS a_content, b.content AS b_content,
                 a.tags AS a_tags, b.tags AS b_tags,
                 a.created_at AS a_created_at, b.created_at AS b_created_at,
                 a.workspace_id AS a_workspace_id, b.workspace_id AS b_workspace_id
          FROM insight_candidates c
          JOIN entries a ON a.id = c.a_id
          JOIN entries b ON b.id = c.b_id
-         WHERE c.status = 'pending'
+         WHERE ${INSIGHT_CANDIDATE_SQL}
            AND a.tags NOT LIKE '%"status:deprecated"%'
            AND b.tags NOT LIKE '%"status:deprecated"%'
            AND (a.valid_until IS NULL OR a.valid_until > ${now})
@@ -357,6 +364,7 @@ export async function runWeeklyInsights(
         // against" — the drawn candidates' own workspace ids, read out of
         // `entries` by the query above and never out of a request. The content
         // is compared and never returned.
+        // validity: any: 重複抑制用の既存洞察は過去分も比較し、本文を呼出元へ返さない。
         `SELECT workspace_id, content FROM (
            SELECT workspace_id, content,
                   ROW_NUMBER() OVER (PARTITION BY workspace_id
@@ -381,6 +389,10 @@ export async function runWeeklyInsights(
     let restatementsSuppressed = 0;
     const rejected: string[] = [];
     const used: string[] = [];
+    const invalid = new Map<string, string[]>();
+    let validationDeferred = 0;
+    let validationExhausted = 0;
+    const validationReasons = { format: 0, language: 0, evidence: 0, restatement: 0 };
     // Two per stored insight: which memories it was drawn from. Collected as
     // plain pairs rather than calling edgeInsertStatement here — that call is
     // just a local statement builder (no D1 round trip), but issuing it
@@ -483,7 +495,7 @@ export async function runWeeklyInsights(
       const result = await reasonOverPair(
         { content: candidate.a_content },
         { content: candidate.b_content },
-        env,
+        chatGptEnvForWorkspaces(env, [insightWorkspace]),
         cfg,
       );
 
@@ -497,6 +509,15 @@ export async function runWeeklyInsights(
       // second chance is by never having been marked settled in the first
       // place.
       if (result.outcome === "failed") continue;
+      if (result.outcome === "invalid") {
+        validationReasons[result.reason]++;
+        const retry = candidate.status !== INSIGHT_RETRY_STATUS;
+        const status = retry ? INSIGHT_RETRY_STATUS : `${INSIGHT_INVALID_PREFIX}${result.reason}`;
+        const ids = invalid.get(status) ?? [];
+        ids.push(candidate.id); invalid.set(status, ids);
+        if (retry) validationDeferred++; else validationExhausted++;
+        continue;
+      }
 
       // Read before the decline is handled, and deliberately so. Declining to
       // write a publishable sentence is not the same as having no view on how
@@ -561,80 +582,66 @@ export async function runWeeklyInsights(
     // three failure modes that all otherwise collapse into "output was low"
     // — a corpus running dry, D2 over-firing, and the model itself saying no
     // look identical from the outside without this line.
-    console.log("[insight] weekly pass:", {
-      candidatesDrawn: results.length,
-      candidatesReasoned,
-      declinedByModel: rejected.length,
-      restatementsSuppressed,
+    logEvent("insight_weekly", {
+      candidates_drawn: results.length,
+      candidates_reasoned: candidatesReasoned,
+      declined_by_model: rejected.length,
+      validation_deferred: validationDeferred,
+      validation_exhausted: validationExhausted,
+      invalid_format: validationReasons.format,
+      invalid_language: validationReasons.language,
+      invalid_evidence: validationReasons.evidence,
+      invalid_restatement: validationReasons.restatement,
+      restatements_suppressed: restatementsSuppressed,
       written,
     });
 
+    const statusStatement = (status: string, ids: string[], condition = "") => ids.length
+      ? [env.DB.prepare(
+          `UPDATE insight_candidates SET status = ?, write_marker = ? WHERE id IN (${ids.map(() => "?").join(", ")}) ${condition}`,
+        ).bind(status, memoryWriteMarker(env), ...ids)]
+      : [];
+    const edgeRows = [...drawnFromByInsight.entries()].flatMap(([insightId, pairs]) => pairs.map(pair => ({ insightId, ...pair })))
+      .map(({ insightId, targetId, workspaceId }) => edgeInsertRow(
+        insightId,
+        targetId,
+        "drawn_from",
+        { provenance: "system", weight: 1, ...sameWorkspaceEdge(workspaceId) },
+      ))
+      .filter((row): row is NonNullable<typeof row> => row !== null);
     const statements = [
-      ...rejected.map(id => env.DB.prepare(
-        `UPDATE insight_candidates SET status = 'rejected' WHERE id = ?`).bind(id)),
-      ...used.map(id => env.DB.prepare(
-        `UPDATE insight_candidates SET status = 'used' WHERE id = ?`).bind(id)),
-      ...[...new Set(replacedInsightIds)].map(id => env.DB.prepare(
-        // scope-exempt: cron: by-id, an insight the system job just replaced in the workspace it was drawing from
-        `DELETE FROM edges WHERE source_id = ? AND type = 'drawn_from' AND provenance = 'system'`).bind(id)),
-      ...[...drawnFromByInsight.entries()]
-        .flatMap(([insightId, pairs]) => pairs.map(({ targetId, workspaceId }) => edgeInsertStatement(
-          insightId, targetId, "drawn_from", { provenance: "system", weight: 1, ...sameWorkspaceEdge(workspaceId) }, env,
-        )))
-        .filter((stmt): stmt is D1PreparedStatement => stmt !== null),
-      ...typedEdges
-        .flatMap(({ sourceId, targetId, type, workspaceId }) => [
-          // Ordered insert -> inherit -> delete, and all three in this one batch.
-          //
-          // The generic edge has to still exist when the weight is read, which
-          // is why the DELETE comes last rather than first.
-          edgeInsertStatement(sourceId, targetId, type, {
-            provenance: "system", weight: INSIGHT_EDGE_WEIGHT,
-            metadata: { via: "insight-reasoning" }, ...sameWorkspaceEdge(workspaceId),
-          }, env),
-          // WEIGHTS ARE HIGH-WATER MARKS, and this step propagates that into
-          // typed edges. `max(weight, excluded.weight)` on the upsert (which
-          // predates this work) means a pair that once scored 0.90 keeps 0.90
-          // even after the content is rewritten and re-inference scores it 0.79;
-          // inheriting carries that figure onto the typed edge, and nothing ever
-          // lowers it — the nightly prune's `weight < 0.3` cannot match an
-          // inferred edge, whose floor is 0.78.
-          //
-          // Taken deliberately as the lesser of two errors. Weight here decides
-          // ORDERING under a fanout cap, not truth; an overstated ordering hint
-          // keeps a historically-strong pair reachable, whereas NOT inheriting
-          // drops a 0.85 pair to 0.75 and can push it out of the cap entirely —
-          // losing the memory rather than mis-ranking it. Letting the update
-          // path SET rather than MAX its inferred weight would fix the drift at
-          // the source; that is a change to pre-existing upsert semantics and is
-          // left as follow-up.
-          //
-          // Inherit the retired edge's weight when it was stronger. Inferred
-          // edges exist only at EDGE_INFER_THRESHOLD (0.78) and above, so the
-          // flat INSIGHT_EDGE_WEIGHT is BELOW every generic edge this replaces
-          // — and graph expansion sorts by weight under a per-node fanout cap.
-          // Without this, replacing a 0.85 edge with a 0.75 one can push a
-          // neighbour past the cap and make a reachable memory unreachable,
-          // which is the opposite of what typing it was for.
-          env.DB.prepare(
-            // scope-exempt: cron: by-id pair, both endpoints already confirmed to share one workspace before the pair reached the model
-            `UPDATE edges
-             SET weight = max(weight, COALESCE((
-                   SELECT MAX(g.weight) FROM edges g
-                   WHERE ((g.source_id = ? AND g.target_id = ?) OR (g.source_id = ? AND g.target_id = ?))
-                     AND g.type = 'relates_to' AND g.provenance = 'inferred'), 0))
-             WHERE source_id = ? AND target_id = ? AND type = ?`,
-          ).bind(sourceId, targetId, targetId, sourceId, sourceId, targetId, type),
-          // Typed replaces generic, and only the INFERRED generic: a relates_to
-          // the person drew themselves is a statement, not a guess this supersedes.
-          env.DB.prepare(
-            // scope-exempt: cron: by-id pair, both endpoints already confirmed to share one workspace before the pair reached the model
-            `DELETE FROM edges
-             WHERE ((source_id = ? AND target_id = ?) OR (source_id = ? AND target_id = ?))
-               AND type = 'relates_to' AND provenance = 'inferred'`,
-          ).bind(sourceId, targetId, targetId, sourceId),
-        ])
-        .filter((stmt): stmt is D1PreparedStatement => stmt !== null),
+      ...statusStatement("rejected", rejected),
+      ...statusStatement("used", used),
+      ...[...new Set(replacedInsightIds)].flatMap(id => [
+        env.DB.prepare(`UPDATE edges SET write_marker = ? WHERE source_id = ? AND type = 'drawn_from' AND provenance = 'system'`).bind(memoryWriteMarker(env, "delete"), id),
+        // scope-exempt: cron: このworkspace内で直前に置換したinsightの既存由来辺だけを除去
+        env.DB.prepare(`DELETE FROM edges WHERE source_id = ? AND type = 'drawn_from' AND provenance = 'system'`).bind(id),
+      ]),
+      // 遅れて届いた検証失敗で、別実行が確定した used/rejected を復活させない。
+      ...[...invalid].flatMap(([status, ids]) => statusStatement(status, ids,
+        status === INSIGHT_RETRY_STATUS
+          ? `AND ${INSIGHT_CANDIDATE_SQL.replace(/\bc\./g, "")} AND status <> '${INSIGHT_RETRY_STATUS}'`
+          : `AND status = '${INSIGHT_RETRY_STATUS}'`,
+      )),
+      ...edgeInsertManyStatements(edgeRows, env),
+      ...typedEdges.flatMap(({ sourceId, targetId, type, workspaceId }) => [
+        edgeInsertStatement(sourceId, targetId, type, {
+          provenance: "system", weight: INSIGHT_EDGE_WEIGHT,
+          metadata: { via: "insight-reasoning" }, ...sameWorkspaceEdge(workspaceId),
+        }, env),
+        // Upstream insert -> inherit -> retire ordering keeps the strongest
+        // historical hint under the fanout cap. Never alter an explicit edge.
+        env.DB.prepare(
+          // scope-exempt: cron: exact pair with both endpoint workspaces validated before reasoning
+          `UPDATE edges SET weight = max(weight, COALESCE((
+             SELECT MAX(g.weight) FROM edges g
+             WHERE ((g.source_id = ? AND g.target_id = ?) OR (g.source_id = ? AND g.target_id = ?))
+               AND g.type = 'relates_to' AND g.provenance = 'inferred'), 0)),
+             write_marker = ?
+           WHERE source_id = ? AND target_id = ? AND type = ? AND provenance = 'system'`,
+        ).bind(sourceId, targetId, targetId, sourceId, memoryWriteMarker(env), sourceId, targetId, type),
+        ...retireInferredRelatesToStatements([{ sourceId, targetId }], env),
+      ]).filter((stmt): stmt is D1PreparedStatement => stmt !== null),
     ];
     if (statements.length) await env.DB.batch(statements);
   } catch (e) {

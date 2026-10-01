@@ -14,14 +14,14 @@ import type { Env } from "../../src/env";
 afterAll(cleanTemp);
 const NEW_INDEXES = ["idx_entries_when", "idx_entries_task", "idx_entries_insight", "idx_entries_stale"];
 
-async function seed(db: D1Database, n: number) {
-  await db.prepare(`INSERT INTO entries (id, content, tags, source, created_at, vector_ids, recall_count, importance_score, workspace_id, actor_id, when_at, when_kind, when_source)
+async function seed(db: D1Database, n: number, marker: string) {
+  await db.prepare(`INSERT INTO entries (id, content, tags, source, created_at, vector_ids, recall_count, importance_score, workspace_id, actor_id, when_at, when_kind, when_source, write_marker)
     WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < ?)
     SELECT 'e'||x, 'memory '||x,
       CASE WHEN x % 20 = 0 THEN '["task","work"]' WHEN x % 50 = 1 THEN '["auto-insight"]' WHEN x % 100 = 2 THEN '["work","stale:as-of"]' ELSE '["work","kind:semantic"]' END,
       'api', 1000 + x, '["v"]', 0, 3, 'ws', 'u1',
-      CASE WHEN x % 200 = 0 THEN 5000 ELSE NULL END, CASE WHEN x % 200 = 0 THEN 'due' ELSE NULL END, CASE WHEN x % 200 = 0 THEN 'explicit' ELSE NULL END
-    FROM c`).bind(n).run();
+      CASE WHEN x % 200 = 0 THEN 5000 ELSE NULL END, CASE WHEN x % 200 = 0 THEN 'due' ELSE NULL END, CASE WHEN x % 200 = 0 THEN 'explicit' ELSE NULL END, ?
+    FROM c`).bind(n, marker).run();
 }
 const indexNames = async (db: D1Database) =>
   ((await db.prepare(`SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'idx_entries_%'`).all<{ name: string }>()).results ?? []).map(r => r.name);
@@ -31,17 +31,19 @@ describe("upgrade of a database without the brief indexes", () => {
     const sq = makeSqliteD1();
     try {
       resetDatabaseInit();
-      const env = makeTestEnv(undefined, { DB: sq.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV() });
+      const env = sq.admitEnv(makeTestEnv(undefined, { DB: sq.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV() }));
       await initializeDatabase(env);
-      await seed(sq.db as unknown as D1Database, 300);
+      await seed(sq.db as unknown as D1Database, 300, sq.fixtureMarker());
       for (const name of NEW_INDEXES) await sq.db.prepare(`DROP INDEX ${name}`).run();
       const before = await indexNames(sq.db as unknown as D1Database);
       expect(before).not.toContain("idx_entries_task");
       const rowsBefore = JSON.stringify(sq.rows());
+      // schema9のsteady probeではなく、brief導入前のupgrade経路を検証する。
+      await sq.db.prepare("UPDATE schema_meta SET version = 8 WHERE id = 'current'").run();
       resetDatabaseInit();
       sq.issued.length = 0;
       await initializeDatabase(env);
-      const writes = sq.issued.filter(s => /^\s*(INSERT|UPDATE|DELETE|REPLACE)/i.test(s));
+      const writes = sq.issued.filter(s => /^\s*(INSERT|UPDATE|DELETE|REPLACE)/i.test(s) && /\b(?:INTO|UPDATE|FROM) entries\b/i.test(s));
       expect(writes).toEqual([]);
       const creates = sq.issued.filter(s => /^\s*CREATE/i.test(s));
       expect(creates.map(s => /idx_entries_\w+/.exec(s)?.[0]).sort()).toEqual([...NEW_INDEXES].sort());
@@ -61,7 +63,7 @@ describe("upgrade of a database without the brief indexes", () => {
       resetDatabaseInit();
       const env = makeTestEnv(undefined, { DB: d1.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV() });
       await initializeDatabase(env);
-      await seed(d1.db, 2000);
+      await seed(d1.db, 2000, "manual-workerd-fixture");
       for (const name of NEW_INDEXES) await d1.db.prepare(`DROP INDEX ${name}`).run();
       // init.ts creates these through exec(), which returns no meta, so run the same DDL through
       // prepare().run() to read what D1 would bill for the one-time build.

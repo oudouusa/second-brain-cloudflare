@@ -60,6 +60,7 @@ export const NEURON_RATES: Record<string, { inputPerMillionTokens: number; outpu
 };
 
 export const EMBEDDING_DIMS: Record<string, number> = {
+  "@cf/google/embeddinggemma-300m": 768,
   "@cf/baai/bge-small-en-v1.5": 384,
   "@cf/baai/bge-base-en-v1.5": 768,
   "@cf/baai/bge-large-en-v1.5": 1024,

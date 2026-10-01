@@ -77,7 +77,7 @@ describe("GET /list", () => {
       { id: "idea-1", content: "Idea note", tags: '["idea"]', source: "api", created_at: 2000, vector_ids: "[]" },
     );
 
-    const res = await worker.fetch(req("GET", "/list?tag=work"), env, ctx);
+    const res = await worker.fetch(req("POST", "/list?tag=work"), env, ctx);
     expect(res.status).toBe(200);
     const data = await res.json() as any[];
     expect(data).toHaveLength(1);
@@ -118,7 +118,7 @@ describe("GET /list", () => {
       { id: "idea-mid", content: "Idea mid", tags: '["idea"]', source: "api", created_at: 2000, vector_ids: "[]" },
     );
 
-    const res = await worker.fetch(req("GET", "/list?tag=work&after=1500&before=2500"), env, ctx);
+    const res = await worker.fetch(req("POST", "/list?tag=work&after=1500&before=2500"), env, ctx);
     expect(res.status).toBe(200);
     const data = await res.json() as any[];
     expect(data).toHaveLength(1);

@@ -210,8 +210,10 @@ function wireHistoryRow(li, item, entry) {
         if (fullText === null) {
           showBtn.disabled = true
           try {
-            const res = await fetch(`${WORKER_URL}/entry/version?id=${encodeURIComponent(entry.id)}&seq=${encodeURIComponent(item.seq)}`, {
-              headers: { Authorization: `Bearer ${AUTH_TOKEN}` },
+            const res = await fetch(`${WORKER_URL}/entry/version`, {
+              method: 'POST',
+              headers: { Authorization: `Bearer ${AUTH_TOKEN}`, 'Content-Type': 'application/json' },
+              body: JSON.stringify({ id: entry.id, seq: item.seq }),
             })
             const data = await res.json()
             fullText = data.ok ? data.content : p.dataset.preview

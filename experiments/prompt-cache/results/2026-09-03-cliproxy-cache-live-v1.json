@@ -1,0 +1,113 @@
+{
+  "schema": "prompt-cache-proxy-measurement.v1",
+  "verified": true,
+  "evidence_sha256": "45d27e6714ccbf6e7b9012595d06bd65fde348423ca26a8aef8f14fff7e3fa67",
+  "experiment_id_hash": "e074244ee3e33b560ca4cbf310eca0a9903058e783f92758cbe86d1030e6c1e0",
+  "transport": "custom-f271036821ab",
+  "model": "gpt-5.6-luna",
+  "sources": {
+    "core": {
+      "type": "worker-mcp-oauth",
+      "hash": "9dd09944324e7365df766c39e5924b6cea9e0e78483df21441d267d980849f4c",
+      "chars": 8727,
+      "complete": true,
+      "endpoint_hash": "e8aaa2f268faee43cf3e9e9c6173d8259bcd6accc957045235783dedeb4e74e9",
+      "etag_hash": "a71f495729d579fbce58da14003d853bb56ed64960c815ff1659772c97caf1a8"
+    },
+    "project": null
+  },
+  "request_plan": {
+    "arms": [
+      "explicit"
+    ],
+    "runs_per_arm": 20,
+    "delay_ms": 2000
+  },
+  "criteria": {
+    "require_worker_source": true,
+    "require_complete_capsules": true,
+    "min_later_hit_rate": 0.8,
+    "expected_transport": "custom-f271036821ab"
+  },
+  "authentication": {
+    "capsule_source": "mcp-managed-oauth",
+    "official_openai_api_key_used": false,
+    "proxy_client_credential_source": "environment"
+  },
+  "cache_proof": {
+    "basis": "cache-read-observed",
+    "cache_write_observed": false,
+    "cache_read_observed": true
+  },
+  "metrics": {
+    "successful_requests": 20,
+    "failed_requests": 0,
+    "later_request_cache_hits": 16,
+    "later_request_cache_hit_rate": 0.842105,
+    "all_token_usage": {
+      "requests": 20,
+      "input_tokens": 38380,
+      "cached_tokens": 28672,
+      "non_cached_input_tokens": 9708,
+      "cached_input_ratio": 0.747056,
+      "output_tokens": 100,
+      "total_tokens": 38480
+    },
+    "later_token_usage": {
+      "requests": 19,
+      "input_tokens": 36461,
+      "cached_tokens": 28672,
+      "non_cached_input_tokens": 7789,
+      "cached_input_ratio": 0.786374,
+      "output_tokens": 95,
+      "total_tokens": 36556
+    },
+    "cache_write_counter": {
+      "samples": 20,
+      "tokens": 0
+    },
+    "cached_tokens_per_hit": {
+      "samples": 16,
+      "min": 1792,
+      "max": 1792,
+      "mean": 1792
+    },
+    "response_latency_ms": {
+      "samples": 20,
+      "min": 1044,
+      "median": 1244,
+      "p90": 1911,
+      "max": 2440,
+      "mean": 1417.65
+    },
+    "later_cache_hit_latency_ms": {
+      "samples": 16,
+      "min": 1044,
+      "median": 1244,
+      "p90": 1911,
+      "max": 2033,
+      "mean": 1392.0625
+    },
+    "later_cache_miss_latency_ms": {
+      "samples": 3,
+      "min": 1120,
+      "median": 1332,
+      "p90": 2440,
+      "max": 2440,
+      "mean": 1630.666667
+    }
+  },
+  "claims": {
+    "cache_read_observed": true,
+    "initial_cache_write_observed": false,
+    "cache_write_observed": false,
+    "official_api_equivalence_verified": false,
+    "provider_billing_discount_verified": false
+  },
+  "billing": {
+    "basis": "not_available_for_cliproxy_oauth",
+    "currency": null,
+    "estimated_cost": null
+  },
+  "failures": []
+}

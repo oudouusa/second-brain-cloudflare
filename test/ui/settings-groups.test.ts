@@ -267,6 +267,36 @@ describe("the memories export, through the shared downloader", () => {
   });
 });
 
+
+describe("索引回復の手動バッチ", () => {
+  it.each([0, 2])("残件があっても1回で止まり、失敗%s件を表示する", async failed => {
+    const ctx = load();
+    let calls = 0;
+    ctx.fetch = async () => { calls++; return { ok: true, json: async () => ({ processed: 8, failed, remaining: 64 }) }; };
+    ctx.loadMenuStats = async () => ctx.renderVectorizeSection(64, Date.now() - 7200000);
+    ctx.refreshAll = () => {};
+    await ctx.runVectorize(ctx.document.getElementById("vectorize-btn"));
+    expect(calls).toBe(1);
+    const html = ctx.__els.get("vectorize-section").innerHTML;
+    expect(html).toContain("64");
+    expect(html).toContain("2.0");
+    expect(html).toContain(ctx.t("upkeep.vectorizeBatchResult", { processed: 8, failed, remaining: 64 }));
+  });
+
+  it("全件完了後も直近結果を残し、実行ボタンは消す", async () => {
+    const ctx = load();
+    ctx.fetch = async () => ({ ok: true, json: async () => ({ processed: 8, failed: 0, remaining: 0 }) });
+    ctx.loadMenuStats = async () => ctx.renderVectorizeSection(0, null);
+    ctx.refreshAll = () => {};
+    await ctx.runVectorize(ctx.document.getElementById("vectorize-btn"));
+    const section = ctx.__els.get("vectorize-section");
+    expect(section.style.display).toBe("");
+    expect(section.innerHTML).toContain("8");
+    expect(section.innerHTML).not.toContain("onclick=");
+    expect(section.innerHTML).not.toContain("NaN");
+  });
+});
+
 /**
  * D1.3 (T-0101.2.4): a backup is a copy of the memories only. Nothing in the
  * dashboard said that in words, and a restore or an export reader had no way

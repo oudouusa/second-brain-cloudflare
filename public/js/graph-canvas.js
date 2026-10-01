@@ -9,7 +9,11 @@ let graphLayerFilter = null
 // (offline etc.) so the graph never dead-ends.
 async function openNodeView(node) {
   try {
-    const res = await fetch(`${WORKER_URL}/entry?id=${encodeURIComponent(node.id)}`, { headers: { Authorization: `Bearer ${AUTH_TOKEN}` } })
+    const res = await fetch(`${WORKER_URL}/entry`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${AUTH_TOKEN}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: node.id }),
+    })
     const data = await res.json()
     if (data.ok && data.entry) {
       openView({ id: data.entry.id, content: data.entry.content, tags: data.entry.tags }, null)

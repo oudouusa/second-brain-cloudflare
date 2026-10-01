@@ -22,8 +22,8 @@
  * legitimate growth.
  */
 import { describe, expect, it } from "vitest";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { Client } from "@modelcontextprotocol/client";
+import { InMemoryTransport } from "@modelcontextprotocol/client";
 import { buildMcpServer } from "../../src/mcp/server";
 import { makeTestEnv, makeTestDb } from "../helpers/make-env";
 
@@ -43,7 +43,9 @@ async function toolsListBytes(): Promise<number> {
   }
 }
 
-const PINNED_MAX_BYTES = 32600;
+// 4.0.0統合: forkのtier/pin/rollover/hot-context等6拡張、入力制限と説明を含め35,856 bytes。
+// mcp-tools-contractが25ツール各1回・全schema hashを別途固定する。
+const PINNED_MAX_BYTES = 35900;
 
 describe("tools/list size", () => {
   it("stays within the pinned byte ceiling", async () => {

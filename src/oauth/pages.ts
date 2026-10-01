@@ -74,13 +74,37 @@ export function oauthPageHtml(title: string, body: string): string {
 }
 
 // Hosted OAuth login page. Self-contained (no CDN) so auth works in any browser session.
-export function loginHtml(error?: string): string {
+export interface OAuthLoginContext {
+  clientId?: string;
+  redirectUri?: string;
+  csrfToken?: string;
+}
+
+function redirectLabel(value?: string): string {
+  if (!value) return "your MCP client";
+  try {
+    const url = new URL(value);
+    return url.protocol === "http:" || url.protocol === "https:"
+      ? url.origin
+      : `${url.protocol}//${url.host || "native app"}`;
+  } catch {
+    return "your MCP client";
+  }
+}
+
+export function loginHtml(error?: string, context: OAuthLoginContext = {}): string {
+  const target = escapeHtml(redirectLabel(context.redirectUri));
+  const client = context.clientId ? escapeHtml(context.clientId.slice(0, 80)) : "registered MCP client";
+  const csrfInput = context.csrfToken
+    ? `<input type="hidden" name="csrf_token" value="${escapeHtml(context.csrfToken)}" />`
+    : "";
   return oauthPageHtml("Second Brain", `
     <h1>Second Brain</h1>
-    <p>Enter your Bearer token to connect to your personal memory layer. This is the password you chose when you set up Second Brain.</p>
+    <p>Authorize <strong>${client}</strong> to access your personal memory layer and return to <strong>${target}</strong>. Continue only if you started this connection from that client.</p>
     <form method="POST">
+      ${csrfInput}
       <input type="password" name="password" placeholder="Bearer token (your setup password)" autofocus autocomplete="current-password" />
-      <button type="submit">Connect</button>
+      <button type="submit" name="approve" value="yes">Authorize connection</button>
     </form>
     <div class="auth-error">${error ? escapeHtml(error) : ""}</div>
   `);

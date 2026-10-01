@@ -18,8 +18,9 @@ let companyWs = "";
 beforeEach(async () => {
   resetDatabaseInit();
   sqlite = makeSqliteD1();
-  env = makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV() });
+  env = sqlite.admitEnv(makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV() }));
   await initializeDatabase(env);
+  env = sqlite.admitEnv(env);
   const roots = await ensureTenantBootstrap(env);
   companyWs = roots.companyWorkspaceId;
   owner = (await resolveIdentityByUserId(env, roots.ownerUserId))!;
@@ -53,10 +54,10 @@ describe("R2-7 (MAJOR): revertEntry writes into the author's personal memory aft
     expect(r.status).toBe("updated");
     const raw = env.DB as any;
     let moved = false;
-    const racing = { ...env, DB: { ...raw, prepare(sql: string) {
+    const racing = { ...env, WRITE_ADMISSION_TOKEN: env.WRITE_ADMISSION_TOKEN, DB: { ...raw, prepare(sql: string) {
       if (!moved && sql.startsWith("INSERT INTO entry_versions")) {
         moved = true;
-        raw.prepare(`UPDATE entries SET workspace_id = ? WHERE id = 'u9'`).bind(author.personalWorkspaceId).run();
+        raw.prepare(`UPDATE entries SET write_marker = '${sqlite.fixtureMarker()}', workspace_id = ? WHERE id = 'u9'`).bind(author.personalWorkspaceId).run();
       }
       return raw.prepare(sql);
     } } } as unknown as Env;

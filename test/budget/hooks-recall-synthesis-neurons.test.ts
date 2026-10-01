@@ -51,10 +51,11 @@ function neuronsFor(inputTokens: number, outputTokens: number): number {
     + (outputTokens / 1_000_000) * OUTPUT_NEURONS_PER_M_TOKENS;
 }
 
-describe("GET /recall as a hook calls it: every client now asks for synthesis to be off", () => {
-  it("buildRecallUrl always sends synthesize=0 (regression guard for the 4.0 fix)", () => {
+describe("hookのPOST /recallでは合成を要求しない", () => {
+  it("本文にsynthesize:falseを送り、検索語をURLへ含めない", () => {
     const url = coreJs.buildRecallUrl("https://w.example", { query: "q", topK: 5, workspace: "personal" });
-    expect(new URL(url).searchParams.get("synthesize")).toBe("0");
+    expect(new URL(url).search).toBe("");
+    expect(JSON.parse(coreJs.buildRecallBody({ query: "q", topK: 5, workspace: "personal" })).synthesize).toBe(false);
   });
 });
 

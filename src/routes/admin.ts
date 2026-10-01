@@ -1,18 +1,39 @@
-import { hasCapsuleTag } from "../tags/system";
 import { deleteEntryVectors, persistPendingVectorDeletes } from "../vectorize/batch";
+import { auditEvent } from "../lib/audit";
+import { hasCapsuleTag } from "../tags/system";
 import type { Env } from "../env";
+import { chatGptEnvForWorkspaces } from "../lib/chatgpt";
 import { readOverrides, resetOverride, resolveConfig } from "../config";
 import { SB_VERSION } from "../env";
-import { COMPRESSION_MIN_AGE_MS, compressionEligibilitySql, isTopicTagSql } from "../compression/eligibility";
+import { COMPRESSION_MIN_AGE_MS, compressionEligibilitySql, isTopicTagSql, isCompressionTagSql } from "../compression/eligibility";
 import { intParam, json } from "../lib/http";
 import { D1_MAX_BOUND_PARAMS, VECTORIZE_DELETE_MAX_IDS_PER_CALL, VECTORIZE_WORKSPACE_FILTER_UNSUPPORTED_KV_KEY, VERSIONS_SINCE_KV_KEY } from "../constants";
 import { requireAdmin, requireIdentity, type Identity } from "../lib/identity";
 import { effectiveWriteTarget, layerOf, primaryCompanyWorkspaceId, readableWorkspaces, scopeWhere, scopeWhereForIdRead } from "../lib/scope";
 import { lookupActorLabels, resolveActorLabel } from "../lib/actors";
 import { ensureTenantBootstrap } from "../lib/tenancy";
-import { graceMs } from "../lib/ai";
 import { classifyEntry } from "../capture/classify";
-import { PENDING_WHERE, indexPendingRow, type PendingRow } from "../vectorize/pending";
+import { storeEntry } from "../capture/store";
+import { adminAuditEvent } from "../lib/admin-audit";
+import { auditEvents, type AuditEventInput } from "../lib/audit";
+import {
+  createMember,
+  isTeamBrain,
+  listMembers,
+  listRoster,
+  listTeamWorkspaces,
+  lookupAuditNames,
+  removeMember,
+  renameTeamWorkspace,
+  rotateMemberToken,
+  setMemberDefaultShare,
+  setMemberProfile,
+  setMemberSuspended,
+  TeamAdminError,
+} from "../lib/team-admin";
+import { graceMs, readWorkersAiHealth } from "../lib/ai";
+import { submitVectorCleanupBatch } from "../vectorize/cleanup";
+import { processPendingClassification, processPendingVectorization } from "../capture/pending";
 import { INDEXABLE_SQL } from "../capture/lifecycle";
 import { PENDING_INSIGHT_SQL } from "../memory/patterns";
 import { STALE_REVIEW_SQL, hasStaleAsOf, withoutStaleAsOf, staleReasonFor } from "../memory/stale";
@@ -26,12 +47,11 @@ import { vectorizeFilterState } from "../vectorize/scope";
 import { TAG_LIKE_ESCAPE, tagLikePattern } from "../memory/tag-sql";
 import { notHeldSqlFor } from "../quarantine/tags";
 import { reasonOverPair, restatesRecent } from "../insight/reason";
-import { MAX_INSIGHTS_PER_RUN, RECENT_INSIGHT_WINDOW, rawInsightText } from "../insight/weekly";
+import { MAX_INSIGHTS_PER_RUN, RECENT_INSIGHT_WINDOW, rawInsightText, INSIGHT_CANDIDATE_SQL } from "../insight/weekly";
 import { runInsightAccrual, isEligiblePair, parseTags } from "../insight/candidates";
-import { adminAuditEvent } from "../lib/admin-audit";
-import { auditEvent, auditEvents, type AuditEventInput } from "../lib/audit";
+import { initializeDatabase } from "../db/init";
+import { memoryWriteMarker } from "../migration/write-lock";
 import { resolveEntryAction, applyInsightResolution } from "../memory/actions";
-import { createMember, listMembers, listRoster, listTeamWorkspaces, lookupAuditNames, removeMember, renameTeamWorkspace, rotateMemberToken, setMemberDefaultShare, setMemberProfile, setMemberSuspended, isTeamBrain, TeamAdminError } from "../lib/team-admin";
 import { readNightSummary, type NightSummary } from "../runtime/night-summary";
 import { readWhenCursor, fetchWhenCandidates, judgeCommitment } from "../when/pass";
 import { DUE_WITHIN_MS, dueSql, parseExplicitWhen } from "../when/input";
@@ -41,10 +61,7 @@ import { DUE_WITHIN_MS, dueSql, parseExplicitWhen } from "../when/input";
  * statement and the id list is the whole of the SELECT's binding, so this is
  * the hard limit rather than a policy. The client pages against it.
  */
-// /patterns/resolve's SELECT spends D1's bound-parameter budget on the id list
-// plus the caller's workspace scope, so its cap is derived per request rather
-// than fixed: three workspaces for an admin would otherwise put a full page at
-// 103 bindings and fail the whole batch.
+const MAX_PATTERN_BULK = 16;
 
 /** How many nodes the degree ranking returns: a ranking, not a dump of the graph. */
 const GRAPH_STATS_TOP_DEGREE = 20;
@@ -60,7 +77,6 @@ export async function handleAdminRoutes(
   env: Env,
   ctx: ExecutionContext,
 ): Promise<Response | null> {
-  const cfg = await resolveConfig(env);
   // Team administration requires admin access; roster and workspace reads only
   // require a member identity and are scoped to that identity.
   if (url.pathname === "/team/members" && request.method === "GET") {
@@ -222,6 +238,7 @@ export async function handleAdminRoutes(
     // try/catch, the same argument GET /team/me's unreachable 404 records
     // above. If the invariant ever breaks, it should reach the 500 handler.
     await setMemberDefaultShare(env, auth.userId, body.default);
+    const cfg = await resolveConfig(env);
     const orgDefault = cfg.TEAM_DEFAULT_WORKSPACE === "company" ? "company" : "personal";
     const defaultShare = body.default === "inherit" ? "" : body.default;
     // Audited like the admin twin, with self: true. Where a person's captures
@@ -326,6 +343,7 @@ export async function handleAdminRoutes(
     // TEAM_DEFAULT_WORKSPACE is a free-text config key, so it is narrowed to the
     // enum here rather than passed through: anything that is not "company" is
     // private-by-default, matching effectiveWriteTarget's own reading of it.
+    const cfg = await resolveConfig(env);
     const orgDefault = cfg.TEAM_DEFAULT_WORKSPACE === "company" ? "company" : "personal";
     // Who owns the deployment, the one thing `role` cannot say. tenancy.ts
     // hashes this brain's AUTH_TOKEN into a users row with role 'admin'
@@ -605,10 +623,12 @@ export async function handleAdminRoutes(
     });
   }
 
+
   // GET /stats
   if (url.pathname === "/stats" && request.method === "GET") {
-    const auth = await requireAdmin(request, env);
+    const auth = await requireIdentity(request, env);
     if (auth instanceof Response) return auth;
+    const cfg = await resolveConfig(env);
     const graceCutoff = Date.now() - graceMs(env);
     // This route answers two different questions and they need two different
     // scopes, which is why the first query carries the scope as a CASE rather
@@ -633,19 +653,25 @@ export async function handleAdminRoutes(
         // deliberately, so counting them here offered the user a repair for
         // something that is not broken.
         // scope-exempt: the row set here is deliberately corpus-wide, unvectorized and unclassified are deployment repair counters and would under-report if narrowed (see the block comment above and team-isolation.test.ts). The caller's clause is applied INSIDE the CASE for count/avg_importance, which scopes those two numbers and not the rows read; that is why it is spelled as a CASE and not a WHERE
+        // validity: any: 管理者の集計・活動・索引保守・変更前の状態確認は過去分も扱う。
         `SELECT
            SUM(CASE WHEN ${scope.clause} THEN 1 ELSE 0 END) as count,
            AVG(CASE WHEN ${scope.clause} THEN importance_score END) as avg_importance,
            SUM(CASE WHEN vector_ids = '[]' AND created_at < ? AND ${INDEXABLE_SQL} THEN 1 ELSE 0 END) as unvectorized,
+           MIN(CASE WHEN vector_ids = '[]' AND created_at < ? AND ${INDEXABLE_SQL} THEN created_at END) as oldest_unvectorized_at,
+           SUM(CASE WHEN vector_ids <> '[]' AND json_valid(pending_append_passages)
+             AND json_array_length(pending_append_passages) > 0 AND ${INDEXABLE_SQL}
+             THEN json_array_length(pending_append_passages) ELSE 0 END) as pending_append_passages,
            SUM(CASE WHEN tags NOT LIKE '%"status:%' AND tags NOT LIKE '%"kind:%' THEN 1 ELSE 0 END) as unclassified
          FROM entries`
-      ).bind(...scope.bindings, ...scope.bindings, graceCutoff).first() as Promise<Record<string, any> | null>,
+      ).bind(...scope.bindings, ...scope.bindings, graceCutoff, graceCutoff).first() as Promise<Record<string, any> | null>,
       // Reserved namespaces and pipeline markers are excluded here rather than
       // hidden in the client: this panel answers "what is my brain about?", and
       // kind:episodic outranked every real topic on a production brain. Numeric
       // tags are legacy issue references (see src/text/hashtags.ts). LIMIT is
       // raised because the filter now discards rows the ORDER BY ranked first.
       env.DB.prepare(
+        // validity: any: 管理者の集計・活動・索引保守・変更前の状態確認は過去分も扱う。
         `SELECT value, COUNT(*) as n FROM entries, json_each(entries.tags)
          WHERE ${isTopicTagSql()}
            AND value NOT GLOB '[0-9]*'
@@ -658,10 +684,11 @@ export async function handleAdminRoutes(
       // from workspaces the same token gets a 404 from /entry for. The nightly
       // compression pass picks its own tags per workspace (src/compression), so
       // narrowing this display list costs no repair coverage.
+      // validity: current: 既存のPENDING_INSIGHT_SQL・STALE_REVIEW_SQL・compressionEligibilitySqlで現在の適格性を検査する。
       env.DB.prepare(`
         SELECT value as tag, COUNT(*) as count
         FROM entries, json_each(entries.tags)
-        WHERE ${isTopicTagSql()}
+        WHERE ${isCompressionTagSql()}
           AND entries.tags NOT LIKE '%"rolled-up"%'
           AND entries.tags NOT LIKE '%"synthesized"%'
           AND entries.tags NOT LIKE '%"auto-pattern"%'
@@ -683,6 +710,7 @@ export async function handleAdminRoutes(
       // over, or a colleague's digest in an unreadable workspace silently
       // removes a real candidate from the admin's own list.
       const existing = await env.DB.prepare(
+        // validity: any: 管理者の集計・活動・索引保守・変更前の状態確認は過去分も扱う。
         `SELECT id FROM entries WHERE tags LIKE '%"synthesized"%' AND tags LIKE ? ${TAG_LIKE_ESCAPE} AND created_at > ? AND ${scope.clause} LIMIT 1`
       ).bind(tagLikePattern(row.tag as string), cutoff, ...scope.bindings).first();
       if (!existing) digestCandidates.push({ tag: row.tag as string, count: row.count as number });
@@ -694,6 +722,8 @@ export async function handleAdminRoutes(
       top_tags: (tagRows.results as any[]).map(r => r.value as string),
       digest_candidates: digestCandidates,
       unvectorized: (summary?.unvectorized as number) ?? 0,
+      pending_append_passages: (summary?.pending_append_passages as number) ?? 0,
+      oldest_unvectorized_at: summary?.oldest_unvectorized_at ?? null,
       vectorize_grace_ms: graceMs(env),
       unclassified: (summary?.unclassified as number) ?? 0,
     });
@@ -756,6 +786,7 @@ export async function handleAdminRoutes(
     // may read are counted at all.
     const invalidEndpoints = await env.DB.prepare(
       // scope-exempt: the entries reads are existence checks bound to edges.workspace_id, and the outer clause already limits the counted rows to edges the caller may read, so neither can reach or probe for an entry outside the caller's scope
+      // validity: any: 管理者の集計・活動・索引保守・変更前の状態確認は過去分も扱う。
       `SELECT COUNT(*) AS n FROM edges
        WHERE ${edgeScope.clause}
          AND (NOT EXISTS (SELECT 1 FROM entries WHERE entries.id = edges.source_id AND entries.workspace_id = edges.workspace_id)
@@ -781,6 +812,7 @@ export async function handleAdminRoutes(
     // could ever join, biasing the whole distribution short.
     const gapScope = scopeWhere(auth);
     const gaps = await env.DB.prepare(
+      // validity: any: 管理者の集計・活動・索引保守・変更前の状態確認は過去分も扱う。
       `WITH gaps AS (
          SELECT created_at - LAG(created_at) OVER (PARTITION BY workspace_id ORDER BY created_at) AS gap
          FROM entries WHERE ${gapScope.clause}
@@ -830,6 +862,7 @@ export async function handleAdminRoutes(
     // GET /brief's activity query. One statement, pivoted into per-source
     // series below.
     const { results } = await env.DB.prepare(
+      // validity: any: 管理者の集計・活動・索引保守・変更前の状態確認は過去分も扱う。
       `SELECT source, CAST(created_at / 86400000 AS INTEGER) AS day, COUNT(*) AS n
        FROM entries WHERE created_at >= ? AND ${scope.clause}
        GROUP BY source, day`,
@@ -879,11 +912,13 @@ export async function handleAdminRoutes(
 
     const [rows, totalRow] = await Promise.all([
       env.DB.prepare(
+        // validity: any: 管理者の集計・活動・索引保守・変更前の状態確認は過去分も扱う。
         `SELECT id, content, source, created_at, recall_count
          FROM entries WHERE ${scope.clause} AND ${exclusions}
          ORDER BY recall_count DESC, created_at DESC LIMIT ?`,
       ).bind(...scope.bindings, limit).all(),
       env.DB.prepare(
+        // validity: any: 管理者の集計・活動・索引保守・変更前の状態確認は過去分も扱う。
         `SELECT SUM(recall_count) AS total, SUM(contradiction_wins) AS contradictions
          FROM entries WHERE ${scope.clause} AND ${exclusions}`,
       ).bind(...scope.bindings).first() as Promise<Record<string, any> | null>,
@@ -942,41 +977,29 @@ export async function handleAdminRoutes(
   if (url.pathname === "/health" && request.method === "GET") {
     const auth = await requireIdentity(request, env);
     if (auth instanceof Response) return auth;
-    const vectorize = await checkVectorizeHealth(env);
-    // "team" is the dashboard's signal to show the layer controls (capture
-    // target, share actions, layer filters). Layers exist on every v3 brain,
-    // but until a second member is invited the toggle is noise for a solo
-    // owner, so the flag reads actual membership, not provisioning.
-    //
-    // isTeamBrain owns the whole decision, the TEAM_MODE setting and, when it
-    // says "auto", the headcount. countActiveMembers, not a bare COUNT(*):
-    // a removed member keeps their `users` row as a tombstone so their shared
-    // memories stay attributable, and counting those made "team" a one-way door
-    //, add one colleague ever, and the brain could never read as solo again.
-    // Suspended people still count; see that function's comment for why.
-    const team = await isTeamBrain(env);
-    // Result-quality signal, not correctness: every hydration below this is
-    // scoped at the SQL layer regardless, so a degraded filter never leaks
-    // another workspace's data, it just lets foreign candidates crowd out
-    // the caller's own in the vector index's own topK before SQL filters
-    // them back out. `latchedAt` reads the durable KV marker rather than
-    // trusting the in-memory latch alone, so the signal survives isolate
-    // churn between deploys.
+    // This is the deployment readiness endpoint. Unlike the background cold-start
+    // optimisation in ensureDbReady, success here guarantees every ordered ALTER and
+    // trigger upgrade has completed, so a fresh D1 needs no unsafe direct schema script.
+    await initializeDatabase(env);
+    const [vectorize, ai, team] = await Promise.all([
+      checkVectorizeHealth(env),
+      readWorkersAiHealth(env),
+      isTeamBrain(env),
+    ]);
     const { supported, degradedQueries } = vectorizeFilterState();
-    // A KV blip must not turn this route's other, independently-available
-    // signals (vectorize.ok, team) into a 500, /health previously depended
-    // on describe() and one D1 count only. `.catch(() => null)` degrades
-    // latchedAt to "unknown" instead, exactly like a marker that was never
-    // written.
     const latchedAtRaw = await env.OAUTH_KV.get(VECTORIZE_WORKSPACE_FILTER_UNSUPPORTED_KV_KEY).catch(() => null);
     const latchedAt = latchedAtRaw ? Number(latchedAtRaw) : null;
     // T-0101.8.5: the KV marker set once history starts being recorded (T-0089.1.1),
     // read here only — no D1 fallback. Omitted, not null, when it has never been set.
     const historySinceRaw = await env.OAUTH_KV.get(VERSIONS_SINCE_KV_KEY).catch(() => null);
     return json({
-      ok: vectorize.ok,
+      ok: vectorize.ok && ai.ok !== false,
+      // 既存okは完全な準備状態を維持。D1到達とAIの受動的観測を区別する。
+      status: !vectorize.ok || ai.ok === false ? "degraded" : "no_known_outage",
+      database: { status: "reachable" },
       version: SB_VERSION,
       vectorize: { ...vectorize, workspaceFilter: { supported, degradedQueries, latchedAt } },
+      ai,
       team,
       ...(historySinceRaw ? { history_since: Number(historySinceRaw) } : {}),
     });
@@ -1023,6 +1046,7 @@ export async function handleAdminRoutes(
         // already runs: the queue's rows have to say which layer they belong
         // to and who wrote them, and three more columns on an existing
         // projection is no new statement and no check:scope movement.
+        // validity: current: 既存のPENDING_INSIGHT_SQL・STALE_REVIEW_SQL・compressionEligibilitySqlで現在の適格性を検査する。
         `SELECT id, content, created_at, workspace_id, actor_id, source FROM entries
          WHERE ${PENDING_INSIGHT_SQL} AND ${scope.clause}
          ORDER BY created_at DESC LIMIT ? OFFSET ?`,
@@ -1030,6 +1054,7 @@ export async function handleAdminRoutes(
       // The total drives "N waiting" and the pager. It is a second query rather
       // than a window function so the shape survives D1's SQLite build.
       env.DB.prepare(
+        // validity: current: 既存のPENDING_INSIGHT_SQL・STALE_REVIEW_SQL・compressionEligibilitySqlで現在の適格性を検査する。
         `SELECT COUNT(*) AS n FROM entries WHERE ${PENDING_INSIGHT_SQL} AND ${scope.clause}`,
       ).bind(...scope.bindings).first() as Promise<Record<string, any> | null>,
     ]);
@@ -1147,12 +1172,14 @@ export async function handleAdminRoutes(
     const now = Date.now();
     const [rows, countRow] = await Promise.all([
       env.DB.prepare(
+        // validity: current: 既存のPENDING_INSIGHT_SQL・STALE_REVIEW_SQL・compressionEligibilitySqlで現在の適格性を検査する。
         `SELECT id, content, tags, source, created_at, when_at, valid_until, COALESCE(updated_at, created_at) AS last_updated
          FROM entries
          WHERE ${STALE_REVIEW_SQL} AND ${scope.clause}
          ORDER BY COALESCE(updated_at, created_at) ASC LIMIT ? OFFSET ?`,
       ).bind(...scope.bindings, limit, offset).all(),
       env.DB.prepare(
+        // validity: current: 既存のPENDING_INSIGHT_SQL・STALE_REVIEW_SQL・compressionEligibilitySqlで現在の適格性を検査する。
         `SELECT COUNT(*) AS n FROM entries WHERE ${STALE_REVIEW_SQL} AND ${scope.clause}`,
       ).bind(...scope.bindings).first() as Promise<Record<string, any> | null>,
     ]);
@@ -1435,10 +1462,7 @@ export async function handleAdminRoutes(
   //
   // Takes `id` for one or `ids` for many. Ruling on a backlog one at a time is
   // the actual complaint this answers, and doing it as N single requests would
-  // be N round trips — cheap against the platform's real 1,000-call ceiling,
-  // but this codebase holds each request to a self-imposed D1 budget of
-  // ~50 calls, and N round trips is N times the request/response overhead and
-  // CPU regardless.
+  // be N round trips against a Worker that gets ~50 D1 queries per invocation.
   if (url.pathname === "/patterns/resolve" && request.method === "POST") {
     const auth = await requireIdentity(request, env);
     if (auth instanceof Response) return auth;
@@ -1482,6 +1506,7 @@ export async function handleAdminRoutes(
 
     const placeholders = ids.map(() => "?").join(", ");
     const { results } = await env.DB.prepare(
+      // validity: any: 管理者の集計・活動・索引保守・変更前の状態確認は過去分も扱う。
       `SELECT id, tags, vector_ids, workspace_id FROM entries WHERE id IN (${placeholders}) AND ${scopeWhereForIdRead(scope).clause}`,
     ).bind(...ids, ...scope.bindings).all();
     const found = results as Record<string, any>[];
@@ -1510,103 +1535,20 @@ export async function handleAdminRoutes(
   if (url.pathname === "/vectorize-pending" && request.method === "POST") {
     const auth = await requireAdmin(request, env);
     if (auth instanceof Response) return auth;
-
-    const graceCutoff = Date.now() - graceMs(env);
-
-    // Deprecated entries are skipped, matching the migration path
-    // (src/migration/embedding.ts). Without this, dismissing a pattern deleted
-    // its vectors and then this button put them straight back, spending the
-    // daily embedding budget to reindex something the user had just told the
-    // brain to drop, and crowding the vector query with candidates that recall
-    // discards at hydration anyway.
-    const { results: toProcess } = await env.DB.prepare(
-      // scope-exempt: admin repair backlog: deployment-wide by design, returns counts not content
-      // validity: any: a replaced row keeps its vectors and must stay re-indexable here (5.5)
-      `SELECT id, content, tags, source, created_at, workspace_id, actor_id FROM entries
-       WHERE ${PENDING_WHERE}
-       ORDER BY created_at DESC LIMIT 25`
-    ).bind(graceCutoff).all<PendingRow>();
-
-    let processed = 0;
-    let failed = 0;
-
-    for (const row of toProcess) {
-      try {
-        // cfg carries the configured embedding model; indexPendingRow stamps the ROW's own
-        // workspace and author, never the admin's.
-        // False: the row changed content or workspace mid-embed; it stays pending for the next call.
-        if (await indexPendingRow(env, row, cfg)) processed++; else failed++;
-      } catch (e) {
-        console.error("Re-embed failed for entry", row.id, e);
-        failed++;
-      }
-    }
-
-    // Every still-unindexed row, not just the past-grace ones the select above can touch (adv-final
-    // MAJOR 2): a row inside its grace window is genuinely pending, not done, so reporting
-    // `remaining: 0` while it sits there would tell a caller — including the undo reply this
-    // backs — that indexing finished when it has not even started. oldest, of that same set,
-    // drives retryAfterMs: 0 once nothing is left, otherwise how long until the longest-waiting
-    // row leaves its grace window and this endpoint can actually make progress on it.
-    const remaining = await env.DB.prepare(
-      // scope-exempt: admin repair backlog: deployment-wide by design, returns counts not content
-      // validity: any: must match the toProcess selection above, replaced rows included (5.5)
-      `SELECT COUNT(*) as count, MIN(created_at) as oldest FROM entries WHERE vector_ids = '[]' AND ${INDEXABLE_SQL}`
-    ).first() as Record<string, any> | null;
-    const remainingCount = (remaining?.count as number) ?? 0;
-    const oldestCreatedAt = remaining?.oldest as number | null;
-    const retryAfterMs = remainingCount === 0 ? 0 : Math.max(0, (oldestCreatedAt as number) + graceMs(env) - Date.now());
-
-    return json({ processed, failed, remaining: remainingCount, retryAfterMs });
+    const { quotaRetryAt, ...result } = await processPendingVectorization(env);
+    return json({ ...result, ...(quotaRetryAt ? { quota_retry_at: quotaRetryAt } : {}) });
   }
 
   // POST /classify-pending
-  // One-time, opt-in backfill: runs classifyEntry over entries that predate the
-  // status (#119) and kind (#12) features and writes status:/kind: tags. Bounded
-  // batch per call, idempotent (skips entries that already carry either tag), and
-  // resumable (safe to stop/restart). No schema migration, only writes tags.
+  // Manual accelerator for the same resumable queue the scheduled quota-recovery
+  // pass drains conservatively. It also remains useful as an opt-in backfill for
+  // entries that predate status (#119) and kind (#12). No schema migration — only
+  // status:/kind: tags are written.
   if (url.pathname === "/classify-pending" && request.method === "POST") {
     const auth = await requireAdmin(request, env);
     if (auth instanceof Response) return auth;
-
-    const UNCLASSIFIED_WHERE = `tags NOT LIKE '%"status:%' AND tags NOT LIKE '%"kind:%'`;
-
-    const { results: toProcess } = await env.DB.prepare(
-      // scope-exempt: admin repair backlog: deployment-wide by design, returns counts not content
-      `SELECT id, content, tags FROM entries
-       WHERE ${UNCLASSIFIED_WHERE}
-       ORDER BY created_at ASC LIMIT 25`
-    ).all();
-
-    let processed = 0;
-    let failed = 0;
-    let skipped = 0;
-
-    for (const row of toProcess as Record<string, any>[]) {
-      try {
-        // cfg carries the user's LLM_MODEL choice; without it this backfill
-        // classifies with the shipped default and ignores their setting.
-        const { canonical, kind } = await classifyEntry(row.content as string, env, cfg);
-        const readTags: string = row.tags as string;
-        let tags: string[] = JSON.parse(readTags);
-        if (kind) tags = withKind(tags, kind);
-        if (canonical && getStatus(tags) === null && !hasCapsuleTag(tags)) tags = withStatus(tags, "canonical");
-        // versioning: exempt: hygiene, compare-and-set on the tags read (T-0089.10); a miss is skipped, not overwritten
-        const res = await env.DB.prepare(`UPDATE entries SET tags = ? WHERE id = ? AND tags = ?`).bind(JSON.stringify(tags), row.id, readTags).run();
-        if ((res.meta.changes ?? res.meta.rows_written ?? 0) === 0) skipped++;
-        else processed++;
-      } catch (e) {
-        console.error("Classification backfill failed for entry", row.id, e);
-        failed++;
-      }
-    }
-
-    const remaining = await env.DB.prepare(
-      // scope-exempt: admin repair backlog: must match the SELECT above or the loop never reaches zero
-      `SELECT COUNT(*) as count FROM entries WHERE ${UNCLASSIFIED_WHERE}`
-    ).first() as Record<string, any> | null;
-
-    return json({ processed, failed, skipped, remaining: (remaining?.count as number) ?? 0 });
+    const { quotaRetryAt, ...result } = await processPendingClassification(env);
+    return json({ ...result, ...(quotaRetryAt ? { quota_retry_at: quotaRetryAt } : {}) });
   }
 
   // POST /insights/accrue, run one accrual pass on demand, right now.
@@ -1666,6 +1608,7 @@ export async function handleAdminRoutes(
   if (url.pathname === "/insights/dry-run" && request.method === "GET") {
     const auth = await requireAdmin(request, env);
     if (auth instanceof Response) return auth;
+    const cfg = await resolveConfig(env);
 
     const limit = intParam(url, "limit", { fallback: 10, min: 1, max: 25 });
     if (limit instanceof Response) return limit;
@@ -1689,11 +1632,11 @@ export async function handleAdminRoutes(
     // draw query — a candidate accrued clean can be held by the time this preview reads it.
     const { results } = await env.DB.prepare(
       `SELECT c.id, c.a_id, c.b_id, c.score, a.content AS a_content, b.content AS b_content,
-              a.tags AS a_tags, b.tags AS b_tags
+              a.tags AS a_tags, b.tags AS b_tags, a.workspace_id AS a_workspace_id, b.workspace_id AS b_workspace_id
        FROM insight_candidates c
        JOIN entries a ON a.id = c.a_id
        JOIN entries b ON b.id = c.b_id
-       WHERE c.status = 'pending'
+       WHERE ${INSIGHT_CANDIDATE_SQL}
          AND a.tags NOT LIKE '%"status:deprecated"%'
          AND b.tags NOT LIKE '%"status:deprecated"%'
          AND (a.valid_until IS NULL OR a.valid_until > ${dryRunNow})
@@ -1719,6 +1662,7 @@ export async function handleAdminRoutes(
     // duplicates something she cannot see and did not write.
     const scope = scopeWhere(auth);
     const { results: recentInsightRows } = await env.DB.prepare(
+      // validity: current: 既存のPENDING_INSIGHT_SQL・STALE_REVIEW_SQL・compressionEligibilitySqlで現在の適格性を検査する。
       `SELECT content FROM entries WHERE ${PENDING_INSIGHT_SQL} AND ${scope.clause}
        ORDER BY created_at DESC LIMIT ?`,
     ).bind(...scope.bindings, RECENT_INSIGHT_WINDOW).all() as { results: { content: string }[] };
@@ -1770,7 +1714,7 @@ export async function handleAdminRoutes(
       const result = await reasonOverPair(
         { content: row.a_content as string },
         { content: row.b_content as string },
-        env,
+        chatGptEnvForWorkspaces(env, [row.a_workspace_id as string, row.b_workspace_id as string]),
         cfg,
       );
 
@@ -1785,6 +1729,8 @@ export async function handleAdminRoutes(
         reason = "the model declined this pair";
       } else if (result.outcome === "failed") {
         reason = "the model call itself failed";
+      } else if (result.outcome === "invalid") {
+        reason = `validation failed: ${result.reason}`;
       } else if (written >= MAX_INSIGHTS_PER_RUN) {
         reason = `the weekly cap of ${MAX_INSIGHTS_PER_RUN} insights would already be reached`;
       } else if (restatesRecent(result.text, writtenThisRun)) {
@@ -1801,6 +1747,7 @@ export async function handleAdminRoutes(
         a_id: row.a_id as string,
         b_id: row.b_id as string,
         score: row.score as number,
+        // 見送り・検証失敗・通信失敗を区別して報告し、候補状態は変更しない。
         // "declined" and "failed" are both reported, distinctly, rather than
         // collapsed to null: a human reading the shortlist can tell "the model
         // looked and said no" apart from "the call itself never answered",

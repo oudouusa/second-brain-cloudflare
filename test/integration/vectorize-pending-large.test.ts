@@ -4,6 +4,7 @@ import { makeTrashEnv, type TrashEnv } from "../helpers/trash-env";
 import { runNightlyVectorizePending, VECTORIZE_PENDING_NIGHTLY_EMBEDS, VECTORIZE_PENDING_NIGHTLY_ROWS } from "../../src/vectorize/pending";
 import { chunkText } from "../../src/text/chunk";
 import { DEFAULTS } from "../../src/config";
+import { embedBatchSize } from "../../src/lib/ai";
 import { D1_ROW_MAX_BYTES } from "../../src/constants";
 
 // T-0089.1.1 close-out round 3: the nightly pass indexes EVERY eligible row whatever its size. The
@@ -49,8 +50,9 @@ describe("nightly vectorize-pending: rows of any size", () => {
     await runNightlyVectorizePending(env, DEFAULTS);
     expect(await indexed("big")).toBe(true);
     expect(JSON.parse((await t.one<{ vector_ids: string }>(`SELECT vector_ids FROM entries WHERE id = 'big'`))!.vector_ids)).toHaveLength(chunks);
-    // ceil(chunks / 100) AI calls, one Vectorize upsert, the candidate read, the content read, one write batch.
-    expect(count()).toBeLessThanOrEqual(Math.ceil(chunks / 100) + 1 + 3);
+    // 固定Gemma25件batchと、候補2読取・outbox/CAS/receiptの7D1実行・upsertを固定する。
+    expect(count()).toBe(Math.ceil(chunks / embedBatchSize(DEFAULTS.EMBEDDING_MODEL)) + 10);
+    expect(count()).toBeLessThanOrEqual(50);
   });
 
   it("a legacy row over the 128 KB cap is skipped with one log line a night, takes no slot, and blocks nothing", async () => {

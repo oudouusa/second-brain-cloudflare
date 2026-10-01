@@ -20,10 +20,12 @@ import { recallEntries } from "../../src/recall/search";
 import { makeSqliteD1, type SqliteD1 } from "../helpers/sqlite-d1";
 import { initializeDatabase, resetDatabaseInit } from "../../src/db/init";
 import { makeTestDb, makeTestEnv, makeVectorizeMock } from "../helpers/make-env";
+import { embeddingMetadata } from "../../src/embedding/profile";
 import worker from "../../src/index";
 import { req } from "../helpers/make-request";
 import type { Env } from "../../src/env";
 import { tagLikePattern } from "../../src/memory/tag-sql";
+import { memoryWriteMarker } from "../../src/migration/write-lock";
 
 const ctx = { waitUntil: (_: Promise<any>) => {} } as any;
 
@@ -56,8 +58,12 @@ function envOver(s: SqliteD1): Env {
   const VECTORIZE = {
     ...makeVectorizeMock(),
     getByIds: async (ids: string[]) =>
-      ids.map(id => ({ id, values: new Array(384).fill(0.1), metadata: { parentId: id.replace(/^v-/, "") } })),
-  } as unknown as VectorizeIndex;
+      ids.map(id => ({
+        id,
+        values: new Array(128).fill(0.1),
+        metadata: { parentId: id.replace(/^v-/, ""), ...embeddingMetadata() },
+      })),
+  } as unknown as Vectorize;
   return makeTestEnv(undefined, { DB, VECTORIZE });
 }
 
@@ -79,10 +85,9 @@ const OTHER = Array.from({ length: 9 }, (_, i) => `other-${i}`).sort();
  */
 function seeded(): SqliteD1 {
   const s = makeSqliteD1();
-  // buildEntryFilterQuery's SELECT reads valid_from/valid_until, one of the
-  // columns src/db/init.ts adds by ALTER at runtime rather than in schema.sql.
-  s.db.prepare(`ALTER TABLE entries ADD COLUMN valid_from INTEGER`).run();
-  s.db.prepare(`ALTER TABLE entries ADD COLUMN valid_until INTEGER`).run();
+  // buildEntryFilterQueryが使う有効期間列はschema 9の参照DDLに含まれる。
+  expect(s.columns()).toContain("valid_from");
+  expect(s.columns()).toContain("valid_until");
   OWN.forEach((id, i) => s.seed({ id, content: `planning note ${i}`, createdAt: 1000 + i, tags: ["q3_planning"], vectorIds: [`v-${id}`] }));
   OTHER.forEach((id, i) => s.seed({ id, content: `planning note ${i}`, createdAt: 2000 + i, tags: ["q3-planning"], vectorIds: [`v-${id}`] }));
   return s;
@@ -145,7 +150,7 @@ describe("tag-scoped recall candidate query", () => {
     const env = makeTestEnv(db, {
       DB,
       VECTORIZE: makeVectorizeMock({
-        getByIds: async () => [{ id: "v-0", values: new Array(384).fill(0.1), metadata: { parentId: "e-0" } }],
+        getByIds: async () => [{ id: "v-0", values: new Array(128).fill(0.1), metadata: { parentId: "e-0" } }],
       }),
     });
 
@@ -202,11 +207,15 @@ describe("tag-scoped recall candidate query", () => {
     sqlite.seed({ id: "c-too-old", content: "alpha beta old evidence", createdAt: 800, tags: ["work", "kind:semantic"] });
     sqlite.seed({ id: "d-too-new", content: "alpha beta future evidence", createdAt: 1200, tags: ["work", "kind:semantic"] });
     sqlite.seed({ id: "z-eligible", content: "alpha beta eligible evidence", createdAt: 1000, tags: ["work", "kind:semantic"] });
+    const admittedEnv = sqlite.admitEnv(env);
     for (const id of ["a-personal", "b-wrong-kind", "c-too-old", "d-too-new", "z-eligible"]) {
-      await sqlite.db.prepare(
-        `INSERT INTO edges (id, source_id, target_id, type, weight, provenance, metadata, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      ).bind(`edge-${id}`, "work-root", id, "decided", 1, "explicit", "{}", 1, 1).run();
+      await admittedEnv.DB.prepare(
+        `INSERT INTO edges (id, source_id, target_id, type, weight, provenance, metadata, created_at, updated_at, write_marker)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).bind(
+        `edge-${id}`, "work-root", id, "decided", 1, "explicit", "{}", 1, 1,
+        memoryWriteMarker(admittedEnv),
+      ).run();
     }
 
     const { matches } = await recallEntries(
@@ -220,7 +229,7 @@ describe("tag-scoped recall candidate query", () => {
         hops: 1,
         synthesize: false,
       },
-      env,
+      admittedEnv,
       ctx,
     );
 
@@ -234,11 +243,11 @@ describe("tag-scoped recall candidate query", () => {
  * asserting on the response body. `?tag=%` returning the whole brain is the case that
  * looks most like a valid answer and is therefore least likely to be noticed.
  */
-describe("GET /list tag filter, end to end", () => {
+describe("POST /list tag filter, end to end", () => {
   async function listed(tag: string): Promise<string[]> {
     const env = await seedEnv();
     const res = await worker.fetch(
-      req("GET", `/list?n=100&tag=${encodeURIComponent(tag)}`),
+      req("POST", `/list?n=100&tag=${encodeURIComponent(tag)}`),
       env,
       ctx,
     );

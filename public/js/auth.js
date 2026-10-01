@@ -1,3 +1,52 @@
+const ACCESS_DASHBOARD_PATH = '/dashboard'
+const ACCESS_SESSION_MARKER = 'cloudflare-access'
+const ACCESS_DASHBOARD_HEADER = 'X-Second-Brain-Dashboard'
+const RETIRED_OAUTH_SESSION_KEYS = ['sb_oa', 'sb_or', 'sb_oe', 'sb_oc', 'sb_os', 'sb_ov']
+let accessDashboardFetchInstalled = false
+
+function isAccessDashboard() {
+  return window.location.pathname === ACCESS_DASHBOARD_PATH
+}
+
+function installAccessDashboardFetch() {
+  if (accessDashboardFetchInstalled) return
+  accessDashboardFetchInstalled = true
+  const nativeFetch = window.fetch.bind(window)
+  window.fetch = (input, init = {}) => {
+    const target = new URL(input instanceof Request ? input.url : input, window.location.href)
+    if (target.origin !== window.location.origin || !target.pathname.startsWith('/dashboard/api/')) {
+      return nativeFetch(input, init)
+    }
+    const headers = new Headers(input instanceof Request ? input.headers : undefined)
+    new Headers(init.headers).forEach((value, name) => headers.set(name, value))
+    // Access owns Authorization on this application. The dashboard uses its
+    // own non-secret header only as a same-origin/CSRF signal to the Worker.
+    headers.delete('Authorization')
+    headers.set(ACCESS_DASHBOARD_HEADER, '1')
+    return input instanceof Request
+      ? nativeFetch(new Request(input, { ...init, headers }))
+      : nativeFetch(input, { ...init, headers })
+  }
+}
+
+function activateAccessDashboard() {
+  if (!isAccessDashboard()) return false
+
+  // The Access cookie is HttpOnly. Remove credentials retained by the retired
+  // dashboard OAuth/static-token flows so private tokens never reach web storage.
+  localStorage.removeItem('sb_url')
+  localStorage.removeItem('sb_token')
+  localStorage.removeItem('sb_odc')
+  RETIRED_OAUTH_SESSION_KEYS.forEach((key) => sessionStorage.removeItem(key))
+
+  WORKER_URL = `${window.location.origin}/dashboard/api`
+  installAccessDashboardFetch()
+  // Kept truthy for existing refresh guards. The fetch wrapper never transmits
+  // this value; authentication is exclusively the Access HttpOnly session.
+  AUTH_TOKEN = ACCESS_SESSION_MARKER
+  return true
+}
+
 async function connect() {
   const url = document.getElementById('auth-url').value.trim().replace(/\/$/, '')
   const tok = document.getElementById('auth-token').value.trim()
@@ -205,6 +254,11 @@ function logout() {
   closeMenu()
   localStorage.removeItem('sb_url')
   localStorage.removeItem('sb_token')
+  if (isAccessDashboard()) {
+    RETIRED_OAUTH_SESSION_KEYS.forEach((key) => sessionStorage.removeItem(key))
+    window.location.assign('/cdn-cgi/access/logout')
+    return
+  }
   WORKER_URL = ''
   AUTH_TOKEN = ''
   document.getElementById('app').style.display = 'none'

@@ -28,7 +28,14 @@ import { makeTestEnv, makeMemoryKV } from "../helpers/make-env";
 import { resetDatabaseInit, initializeDatabase } from "../../src/db/init";
 import { ensureTenantBootstrap } from "../../src/lib/tenancy";
 import { createMember } from "../../src/lib/team-admin";
-import { loadIntegration } from "../../src/integrations";
+import {
+  acquireIntegrationOperation,
+  loadIntegration,
+  releaseIntegrationOperation,
+  saveIntegration,
+  withIntegrationOperation,
+  type IntegrationRecord,
+} from "../../src/integrations";
 import { mirrorWriteContext } from "../../src/integrations/mirror";
 import type { Env } from "../../src/env";
 
@@ -105,6 +112,21 @@ async function settle(): Promise<void> {
     const batch = pending;
     pending = [];
     await Promise.all(batch);
+  }
+}
+
+/** Persist a fixture edit through the same generation-fenced key as production. */
+async function replaceIntegration(record: IntegrationRecord): Promise<void> {
+  const directEnv = sqlite.admitEnv(env);
+  const operation = await acquireIntegrationOperation(directEnv, record.provider, "connect");
+  try {
+    await saveIntegration(withIntegrationOperation(directEnv, operation), {
+      ...record,
+      stateGeneration: operation.stateGeneration,
+      providerGeneration: operation.providerGeneration,
+    });
+  } finally {
+    await releaseIntegrationOperation(directEnv, operation);
   }
 }
 
@@ -213,7 +235,7 @@ describe("GET /integrations reports where a connection mirrors and who made it",
     // A pre-task blob: the mirror layer is there, the actor never was.
     const record = (await loadIntegration(env, "notion"))!;
     record.config = { mirrorWorkspace: "personal" };
-    await env.OAUTH_KV.put("integrations:notion", JSON.stringify(record));
+    await replaceIntegration(record);
 
     const spy = vi.spyOn(env.DB, "prepare");
     const legacyRow = await notionRow(OWNER);
@@ -226,7 +248,7 @@ describe("GET /integrations reports where a connection mirrors and who made it",
 
     spy.mockClear();
     record.config = { mirrorWorkspace: "personal", connectedByUserId: roots.ownerUserId };
-    await env.OAUTH_KV.put("integrations:notion", JSON.stringify(record));
+    await replaceIntegration(record);
     expect((await notionRow(OWNER)).connectedBy).toBe("Owner");
     expect(rosterQueries(spy.mock.calls.map((c) => c[0])).length).toBe(1);
   });
@@ -262,7 +284,7 @@ describe("GET /integrations reports where a connection mirrors and who made it",
     await call("POST", "/integrations/notion/connect", OWNER, { token: "owner-notion-token" });
     const first = (await loadIntegration(env, "notion"))!;
     first.itemMap = { page: { entryId: "e-1", version: "v1" } };
-    await env.OAUTH_KV.put("integrations:notion", JSON.stringify(first));
+    await replaceIntegration(first);
 
     await call("POST", "/integrations/notion/connect", bea.token, { token: "bea-notion-token" });
 

@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { Client } from "@modelcontextprotocol/client";
+import { InMemoryTransport } from "@modelcontextprotocol/client";
 import worker from "../../src/index";
 import { buildMcpServer } from "../../src/mcp/server";
 import { makeSqliteD1, type SqliteD1 } from "../helpers/sqlite-d1";
@@ -22,7 +22,7 @@ const ctx = { waitUntil: (_: Promise<unknown>) => {} } as unknown as ExecutionCo
 beforeEach(async () => {
   resetDatabaseInit();
   sqlite = makeSqliteD1();
-  env = makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV() });
+  env = sqlite.admitEnv(makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV() }));
   await initializeDatabase(env);
   const roots = await ensureTenantBootstrap(env);
   owner = (await resolveIdentityByUserId(env, roots.ownerUserId))!;
@@ -88,7 +88,7 @@ describe("shared and unshared events record fromWorkspaceId and are written in m
   it("a move whose batch fails writes no event, and an event never exists without its move", async () => {
     await seed("e4");
     const raw = env.DB as any;
-    const failing = { ...env, DB: { ...raw, batch: () => { throw new Error("D1 down"); } } } as unknown as Env;
+    const failing = { ...env, WRITE_ADMISSION_TOKEN: env.WRITE_ADMISSION_TOKEN, DB: { ...raw, batch: () => { throw new Error("D1 down"); } } } as unknown as Env;
     await expect(moveEntry("e4", "company", failing, owner, { actorId: owner.userId, channel: "rest" })).rejects.toThrow();
     expect(await events("e4")).toEqual([]);
     expect((await env.DB.prepare(`SELECT workspace_id FROM entries WHERE id = 'e4'`).first<{ workspace_id: string }>())!.workspace_id).toBe(owner.personalWorkspaceId);
@@ -128,7 +128,7 @@ describe("shared and unshared events record fromWorkspaceId and are written in m
     }));
     await seed("e8", { workspaceId: owner.personalWorkspaceId, actorId: "" });
     await seed("e9", { workspaceId: owner.personalWorkspaceId, actorId: "" });
-    sqlite.issued.length = 0;
+    sqlite.executions.length = 0;
     const res = await worker.fetch(req("POST", "/integrations/notion/move", { body: {} }), env, ctx);
     const body = await res.json() as any;
     expect(body.moved).toBe(2);
@@ -136,8 +136,9 @@ describe("shared and unshared events record fromWorkspaceId and are written in m
     expect(await events("e9")).toHaveLength(1);
     // One D1 call per moved entry for the whole [event, UPDATE, UPDATE] batch (plus the route's own
     // one admin-event audit for the whole move action) — no extra execution per entry from the event.
-    const batches = sqlite.issued.filter(s => s === "BATCH").length;
-    expect(batches).toBe(3);
+    const batches = sqlite.executions.filter(s => s === "BATCH").length;
+    // standingのcache無効化を同batchに含めるが、forkの書込フェンス用batchが1回増える。
+    expect(batches).toBe(4);
   });
 });
 
@@ -167,12 +168,12 @@ describe("history visibility follows moves", () => {
     await bump("g1", "created", owner.userId, 100);
     await moveEntry("g1", "company", env, owner, { actorId: owner.userId, channel: "rest" });
 
-    const asBob = await worker.fetch(req("GET", "/entry?id=g1", { token: bobToken }), env, ctx);
+    const asBob = await worker.fetch(req("POST", "/entry?id=g1", { token: bobToken }), env, ctx);
     const bobBody = await asBob.json() as any;
     expect(bobBody.entry.timeline.some((e: any) => e.event === "created")).toBe(false);
     expect(bobBody.entry.timeline.some((e: any) => e.event === "shared")).toBe(true);
 
-    const asOwner = await worker.fetch(req("GET", "/entry?id=g1"), env, ctx);
+    const asOwner = await worker.fetch(req("POST", "/entry?id=g1"), env, ctx);
     const ownerBody = await asOwner.json() as any;
     expect(ownerBody.entry.timeline.some((e: any) => e.event === "created")).toBe(true);
   });
@@ -224,7 +225,7 @@ describe("history visibility follows moves", () => {
     await bump("l1", "shared", owner.userId, 2000, { workspaceId: roots.companyWorkspaceId }); // pre-4.0: no fromWorkspaceId
     await bump("l1", "unshared", owner.userId, 3000, { workspaceId: owner.personalWorkspaceId }); // pre-4.0: no fromWorkspaceId
 
-    const res = await worker.fetch(req("GET", "/entry?id=l1"), env, ctx);
+    const res = await worker.fetch(req("POST", "/entry?id=l1"), env, ctx);
     const body = await res.json() as any;
     expect((body.entry ?? body).timeline.map((e: any) => e.event)).toEqual(["updated", "shared", "unshared"]);
   });

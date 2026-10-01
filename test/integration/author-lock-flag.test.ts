@@ -59,7 +59,8 @@ async function capture(token: string, content: string, workspace?: "personal" | 
   return body.id as string;
 }
 
-const entryOf = async (id: string, token: string) => (await jsonOf(await call("GET", `/entry?id=${id}`, token))).entry;
+const entryOf = async (id: string, token: string) =>
+  (await jsonOf(await call("POST", "/entry", token, { id }))).entry;
 
 beforeEach(async () => {
   resetDatabaseInit();

@@ -1,13 +1,13 @@
 name: Store Merged PR to Second Brain
 
+# 薄フォークでは PR を外部 Second Brain へ自動保存しない。
+# upstream 同期時に差分を追跡しやすいよう定義は残すが、job は明示的に無効化する。
 on:
-  pull_request:
-    types:
-      - closed
+  workflow_dispatch:
 
 jobs:
   store-to-second-brain:
-    if: github.event.pull_request.merged == true
+    if: ${{ false }}
     runs-on: ubuntu-latest
 
     steps:

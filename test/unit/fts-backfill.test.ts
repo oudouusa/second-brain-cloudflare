@@ -350,17 +350,16 @@ describe("checkFtsIntegrity", () => {
     const result = await checkFtsIntegrity(env);
 
     expect(result).toEqual({ healthy: true });
-    // Snapshot the night's statements before the EXPLAIN probes below land
-    // in `issued`. Standalone calls record verbatim; batch members live in
-    // `batches` (issued collapses each batch to a single "BATCH" entry).
-    const allSql = [...d1.issued.filter(s => s !== "BATCH"), ...d1.batches.flat()];
+    // This fork's SQLite facade records every prepared statement in `issued`,
+    // including batch members. Inspect each statement exactly once.
+    const allSql = [...d1.issued];
 
     const planDetails = async (sql: string): Promise<string[]> =>
       ((await d1.db.prepare(`EXPLAIN QUERY PLAN ${sql}`).all()).results as { detail: string }[]).map(r => r.detail);
     const entriesScans: string[] = [];
     for (const sql of allSql) {
       if (!/\bFROM\s+entries\b/i.test(sql)) continue;
-      entriesScans.push(...(await planDetails(sql)).filter(d => /^SCAN entries\b/.test(d)));
+      entriesScans.push(...(await planDetails(sql)).filter(d => /^SCAN entries\b/.test(d)).map(d => `${sql}: ${d}`));
     }
     expect(entriesScans).toHaveLength(1);
     // Belt and suspenders: no bare count(*) over entries (a full scan in its
@@ -485,7 +484,7 @@ describe("checkFtsIntegrity", () => {
     seed(d1, 5000);
     // Realistic memory-size content; the update trigger re-mirrors FTS,
     // keeping (rowid, id, content) parity.
-    await d1.db.prepare(`UPDATE entries SET content = content || ' with violet orchid dashboard detail repeated for a realistic memory size'`).run();
+    await d1.db.prepare(`UPDATE entries SET content = content || ' with violet orchid dashboard detail repeated for a realistic memory size', write_marker = ?`).bind(d1.fixtureMarker()).run();
     const env = envFor(d1);
     await env.OAUTH_KV.put(FTS_READY_KV_KEY, "1");
     await d1.db.prepare(`UPDATE entries_fts SET content = 'stale orchid payload' WHERE rowid = 7`).run();

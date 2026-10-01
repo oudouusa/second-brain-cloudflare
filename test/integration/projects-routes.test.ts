@@ -297,7 +297,7 @@ describe("GET /projects?counts=1", () => {
       if (/INDEXED BY idx_entries_project/.test(sql)) throw new Error("D1_ERROR: database is locked");
       return prepare(sql);
     };
-    await expect(call("GET", "/projects?counts=1", ALICE)).rejects.toThrow(/database is locked/);
+    expect((await call("GET", "/projects?counts=1", ALICE)).status).toBe(500);
   });
 
   it("flags counts_approximate when the 5000 row scan is exhausted", async () => {

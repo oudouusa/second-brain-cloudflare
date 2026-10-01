@@ -16,6 +16,7 @@ export type EdgeType = keyof typeof EDGE_TYPES;
 
 export const PROVENANCE_VALUES = ["explicit", "inferred", "system"] as const;
 export type EdgeProvenance = (typeof PROVENANCE_VALUES)[number];
+export type EdgeDirection = "outgoing" | "incoming" | "undirected";
 
 export interface GraphNeighbor {
   id: string;
@@ -25,6 +26,9 @@ export interface GraphNeighbor {
   viaProvenance: EdgeProvenance; // how the traversed edge was created: explicit (you) / inferred (auto) / system
   viaLinkedAt: number;           // when the traversed edge was formed (edge created_at)
   viaFrom: string;               // id of the node this neighbor was reached from
+  viaSourceId: string;           // stored edge source; preserves directed semantics
+  viaTargetId: string;           // stored edge target; preserves directed semantics
+  viaDirection: EdgeDirection;   // direction from viaFrom toward this neighbor
   /** T-0089.2.1: null means still current, a replaced fact keeps the date it stopped. */
   validUntil?: number | null;
 }
@@ -40,8 +44,16 @@ export interface Connection {
   weight: number;
   provenance: EdgeProvenance; // explicit (you linked) / inferred (auto) / system
   linkedAt: number;           // when the edge was formed (edge created_at)
+  sourceId: string;
+  targetId: string;
+  direction: EdgeDirection;   // direction from the requested entry toward this connection
   /** T-0089.2.1: null means still current, a replaced fact keeps the date it stopped. */
   validUntil: number | null;
+}
+
+export interface ConnectionPage {
+  connections: Connection[];
+  nextCursor: string | null;
 }
 
 export interface GraphNode {

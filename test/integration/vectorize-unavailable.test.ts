@@ -5,8 +5,8 @@ import { req } from "../helpers/make-request";
 import type { Env } from "../../src/env";
 import { D1Mock } from "../helpers/d1-mock";
 import { buildMcpServer } from "../../src/mcp/server";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { Client } from "@modelcontextprotocol/client";
+import { InMemoryTransport } from "@modelcontextprotocol/client";
 import { VECTORIZE_GET_BY_IDS_BATCH } from "../../src/constants";
 import { recallEntries } from "../../src/recall/search";
 import type { RecallDiagnostics } from "../../src/recall/types";
@@ -92,7 +92,7 @@ describe("Vectorize unavailable — writes degrade to keyword-only (#270)", () =
         await seed(db, "findable by keyword");
         const env = makeTestEnv(db, overrides());
         const { ctx } = makeCtx();
-        const res = await worker.fetch(req("GET", "/recall?query=findable"), env, ctx);
+        const res = await worker.fetch(req("POST", "/recall?query=findable"), env, ctx);
 
         expect(res.status).toBe(200);
         const body = await res.json() as any;
@@ -138,7 +138,7 @@ describe("Vectorize unavailable — writes degrade to keyword-only (#270)", () =
     expect(JSON.parse(db.entries[0].vector_ids).length).toBeGreaterThan(0);
   });
 
-  it("still fails loudly when the embed fails but Vectorize is healthy (#212)", async () => {
+  it("returns an actionable quota response and leaves the entry unchanged when the embed quota is exhausted (#212)", async () => {
     // The distinction the fix turns on: a failing embed against a reachable index
     // is a transient fault, not a keyword-only deployment. Committing here would
     // report success for content the index never received.
@@ -150,7 +150,12 @@ describe("Vectorize unavailable — writes degrade to keyword-only (#270)", () =
     const res = await worker.fetch(req("POST", "/update", { body: { id, content: "replacement content" } }), env, ctx);
     await drain();
 
-    expect(res.status).toBe(500);
+    expect(res.status).toBe(429);
+    expect(res.headers.get("Retry-After")).toMatch(/^\d+$/);
+    const body = await res.json() as any;
+    expect(body.code).toBe("workers_ai_quota_exhausted");
+    expect(body.error).toContain("09:00 JST");
+    expect(JSON.stringify(body)).not.toContain("4006");
     expect(db.entries[0].content).toBe(content);
     expect(db.entries[0].vector_ids).toBe(vector_ids);
   });
@@ -182,7 +187,7 @@ describe("recall wording for Vectorize failures (#352)", () => {
 
   it("a transient Vectorize query error yields the neutral wording, not a missing-index diagnosis", async () => {
     const { ctx } = makeCtx();
-    const res = await worker.fetch(req("GET", "/recall?query=nothing+stored+here"), transient(), ctx);
+    const res = await worker.fetch(req("POST", "/recall?query=nothing+stored+here"), transient(), ctx);
     const body = await res.json() as any;
 
     expect(body.semantic_unavailable).toBe(true);
@@ -204,7 +209,7 @@ describe("recall wording for Vectorize failures (#352)", () => {
   it("an absent binding still reports semantic_unavailable with the neutral wording", async () => {
     const { ctx } = makeCtx();
     const env = makeTestEnv(db, { VECTORIZE: undefined as any });
-    const res = await worker.fetch(req("GET", "/recall?query=nothing+stored+here"), env, ctx);
+    const res = await worker.fetch(req("POST", "/recall?query=nothing+stored+here"), env, ctx);
     const body = await res.json() as any;
 
     expect(body.semantic_unavailable).toBe(true);
@@ -216,7 +221,7 @@ describe("recall wording for Vectorize failures (#352)", () => {
   it("a healthy recall carries no unavailable notice", async () => {
     const { ctx } = makeCtx();
     const env = makeTestEnv(db, { VECTORIZE: makeVectorizeMock({ query: vi.fn().mockResolvedValue({ matches: [] }) } as any) });
-    const res = await worker.fetch(req("GET", "/recall?query=nothing+stored+here"), env, ctx);
+    const res = await worker.fetch(req("POST", "/recall?query=nothing+stored+here"), env, ctx);
     const body = await res.json() as any;
 
     expect(body.semantic_unavailable).toBe(false);
@@ -234,7 +239,7 @@ describe("recall wording for Vectorize failures (#352)", () => {
       id: "e1", content: "quarterly pricing review", tags: JSON.stringify(["shared"]), source: "api",
       created_at: Date.now(), vector_ids: JSON.stringify(ids), recall_count: 0, importance_score: 0,
     });
-    const values = new Array(384).fill(0.1);
+    const values = new Array(128).fill(1 / Math.sqrt(128));
     const getByIds = vi.fn()
       .mockResolvedValueOnce(ids.slice(0, VECTORIZE_GET_BY_IDS_BATCH).map(id => ({ id, values, metadata: { parentId: "e1", isUpdate: false } })))
       .mockRejectedValueOnce(new Error("vectorize internal error (code 5xx)"));
@@ -243,7 +248,7 @@ describe("recall wording for Vectorize failures (#352)", () => {
 
     // No token overlap with the entry's content: the keyword rows cannot surface it,
     // so it can only appear via the first batch's dense vectors.
-    const res = await worker.fetch(req("GET", "/recall?query=zebra+migration+patterns&tag=shared"), env, ctx);
+    const res = await worker.fetch(req("POST", "/recall?query=zebra+migration+patterns&tag=shared"), env, ctx);
     const body = await res.json() as any;
 
     expect(getByIds).toHaveBeenCalledTimes(2);

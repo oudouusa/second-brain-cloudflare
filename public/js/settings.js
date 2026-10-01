@@ -62,7 +62,7 @@ async function loadMenuStats() {
     const data = await res.json()
     vectorizeGraceMs = data.vectorize_grace_ms ?? vectorizeGraceMs
     renderDigestSection(data.digest_candidates ?? [])
-    renderVectorizeSection(data.unvectorized ?? 0)
+    renderVectorizeSection((data.unvectorized ?? 0) + (data.pending_append_passages ?? 0), data.oldest_unvectorized_at)
     renderClassifySection(data.unclassified ?? 0)
     await loadPatternCount()
   } catch {
@@ -140,8 +140,10 @@ async function runDigest(tag, btn) {
   btn.innerHTML = `<i class="ti ti-loader-2"></i> ${escHtml(t('upkeep.working'))}`
   const row = document.getElementById('digest-row-' + tag)
   try {
-    const res = await fetch(`${WORKER_URL}/digest?tag=${encodeURIComponent(tag)}`, {
-      headers: { Authorization: `Bearer ${AUTH_TOKEN}` },
+    const res = await fetch(`${WORKER_URL}/digest`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${AUTH_TOKEN}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ tag }),
     })
     const data = await res.json()
     if (data.synthesis) {
@@ -173,9 +175,11 @@ async function runDigest(tag, btn) {
   }
 }
 
-function renderVectorizeSection(count) {
+let lastVectorizeResult = null
+
+function renderVectorizeSection(count, oldestAt) {
   const el = document.getElementById('vectorize-section')
-  if (!count) {
+  if (!count && !lastVectorizeResult) {
     el.style.display = 'none'
     return
   }
@@ -183,7 +187,9 @@ function renderVectorizeSection(count) {
   el.innerHTML = `
     <div class="digest-section-label">${escHtml(t('upkeep.vectorizeLabel'))}</div>
     <p class="digest-note">${escHtml(tPlural('upkeep.vectorizeNote', count))}</p>
-    <button class="digest-btn" id="vectorize-btn" onclick="runVectorize(this)">${escHtml(t('upkeep.vectorizeAction'))}</button>
+    ${Number.isFinite(oldestAt) ? `<p class="digest-note">${escHtml(t('upkeep.oldestUnindexed', { hours: Math.max(0, (Date.now() - oldestAt) / 3600000).toFixed(1) }))}</p>` : ''}
+    ${lastVectorizeResult ? `<p class="digest-note">${escHtml(t('upkeep.vectorizeBatchResult', lastVectorizeResult))}</p>` : ''}
+    ${count ? `<button class="digest-btn" id="vectorize-btn" onclick="runVectorize(this)">${escHtml(t('upkeep.vectorizeAction'))}</button>` : ''}
   `
 }
 
@@ -192,22 +198,14 @@ async function runVectorize(btn) {
   btn.classList.add('digest-btn--loading')
   btn.innerHTML = `<i class="ti ti-loader-2"></i> ${escHtml(t('upkeep.working'))}`
   try {
-    let remaining = 1
-    let totalProcessed = 0
-    while (remaining > 0) {
-      const res = await fetch(`${WORKER_URL}/vectorize-pending`, {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${AUTH_TOKEN}` },
-      })
-      if (!res.ok) throw new Error(t('auth.serverError', { status: res.status }))
-      const data = await res.json()
-      remaining = data.remaining ?? 0
-      totalProcessed += data.processed ?? 0
-      if ((data.processed ?? 0) === 0 && remaining > 0) break
-    }
+    const res = await fetch(`${WORKER_URL}/vectorize-pending`, {
+      method: 'POST', headers: { Authorization: `Bearer ${AUTH_TOKEN}` },
+    })
+    if (!res.ok) throw new Error(t('auth.serverError', { status: res.status }))
+    const data = await res.json()
+    lastVectorizeResult = { processed: data.processed ?? 0, failed: data.failed ?? 0, remaining: data.remaining ?? 0 }
     btn.classList.remove('digest-btn--loading')
-    btn.innerHTML = `<i class="ti ti-check"></i> ${escHtml(tPlural('upkeep.vectorizeDone', totalProcessed, { n: totalProcessed }))}`
-    btn.style.color = 'var(--good)'
+    btn.innerHTML = escHtml(t('upkeep.vectorizeBatchResult', lastVectorizeResult))
     await loadMenuStats()
     refreshAll()
   } catch {
@@ -383,7 +381,7 @@ function renderRestoreDone(totals) {
   `
 }
 
-/** Stage two: the same /vectorize-pending loop the "Not indexed" section runs,
+/** Stage two: the restore-specific /vectorize-pending loop,
  * kept inside the restore flow so finishing doesn't require finding another
  * button elsewhere in the menu. */
 async function indexRestored(btn) {

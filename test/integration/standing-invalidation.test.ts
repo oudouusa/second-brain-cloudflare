@@ -51,8 +51,9 @@ async function setup() {
   const sqlite = makeSqliteD1();
   open.push(sqlite);
   const kv = makeMemoryKV();
-  const env: Env = makeTestEnv(undefined, { DB: sqlite.db as unknown as D1Database, OAUTH_KV: kv });
+  let env: Env = sqlite.admitEnv(makeTestEnv(undefined, { DB: sqlite.db as unknown as D1Database, OAUTH_KV: kv }));
   await initializeDatabase(env);
+    env = sqlite.admitEnv(env);
   return { env, sqlite, kv };
 }
 
@@ -138,18 +139,19 @@ describe("standing invalidation: captureEntry and appendToEntry (lane W's files)
     c.enqueue(new TextEncoder().encode("data: [DONE]\n\n")); c.close();
   } });
   const decisionAI = (decision: string) =>
-    ({ run: vi.fn(async (model: string) => model.startsWith("@cf/baai/bge") ? { data: [new Array(384).fill(0.1)] } : stream(decision)) }) as unknown as Ai;
+    ({ run: vi.fn(async (model: string) => model === DEFAULTS.EMBEDDING_MODEL ? { data: [new Array(768).fill(0.1)] } : stream(decision)) }) as unknown as Ai;
 
   it("merge into an already-standing target touches the cache, even when the incoming capture is not itself tagged standing", async () => {
     const { sqlite, kv } = await setup();
     insertEntry(sqlite, { id: "s1", content: "Old text", workspaceId: "" });
     const decision = JSON.stringify({ action: "merge", target_id: "s1", merged_content: "Old text. Incoming fact." });
-    const env: Env = makeTestEnv(undefined, {
+    let env: Env = sqlite.admitEnv(makeTestEnv(undefined, {
       DB: sqlite.db as unknown as D1Database, OAUTH_KV: kv,
       VECTORIZE: makeVectorizeMock({ query: vi.fn().mockResolvedValue({ matches: [{ id: "s1", score: 0.9, metadata: { parentId: "s1" } }] }) }),
       AI: decisionAI(decision),
-    });
+    }));
     await initializeDatabase(env);
+    env = sqlite.admitEnv(env);
 
     const result = await captureEntry("Incoming fact", [], "api", env, ctx, undefined, { workspaceId: "", actorId: "u1" }, undefined, { channel: "rest" });
     expect(result.status).toBe("merged");
@@ -160,12 +162,13 @@ describe("standing invalidation: captureEntry and appendToEntry (lane W's files)
   it("a contradiction that closes a standing row's window touches the cache and drops it", async () => {
     const { sqlite, kv } = await setup();
     insertEntry(sqlite, { id: "old", content: "I live in NYC", workspaceId: "" });
-    const env: Env = makeTestEnv(undefined, {
+    let env: Env = sqlite.admitEnv(makeTestEnv(undefined, {
       DB: sqlite.db as unknown as D1Database, OAUTH_KV: kv,
       VECTORIZE: makeVectorizeMock({ query: vi.fn().mockResolvedValue({ matches: [{ id: "old", score: 0.72, metadata: { parentId: "old" } }] }) }),
       AI: decisionAI(JSON.stringify({ contradicts: true, conflicting_id: "old", reason: "different city" })),
-    });
+    }));
     await initializeDatabase(env);
+    env = sqlite.admitEnv(env);
     standingTouched(env, ctx, DEFAULTS, [""]);
     const before = await cacheAfter(kv, "");
     expect(before?.items.map(i => i.id)).toContain("old");

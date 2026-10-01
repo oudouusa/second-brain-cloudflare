@@ -27,8 +27,9 @@ let workspaceId = "";
 beforeEach(async () => {
   resetDatabaseInit();
   sqlite = makeSqliteD1();
-  env = makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV() });
+  env = sqlite.admitEnv(makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV() }));
   await initializeDatabase(env);
+  env = sqlite.admitEnv(env);
   const roots = await ensureTenantBootstrap(env);
   workspaceId = roots.ownerPersonalWorkspaceId;
   owner = (await resolveIdentityByUserId(env, roots.ownerUserId))!;
@@ -44,7 +45,7 @@ const versionsOf = async (id: string) => ((await sqlite.db.prepare(`SELECT seq, 
 function racingEnv(base: Env, trigger: string, injected: () => void): Env {
   const raw = base.DB as any;
   let fired = false;
-  return { ...base, DB: { ...raw, prepare(sql: string) {
+  return { ...base, WRITE_ADMISSION_TOKEN: base.WRITE_ADMISSION_TOKEN, DB: { ...raw, prepare(sql: string) {
     if (!fired && sql.startsWith(trigger)) { fired = true; injected(); }
     return raw.prepare(sql);
   } } } as unknown as Env;
@@ -69,7 +70,7 @@ describe("D1: revertEntry's snapshot and UPDATE share one guard, not a lighter o
     // snapshot statement is about to be prepared -- before the batch that carries both it and the
     // UPDATE ever runs.
     const racing = racingEnv(env, "INSERT INTO entry_versions", () => {
-      sqlite.db.prepare(`UPDATE entries SET vector_ids = ? WHERE id = 'e1'`).bind(JSON.stringify(["raced-in"])).run();
+      sqlite.db.prepare(`UPDATE entries SET write_marker = '${sqlite.fixtureMarker()}', vector_ids = ? WHERE id = 'e1'`).bind(JSON.stringify(["raced-in"])).run();
     });
 
     const result = await revertEntry(racing, owner, "e1", change, DEFAULTS, undefined, workspaceId);
@@ -107,7 +108,7 @@ describe("D2: releaseHeldAfterEdit's guard pins content, not just tags/workspace
 
     const racing = racingEnv(env, "INSERT INTO entry_versions", () => {
       // A concurrent edit lands between releaseHeldAfterEdit's own read and its batch commit.
-      sqlite.db.prepare(`UPDATE entries SET content = ? WHERE id = 'e2'`).bind("unreviewed replacement text").run();
+      sqlite.db.prepare(`UPDATE entries SET write_marker = '${sqlite.fixtureMarker()}', content = ? WHERE id = 'e2'`).bind("unreviewed replacement text").run();
     });
 
     const result = await revertEntry(racing, owner, "e2", change, DEFAULTS, undefined, workspaceId);
@@ -132,7 +133,7 @@ describe("D4: a vector_ids write is gated on INDEXABLE_SQL, checked at commit ti
     // The row is deprecated (a contradiction landing, say) in the gap between storeEntry's own
     // embed call and its vector_ids UPDATE -- before that UPDATE's own prepare() ever runs.
     const racing = racingEnv(env, "UPDATE entries SET vector_ids = ?", () => {
-      sqlite.db.prepare(`UPDATE entries SET tags = '["status:deprecated"]' WHERE id = 'e3'`).run();
+      sqlite.db.prepare(`UPDATE entries SET write_marker = '${sqlite.fixtureMarker()}', tags = '["status:deprecated"]' WHERE id = 'e3'`).run();
     });
 
     const stored = await storeEntry(racing, "e3", "a note being embedded", [], "api", 2000, DEFAULTS, { workspaceId, actorId: owner.userId });

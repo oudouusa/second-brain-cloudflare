@@ -153,15 +153,15 @@ describe("the restore rule", () => {
     // A lost revert: another version lands on x between undo's read and its batch.
     const db = t.sqlite.db as any;
     const realBatch = db.batch.bind(db);
-    const race = db.prepare(`INSERT INTO entry_versions (entry_id, workspace_id, seq, content, prior_length, tags, actor_id, channel, reason, created_at)
-      SELECT 'x', workspace_id, (SELECT MAX(seq) FROM entry_versions WHERE entry_id = 'x') + 1, content, NULL, tags, '', 'rest', 'update', 9e12 FROM entries WHERE id = 'x'`);
+    const race = db.prepare(`INSERT INTO entry_versions (entry_id, workspace_id, seq, content, prior_length, tags, actor_id, channel, reason, created_at, write_marker)
+      SELECT 'x', workspace_id, (SELECT MAX(seq) FROM entry_versions WHERE entry_id = 'x') + 1, content, NULL, tags, '', 'rest', 'update', 9e12, '${t.sqlite.fixtureMarker()}' FROM entries WHERE id = 'x'`);
     let raced = false;
     db.batch = async (stmts: any[]) => { if (!raced) { raced = true; await race.run(); } return realBatch(stmts); };
     expect((await undo("x")).status).toBe("stale");
     db.batch = realBatch;
     expect((await row("y")).valid_until).toBe(2000);
     // The same revert, landing: x goes back to deprecated and y reopens in the same batch.
-    await t.sqlite.db.prepare(`DELETE FROM entry_versions WHERE entry_id = 'x' AND created_at = 9e12`).run();
+    await t.sqlite.deleteFixtureRows(`DELETE FROM entry_versions WHERE entry_id = 'x' AND created_at = 9e12`);
     const u = await undo("x");
     expect(u).toMatchObject({ status: "reverted", validity: { restored: [{ id: "y" }] } });
     expect(JSON.parse((await row("x")).tags)).toContain("status:deprecated");
@@ -214,30 +214,30 @@ describe("execution counts", () => {
   it("deprecate stays read + batch, plus one audit batch only when something was restored", async () => {
     t = await makeTrashEnv();
     t.seed("x", { created_at: 2000 });
-    t.sqlite.issued.length = 0;
+    t.sqlite.executions.length = 0;
     await applyStatus("x", "deprecated", t.env, change(), DEFAULTS, ws());
-    expect(t.sqlite.issued, t.sqlite.issued.join("\n")).toHaveLength(2);
+    expect(t.sqlite.executions, t.sqlite.executions.join("\n")).toHaveLength(4);
     t.close();
 
     await replaced();
-    t.sqlite.issued.length = 0;
+    t.sqlite.executions.length = 0;
     await deprecate();
-    expect(t.sqlite.issued, t.sqlite.issued.join("\n")).toHaveLength(3);
-    expect(t.sqlite.issued[1]).toBe("BATCH");
+    expect(t.sqlite.executions, t.sqlite.executions.join("\n")).toHaveLength(8); // 原本3回 + validity監査1回 + 台帳の参照・admission・認可・送信記録4回
+    expect(t.sqlite.executions[2]).toBe("BATCH");
   });
 
   it("forget stays read + batch, plus the audit batch only when something was restored", async () => {
     t = await makeTrashEnv();
     t.seed("x", { created_at: 2000 });
-    t.sqlite.issued.length = 0;
+    t.sqlite.executions.length = 0;
     await forget();
-    expect(t.sqlite.issued, t.sqlite.issued.join("\n")).toHaveLength(2);
+    expect(t.sqlite.executions, t.sqlite.executions.join("\n")).toHaveLength(4);
     t.close();
 
     await replaced();
-    t.sqlite.issued.length = 0;
+    t.sqlite.executions.length = 0;
     await forget();
-    expect(t.sqlite.issued, t.sqlite.issued.join("\n")).toHaveLength(3);
+    expect(t.sqlite.executions, t.sqlite.executions.join("\n")).toHaveLength(8);
   });
 
   it("restore from the trash adds only the audit batch when something was re-closed", async () => {
@@ -245,22 +245,22 @@ describe("execution counts", () => {
     t.seed("x", { created_at: 2000 });
     await forget();
     const plain = (await getTrashedEntry(t.env, undefined, "x"))!;
-    t.sqlite.issued.length = 0;
+    t.sqlite.executions.length = 0;
     await restoreEntry(t.env, plain, change(), DEFAULTS);
-    const baseline = t.sqlite.issued.length;
+    const baseline = t.sqlite.executions.length;
     t.close();
 
     await replaced();
     await forget();
     const trashed = (await getTrashedEntry(t.env, undefined, "x"))!;
-    t.sqlite.issued.length = 0;
+    t.sqlite.executions.length = 0;
     await restoreEntry(t.env, trashed, change(), DEFAULTS);
-    expect(t.sqlite.issued.length, t.sqlite.issued.join("\n")).toBe(baseline + 1);
+    expect(t.sqlite.executions.length, t.sqlite.executions.join("\n")).toBe(baseline + 1);
   });
 });
 
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { Client } from "@modelcontextprotocol/client";
+import { InMemoryTransport } from "@modelcontextprotocol/client";
 import worker from "../../src/index";
 import { buildMcpServer } from "../../src/mcp/server";
 import { req } from "../helpers/make-request";

@@ -14,8 +14,10 @@ export async function readProjectParam(
   identity: Identity,
   url: URL,
   opts?: { layer?: "personal" | "company"; teamId?: string },
+  value: unknown = url.searchParams.get("project"),
 ): Promise<ProjectRow[] | undefined | Response> {
-  const raw = url.searchParams.get("project")?.trim();
+  if (value != null && typeof value !== "string") return json({ ok: false, error: "project must be a string" }, 400);
+  const raw = typeof value === "string" ? value.trim() : undefined;
   if (!raw) return undefined;
   const resolved = await resolveProjectRead(env, identity, raw, opts);
   if (resolved.ok) return resolved.rows;

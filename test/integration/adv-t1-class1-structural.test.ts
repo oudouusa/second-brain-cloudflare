@@ -11,8 +11,8 @@
  * the JS mock's approximation of it.
  */
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { Client } from "@modelcontextprotocol/client";
+import { InMemoryTransport } from "@modelcontextprotocol/client";
 import { makeSqliteD1, type SqliteD1 } from "../helpers/sqlite-d1";
 import { makeTestEnv, makeMemoryKV } from "../helpers/make-env";
 import { req } from "../helpers/make-request";
@@ -34,7 +34,7 @@ let companyWs = "";
 beforeEach(async () => {
   resetDatabaseInit();
   sqlite = makeSqliteD1();
-  env = makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV() });
+  env = sqlite.admitEnv(makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV() }));
   await initializeDatabase(env);
   const roots = await ensureTenantBootstrap(env);
   companyWs = roots.companyWorkspaceId;
@@ -69,7 +69,7 @@ function raceUnshare(id: string, moveTo: string): Env {
   let moved = false;
   const READ = /^SELECT id, workspace_id, actor_id(?:, [^]+?)? FROM entries WHERE id = \? AND/;
   return {
-    ...env,
+    ...env, WRITE_ADMISSION_TOKEN: env.WRITE_ADMISSION_TOKEN,
     DB: {
       ...raw,
       prepare(sql: string) {

@@ -4,8 +4,8 @@
  * `update` tool, not hand-seeded, so the version row is exactly what a real edit leaves behind.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { Client } from "@modelcontextprotocol/client";
+import { InMemoryTransport } from "@modelcontextprotocol/client";
 import { buildMcpServer } from "../../src/mcp/server";
 import worker from "../../src/index";
 import { req } from "../helpers/make-request";
@@ -38,14 +38,34 @@ async function call(name: string, args: Record<string, unknown> = {}, user: Iden
 beforeEach(async () => {
   resetDatabaseInit();
   sqlite = makeSqliteD1();
-  env = makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV() });
+  env = sqlite.admitEnv(makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV() }));
   await initializeDatabase(env);
+  env = sqlite.admitEnv(env);
   await ensureTenantBootstrap(env);
   identity = (await resolveIdentityFromToken("test-token", env))!;
 });
 afterEach(() => sqlite.close());
 
 describe("get(id, version)", () => {
+  it("履歴本文はURLパラメータ付きGETで取得できない", async () => {
+    const response = await worker.fetch(req("GET", "/entry/version?id=private-id&seq=1"), env, ctx);
+    expect(response.status).toBe(405);
+    expect(response.headers.get("Allow")).toBe("POST");
+    expect(await response.text()).not.toContain("private-id");
+  });
+
+  it.each([null, [], { id: "" }, { id: "e", seq: "1" }, { id: "e", seq: 0 }, { id: "e", seq: 1.5 }])("不正な履歴JSONを拒否する: %j", async body => {
+    const response = await worker.fetch(req("POST", "/entry/version", { body }), env, ctx);
+    expect(response.status).toBe(400);
+  });
+
+  it("履歴読取にも認証と8KB本文上限を適用する", async () => {
+    const denied = await worker.fetch(req("POST", "/entry/version", { token: null, body: { id: "e", seq: 1 } }), env, ctx);
+    expect(denied.status).toBe(401);
+    const oversized = await worker.fetch(req("POST", "/entry/version", { body: { id: "x".repeat(8192), seq: 1 } }), env, ctx);
+    expect(oversized.status).toBe(413);
+  });
+
   it("reads the text before the change, with reason, actor and via", async () => {
     sqlite.seed({ id: "e1", content: "first text", createdAt: 1000 });
     await call("update", { id: "e1", content: "second text" });
@@ -88,7 +108,7 @@ describe("get(id, version)", () => {
     await call("update", { id: "e5", content: "changed text" });
 
     const mcpText = await call("get", { id: "e5", version: 1 });
-    const res = await worker.fetch(req("GET", "/entry/version?id=e5&seq=1"), env, ctx);
+    const res = await worker.fetch(req("POST", "/entry/version?id=e5&seq=1"), env, ctx);
     const rest = await res.json() as any;
     expect(mcpText).toContain(rest.content);
     expect(rest.content).toBe("shared text");

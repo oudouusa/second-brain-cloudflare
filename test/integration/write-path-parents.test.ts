@@ -11,12 +11,13 @@ import { checkDuplicateAndContradiction } from "../../src/capture/duplicate";
 import { deleteStaleVectors, storeEntry } from "../../src/capture/store";
 import { neighborsFromVectorQuery } from "../../src/graph/traverse";
 import { nearestParents } from "../../src/vectorize/parents";
+import { embeddingMetadata } from "../../src/embedding/profile";
 import { DEFAULTS } from "../../src/config";
 import { VECTORIZE_UPSERT_BATCH, WRITE_PATH_TOPK } from "../../src/constants";
 import { deleteEntryVectors } from "../../src/vectorize/batch";
 import type { Env } from "../../src/env";
 
-const DIMS = 256;
+const DIMS = 128;
 
 /** A hashed bag-of-words embedding: near-identical text scores high, a start/middle/end sample of it scores lower. */
 function bow(text: string): number[] {
@@ -37,20 +38,18 @@ const longNote = (tag: string) =>
 
 function makeEnv() {
   const d1 = makeSqliteD1();
-  // Validity columns are runtime ALTERs (src/db/init.ts), not in schema.sql; the duplicate check reads valid_until.
-  d1.db.prepare(`ALTER TABLE entries ADD COLUMN valid_from INTEGER`).run();
-  d1.db.prepare(`ALTER TABLE entries ADD COLUMN valid_until INTEGER`).run();
+  // 4.0の参照schemaにはvalidity列が含まれる。
   const vectorize = new ExactVectorize({ dimensions: DIMS });
   const embeds: string[] = [];
   const env = {
-    DB: d1.db, OAUTH_KV: makeMemoryKV(), VECTORIZE: vectorize as unknown as VectorizeIndex,
+    DB: d1.db, OAUTH_KV: makeMemoryKV(), VECTORIZE: vectorize as unknown as Vectorize,
     // Codex review, T-0102 F3: storeEntry now always batchEmbeds (embedMany, one AI call for the
     // whole chunk batch), so the mock must return one vector per input text like the real API,
     // not just the first.
-    AI: { run: vi.fn(async (_m: string, input: { text: string[] }) => { embeds.push(...input.text); return { data: input.text.map(bow) }; }) },
+    AI: { run: vi.fn(async (_m: string, input: { text: string[] }) => { embeds.push(...input.text); return { data: input.text.map(text => [...bow(text), ...new Array(640).fill(0)]) }; }) },
     VECTORIZE_GRACE_MS: "0",
   } as unknown as Env;
-  return { env, d1, vectorize, embeds };
+  return { env: d1.admitEnv(env), d1, vectorize, embeds };
 }
 
 describe("nearestParents", () => {
@@ -68,8 +67,8 @@ describe("neighbor queries over long notes", () => {
   it("asks a wider window and still returns five distinct notes when one long note fills the nearest slots", async () => {
     const query = vi.fn(async () => ({
       matches: [
-        ...Array.from({ length: 7 }, (_, i) => ({ id: `long-chunk-${i}`, score: 0.99 - i * 0.01, metadata: { parentId: "long" } })),
-        ...["n1", "n2", "n3", "n4", "n5", "n6"].map((id, i) => ({ id, score: 0.8 - i * 0.05 })),
+        ...Array.from({ length: 7 }, (_, i) => ({ id: `long-chunk-${i}`, score: 0.99 - i * 0.01, metadata: { ...embeddingMetadata(), parentId: "long" } })),
+        ...["n1", "n2", "n3", "n4", "n5", "n6"].map((id, i) => ({ id, score: 0.8 - i * 0.05, metadata: embeddingMetadata() })),
       ],
     }));
     const env = { VECTORIZE: { query } } as unknown as Env;
@@ -95,23 +94,21 @@ describe("duplicate check on long notes", () => {
 });
 
 describe("Vectorize call sizes", () => {
-  it("upserts a note of more than a thousand chunks in calls of at most VECTORIZE_UPSERT_BATCH", async () => {
+  it("forkの入力上限を超える記憶はVectorizeへ送る前に拒否する", async () => {
     const { env, d1, vectorize } = makeEnv();
-    const sizes: number[] = [];
-    const upsert = vectorize.upsert.bind(vectorize);
-    vectorize.upsert = (async (vs: unknown[]) => { sizes.push(vs.length); return upsert(vs as never); }) as never;
-    const content = "x".repeat(1_700_000);
-    d1.seed({ id: "huge", content, createdAt: 1 });
-    const stored = await storeEntry(env, "huge", content, [], "api", 1);
-    expect(stored.vectorIds.length).toBeGreaterThan(VECTORIZE_UPSERT_BATCH);
-    expect(Math.max(...sizes)).toBeLessThanOrEqual(VECTORIZE_UPSERT_BATCH);
-    expect(sizes.reduce((a, b) => a + b, 0)).toBe(stored.vectorIds.length);
-  }, 120_000);
+    try {
+      const upsert = vi.spyOn(vectorize, "upsert");
+      const content = "x".repeat(1_700_000);
+      await expect(storeEntry(env, "huge", content, [], "api", 1)).rejects.toThrow("limited");
+      expect(upsert).not.toHaveBeenCalled();
+    } finally { d1.close(); }
+  });
 
   it("deletes vectors in calls of at most VECTORIZE_UPSERT_BATCH, and never deletes an id that is kept", async () => {
     const calls: string[][] = [];
     // Every vector names its entry in metadata.parentId; deleteEntryVectors checks it (T-0089.1.1).
-    const env = { VECTORIZE: {
+    const { env: baseEnv, d1 } = makeEnv();
+    const env = { ...baseEnv, VECTORIZE: {
       deleteByIds: vi.fn(async (ids: string[]) => { calls.push(ids); }),
       getByIds: vi.fn(async (ids: string[]) => ids.map(id => ({ id, values: [], metadata: { parentId: "e" } }))),
     } } as unknown as Env;
@@ -124,5 +121,6 @@ describe("Vectorize call sizes", () => {
     await deleteStaleVectors(env, "e", ids, ids.slice(0, 1_200));
     expect(calls.flat()).toEqual(ids.slice(1_200));
     expect(Math.max(...calls.map(c => c.length))).toBeLessThanOrEqual(VECTORIZE_UPSERT_BATCH);
+    d1.close();
   });
 });

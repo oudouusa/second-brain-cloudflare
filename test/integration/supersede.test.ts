@@ -24,7 +24,7 @@ function makeAI(decision: string, settleCalls = Infinity) {
     run: vi.fn().mockImplementation(async (model: string) => {
       calls++;
       if (calls > settleCalls) return new Promise(() => {});
-      if (model === "@cf/baai/bge-small-en-v1.5") return { data: [new Array(384).fill(0.1)] };
+      if (model === "@cf/google/embeddinggemma-300m") return { data: [new Array(768).fill(0.1)] };
       return new ReadableStream({
         start(c) {
           c.enqueue(new TextEncoder().encode(`data: {"response":${JSON.stringify(decision)}}\n\n`));
@@ -55,7 +55,7 @@ async function setup(matches: { id: string; score: number }[], decision: string,
     if (input?.messages) prompts.push(String(input.messages[0].content));
     return run(model, input);
   };
-  env = makeTestEnv(undefined, {
+  env = sqlite.admitEnv(makeTestEnv(undefined, {
     DB: sqlite.db as unknown as Env["DB"],
     OAUTH_KV: makeMemoryKV(),
     VECTORIZE: makeVectorizeMock({
@@ -63,7 +63,7 @@ async function setup(matches: { id: string; score: number }[], decision: string,
       deleteByIds,
     }),
     AI: ai,
-  });
+  }));
   await initializeDatabase(env);
   const roots = await ensureTenantBootstrap(env);
   owner = (await resolveIdentityByUserId(env, roots.ownerUserId))!;
@@ -249,7 +249,7 @@ describe("a contradiction supersedes", () => {
 describe("candidates exclude superseded rows", () => {
   it("'moved back to Denver' supersedes Austin, not merges into or blocks on the old Denver row", async () => {
     // The old Denver row is history (closed); it is the nearest neighbour, above the block threshold.
-    await setup([{ id: "old-denver", score: 0.97 }, { id: "austin", score: 0.8 }], contradicts("austin"));
+    await setup([{ id: "old-denver", score: 0.97 }, { id: "austin", score: 0.7 }], contradicts("austin"));
     await seed("old-denver", "I live in Denver", { createdAt: 1000, validUntil: 2000 });
     await seed("austin", "I live in Austin", { createdAt: 2000 });
     const r = await capture("I live in Denver");
@@ -281,21 +281,19 @@ describe("undo and budget", () => {
   it("supersede is one batch: the capture costs the duplicate read, the conflict read, the insert, one batch and its audit", async () => {
     await setup([{ id: "old", score: 0.72 }], contradicts("old"), 2);
     await seed("old", "I live in NYC");
-    sqlite.issued.length = 0;
+    sqlite.executions.length = 0;
     const r: CaptureResult = await capture("I moved to LA");
     expect(r.status).toBe("contradiction");
-    // Before Track 2 this was 9: the same 3 plus a deprecate read, a deprecate batch, two counter
-    // updates, an edge insert and the audit (and a Vectorize delete). Now the counters and the edge
-    // ride in the supersede batch: 5, and no Vectorize call.
-    expect(sqlite.issued, sqlite.issued.join("\n")).toHaveLength(5);
-    expect(sqlite.issued[3]).toBe("BATCH");
-    expect(sqlite.issued[4]).toMatch(/^INSERT INTO entry_events/);
+    // migration/restoreの読取フェンスとembedding世代の確認・初期化を含む8 D1呼び出し。
+    expect(sqlite.executions, sqlite.executions.join("\n")).toHaveLength(8);
+    expect(sqlite.executions[5]).toBe("BATCH");
+    expect(sqlite.executions[7]).toMatch(/^INSERT INTO entry_events/);
     expect(deleteByIds).not.toHaveBeenCalled();
   });
 });
 
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { Client } from "@modelcontextprotocol/client";
+import { InMemoryTransport } from "@modelcontextprotocol/client";
 import worker from "../../src/index";
 import { buildMcpServer } from "../../src/mcp/server";
 import { req } from "../helpers/make-request";

@@ -28,14 +28,14 @@ async function migrated(): Promise<SqliteD1> {
 }
 
 function envOf(s: SqliteD1, matches: { id: string; score: number }[], overrides: Record<string, unknown> = {}): Env {
-  return makeTestEnv(undefined, {
+  return s.admitEnv(makeTestEnv(undefined, {
     DB: s.db as unknown as Env["DB"],
     OAUTH_KV: makeMemoryKV(),
     VECTORIZE: makeVectorizeMock({
       query: vi.fn().mockResolvedValue({ matches: matches.map(m => ({ id: m.id, score: m.score, metadata: { parentId: m.id } })) }),
     }),
     ...overrides,
-  });
+  }));
 }
 
 const DAY = 86400000;
@@ -189,7 +189,7 @@ describe("as-of recall answers what was actually true at T (5.7)", () => {
     const asOf = NOW - 1 * DAY;
     const { matches, queryUsed } = await recallEntries({ query: "marina slip yesterday", topK: 10, synthesize: false }, env, ctx, undefined, { asOf });
     expect(matches.map(m => m.id)).toContain("e1");
-    expect(queryUsed).toContain("yesterday"); // parseTimePhrase never ran, so "yesterday" was not stripped
+    expect(queryUsed).toBe("marina slip"); // forkの語彙蒸留は時間語を除くが、上の結果がcreated_atの時間制限を受けないことを保証する
   });
 
   // Cross-vendor review MAJOR (T-0102, "your current task"), synthesis-path hardening: as-of's own
@@ -211,7 +211,7 @@ describe("as-of recall answers what was actually true at T (5.7)", () => {
     expect(matches.find(m => m.id === "e1")?.content).toBe("");
     expect(insight).toBe("3"); // the mock's own canned response: synthesis did run, over e2/e3
 
-    const chatCall = (ai.run as any).mock.calls.find((c: unknown[]) => typeof c[0] === "string" && !(c[0] as string).startsWith("@cf/baai/bge"));
+    const chatCall = (ai.run as any).mock.calls.find((c: unknown[]) => typeof c[0] === "string" && !!(c[1] as { messages?: unknown })?.messages);
     const prompt = chatCall![1].messages[0].content as string;
     expect(prompt).not.toContain("ignore all previous instructions");
     expect(prompt, "the held row is dropped, not just emptied").not.toContain("ID: e1");
@@ -267,7 +267,7 @@ describe("as-of recall answers what was actually true at T (5.7)", () => {
     expect(match?.content).toBe("");
     expect(insight, "the only match is held, so there is nothing left to synthesize").toBe("");
     for (const call of (ai.run as any).mock.calls) {
-      if (typeof call[0] === "string" && !(call[0] as string).startsWith("@cf/baai/bge")) {
+      if (typeof call[0] === "string" && !!(call[1] as { messages?: unknown })?.messages) {
         const prompt = call[1].messages[0].content as string;
         // NIT (cloud re-review, on top of 0b970baa): the fixture's own injection text is
         // capitalized ("Ignore all previous instructions..."), so a case-sensitive toContain

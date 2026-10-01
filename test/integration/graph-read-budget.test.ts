@@ -31,7 +31,6 @@
  * drift into testing a query the Worker does not run.
  */
 import { describe, it, expect, afterEach } from "vitest";
-import { DatabaseSync } from "node:sqlite";
 import { buildGraph, GRAPH_VIEW_MAX_NODES } from "../../src/graph/traverse";
 import { initializeDatabase, resetDatabaseInit } from "../../src/db/init";
 import { makeSqliteD1, type SqliteD1 } from "../helpers/sqlite-d1";
@@ -48,19 +47,18 @@ afterEach(() => { sqlite?.close(); sqlite = null; });
  * `n` edges over `n / 4` nodes with weights spread across 0..1, inserted by one recursive
  * CTE — a per-row INSERT from JS is the slow part of a 20,000-edge fixture, not SQLite.
  */
-function seedGraph(db: SqliteD1, n: number, withNodes = true): void {
-  // valid_until is one of the columns src/db/init.ts adds by ALTER at runtime
-  // rather than in schema.sql; buildGraph's node hydration selects it.
-  db.db.prepare(`ALTER TABLE entries ADD COLUMN valid_until INTEGER`).run();
+async function seedGraph(db: SqliteD1, n: number, withNodes = true): Promise<void> {
   const nodes = Math.max(2, Math.floor(n / 4));
-  db.db.prepare(
+  // 端点保護triggerを満たすnodeを先に作り、書込み完了を待つ。
+  for (let i = 0; i < nodes; i++) db.seed({ id: `n${i}`, content: `Memory ${i}`, createdAt: 1000 + i });
+  await db.db.prepare(
     `WITH RECURSIVE seq(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM seq WHERE i + 1 < ${n})
-     INSERT INTO edges (id, source_id, target_id, type, weight, provenance, metadata, created_at, updated_at)
+     INSERT INTO edges (id, source_id, target_id, type, weight, provenance, metadata, created_at, updated_at, write_marker)
      SELECT 'e' || i, 'n' || (i / 4), 'n' || (((i / 4) + ((i % 4) + 1) * 997) % ${nodes}),
-            'relates_to', (i % 1000) / 1000.0, 'inferred', '{}', 0, 0
+            'relates_to', (i % 1000) / 1000.0, 'inferred', '{}', 0, 0, ?
      FROM seq`
-  ).run();
-  if (withNodes) for (let i = 0; i < nodes; i++) db.seed({ id: `n${i}`, content: `Memory ${i}`, createdAt: 1000 + i });
+  ).bind(db.fixtureMarker()).run();
+  expect(await db.db.prepare("SELECT COUNT(*) AS n FROM edges").first()).toEqual({ n });
 }
 
 /** env.DB over real SQLite, recording every statement so the plan can be taken later. */
@@ -83,7 +81,7 @@ async function planOf(db: SqliteD1, sql: string): Promise<string> {
 describe("GET /graph read budget", () => {
   it("always bounds the strongest-edges query with a LIMIT, even with no caller limit", async () => {
     sqlite = makeSqliteD1();
-    seedGraph(sqlite, 400);
+    await seedGraph(sqlite, 400);
     const { env, statements } = recordingEnv(sqlite);
 
     await buildGraph({}, env);
@@ -93,11 +91,12 @@ describe("GET /graph read budget", () => {
     const strongest = statements.filter(s => STRONGEST_EDGES.test(s));
     expect(strongest).toHaveLength(1);
     expect(strongest[0]).toMatch(/LIMIT \d+$/);
+    expect(statements.filter(s => s.includes("FROM edges WHERE source_id IN"))).toHaveLength(0);
   });
 
   it("plans that query as an index scan with no whole-table sort", async () => {
     sqlite = makeSqliteD1();
-    seedGraph(sqlite, 2_000);
+    await seedGraph(sqlite, 2_000);
     const { env, statements } = recordingEnv(sqlite);
 
     await buildGraph({}, env);
@@ -109,13 +108,13 @@ describe("GET /graph read budget", () => {
 
   it("keeps the same bounded plan as the edge table grows", async () => {
     // The failure mode is a cost that scales with the brain, so the property under test is
-    // that it does not: same plan, same LIMIT, 50x the edges. The plan is a property of the
-    // edges table and its indexes, so the node rows (a slow per-row insert) are left out.
+    // that it does not: same plan, same LIMIT, 50x the edges.
+    // 端点nodeも作成し、空のedge表で実行計画だけ通る偽陽性を防ぐ。
     const plans: string[] = [];
     for (const edges of [500, 25_000]) {
       const db = makeSqliteD1();
       try {
-        seedGraph(db, edges, false);
+        await seedGraph(db, edges);
         const { env, statements } = recordingEnv(db);
         await buildGraph({}, env);
         plans.push(await planOf(db, statements.find(s => STRONGEST_EDGES.test(s))!));
@@ -125,11 +124,11 @@ describe("GET /graph read budget", () => {
     }
     expect(plans[0]).toBe(plans[1]);
     expect(plans[1]).not.toContain("TEMP B-TREE");
-  });
+  }, 15_000);
 
   it("caps the view at GRAPH_VIEW_MAX_NODES however large a limit is asked for", async () => {
     sqlite = makeSqliteD1();
-    seedGraph(sqlite, 400);
+    await seedGraph(sqlite, 400);
     const { env, statements } = recordingEnv(sqlite);
 
     await buildGraph({ limit: GRAPH_VIEW_MAX_NODES * 100 }, env);
@@ -142,7 +141,6 @@ describe("GET /graph read budget", () => {
     // The cheap alternative to the index was dropping ORDER BY entirely. It is not what
     // shipped, so the ordering it would have cost has to stay observable.
     sqlite = makeSqliteD1();
-    await sqlite.db.prepare(`ALTER TABLE entries ADD COLUMN valid_until INTEGER`).run();
     for (let i = 0; i < 6; i++) sqlite.seed({ id: `n${i}`, content: `Memory ${i}`, createdAt: 1000 + i });
     const weights: [string, string, number][] = [["n0", "n1", 0.95], ["n2", "n3", 0.10], ["n4", "n5", 0.60]];
     for (const [source, target, weight] of weights) {
@@ -160,10 +158,10 @@ describe("GET /graph read budget", () => {
 });
 
 describe("edges schema drift", () => {
-  // db/schema.sql runs on `npm run db:migrate`; src/db/init.ts runs on every cold isolate
-  // and is the only thing that reaches a brain migrated before an index existed. A brain
-  // is served by whichever ran last, so an index present in one and missing from the other
-  // means the read budget above holds on some brains and not others.
+  // db/schema.sql is the local/empty-DB reference; src/db/init.ts runs on every cold
+  // isolate and is the only production path that reaches a brain migrated before an
+  // index existed. An index present in one and missing from the other means the read
+  // budget above holds on some brains and not others.
   afterEach(resetDatabaseInit);
 
   // Autoindexes are excluded — they come from the PRIMARY KEY and UNIQUE constraints, so
@@ -175,29 +173,17 @@ describe("edges schema drift", () => {
     const { results } = await sqlite.db.prepare(EDGE_INDEXES).all();
     const fromSchemaFile = (results as { name: string }[]).map(r => r.name);
 
-    const raw = new DatabaseSync(":memory:");
+    const runtime = makeSqliteD1({ schema: false });
     try {
       resetDatabaseInit();
-      const DB = {
-        exec: async (sql: string) => { raw.exec(sql); },
-        prepare: (sql: string) => ({
-          all: async () => ({ results: raw.prepare(sql).all() }),
-          run: async () => {
-            raw.prepare(sql).run();
-            return { meta: { changes: 0 } };
-          },
-        }),
-        // v2.2 ownership rule: entries_fts and its triggers are created in
-        // one batch (src/db/init.ts).
-        batch: async (stmts: { run(): Promise<unknown> }[]) => Promise.all(stmts.map(s => s.run())),
-      } as unknown as D1Database;
-      await initializeDatabase(makeTestEnv(undefined, { DB }));
-      const fromInit = (raw.prepare(EDGE_INDEXES).all() as { name: string }[]).map(r => r.name);
+      await initializeDatabase(makeTestEnv(undefined, { DB: runtime.db as unknown as D1Database }));
+      const { results: runtimeResults } = await runtime.db.prepare(EDGE_INDEXES).all();
+      const fromInit = (runtimeResults as { name: string }[]).map(r => r.name);
 
       expect(fromInit).toEqual(fromSchemaFile);
       expect(fromInit).toContain("idx_edges_weight");
     } finally {
-      raw.close();
+      runtime.close();
     }
   });
 });

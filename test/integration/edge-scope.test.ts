@@ -119,11 +119,17 @@ describe("structural: every edge insert checks endpoint readability in the same 
   });
 
   it("finds the reviewed edge-insert sites", () => {
-    expect(sites.map((s) => s.file).sort()).toEqual(["entries/import.ts", "graph/edges.ts", "graph/edges.ts", "memory/trash.ts", "memory/validity.ts", "memory/validity.ts"]);
+    expect(sites.map((s) => s.file).sort()).toEqual(["entries/import.ts", "graph/edges.ts", "graph/edges.ts", "graph/edges.ts", "graph/edges.ts", "memory/trash.ts", "memory/validity.ts", "memory/validity.ts"]);
   });
 
   it("each one carries the shared readability guard", () => {
-    for (const s of sites) expect(s.sql, s.file).toMatch(/\$\{edgeEndpointsReadableSql\(/);
+    for (const s of sites) {
+      expect(s.sql, s.file).toMatch(/edgeEndpointsReadableSql\(/);
+      if (s.file === "entries/import.ts") {
+        // 全体restoreの専用leaseのみ、保存済みの共有関係をそのまま復元する。
+        expect(s.sql).toContain('restoreLeaseOwner ? "1" : edgeEndpointsReadableSql("?", "?", "?")');
+      } else expect(s.sql, s.file).toMatch(/\$\{edgeEndpointsReadableSql\(/);
+    }
   });
 
   it("automatic edge writers go through sameWorkspaceEdge; only the explicit link surfaces pass a reader's workspaces", () => {

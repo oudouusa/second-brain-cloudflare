@@ -1,0 +1,18 @@
+[
+  {
+    "id": "migration-deferred-ja",
+    "query": "Cedarの移行は完了していますか。日本語で回答してください。",
+    "memories": "[1] 2026-09-01: Cedar chose passkeys for production.\n[2] 2026-09-03: Cedar deferred migration until September 12. Existing login remains active until validation passes.",
+    "source_ids": [1, 2],
+    "required_citations": [2],
+    "review": "移行完了とは断定しない。9月12日まで延期、検証合格まで既存ログインを維持と説明する。[1]の引用は任意。"
+  },
+  {
+    "id": "unknown-release-ja",
+    "query": "Mapleの本番公開日はいつですか。日本語で回答してください。",
+    "memories": "[1] Maple completed a local prototype on September 4.\n[2] Maple has not decided a production launch date; approval is still pending.",
+    "source_ids": [1, 2],
+    "required_citations": [2],
+    "review": "本番公開日は未定と回答する。9月4日を公開日と取り違えず、具体的な公開日を捏造しない。[1]の引用は任意。"
+  }
+]

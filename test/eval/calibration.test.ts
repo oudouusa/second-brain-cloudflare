@@ -65,7 +65,8 @@ import { EVAL_FULL } from "./full";
 // Each gate evaluation resamples about 1,600 queries per metric and category; a loaded machine needs the room.
 vi.setConfig({ testTimeout: 30_000 });
 
-const MODEL = DEFAULTS.EMBEDDING_MODEL;
+// 上流同梱replayはBGE専用。Gemmaの品質証拠へ転用しない。
+const MODEL = "@cf/baai/bge-small-en-v1.5";
 const COMMITTED = resolve(CORE_DATA_DIR, `replay.${MODEL.split("/").pop()}.jsonl.gz`);
 // read lists only files that exist (the committed layer plus any local cache), so this is what the runs below replay from.
 const cache = replayPaths(MODEL, "core-1k").read;
@@ -82,7 +83,7 @@ const rule = (r: ReturnType<typeof evaluateGate>, name: string) => r.rules.find(
 const SABOTAGE = "sabotage";
 
 // Opt-in (EVAL_FULL=1, npm run test:eval:full): it replays the whole golden set for several variants, about 10 minutes.
-describe.skipIf(!EVAL_FULL)("gate calibration on core-1k (offline)", () => {
+describe.skipIf(!EVAL_FULL || String(DEFAULTS.EMBEDDING_MODEL) !== MODEL)("gate calibration on core-1k (offline)", () => {
   const reports: Record<string, VariantReport> = {};
 
   registerVariant({ name: SABOTAGE, description: "Calibration only: KEYWORD_CANDIDATE_LIMIT 1 and MMR_LAMBDA 0.", config: { KEYWORD_CANDIDATE_LIMIT: 1, MMR_LAMBDA: 0, RERANK_MODE: "off" } });

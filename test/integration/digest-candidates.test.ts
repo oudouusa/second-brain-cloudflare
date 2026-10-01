@@ -3,18 +3,18 @@
  *
  * Its correctness IS the SQL: which tags come back decides which tags get compressed, and
  * a nightly run only compresses COMPRESSION_MAX_TAGS_PER_RUN of them. `test/helpers/d1-mock.ts`
- * cannot evaluate SQL — its digest-candidate branch calls isTopicTag(), the TypeScript half
+ * cannot evaluate SQL — its digest-candidate branch calls isCompressionTag(), the TypeScript half
  * of the rule — so a WHERE clause that drifted from that predicate would pass every
  * mock-based test in the suite. This runs the clause itself against real SQLite.
  *
  * The WHERE fragments are imported rather than retyped, so this exercises the same strings
  * src/compression/nightly.ts and src/routes/admin.ts embed.
  */
-import { describe, it, expect, afterEach } from "vitest";
+import { describe, it, expect, afterEach, vi } from "vitest";
 import {
   compressionEligibilitySql,
-  isTopicTag,
-  isTopicTagSql,
+  isCompressionTag,
+  isCompressionTagSql,
   COMPRESSION_MIN_AGE_MS,
 } from "../../src/compression/eligibility";
 import { makeSqliteD1, type SqliteD1 } from "../helpers/sqlite-d1";
@@ -23,6 +23,7 @@ import { tagLikePattern, TAG_LIKE_ESCAPE } from "../../src/memory/tag-sql";
 import { CAPSULE_SLOT_TAG_PREFIX, CAPSULE_TAG_PREFIX } from "../../src/tags/system";
 import { compressTag } from "../../src/compression/digest";
 import { initializeDatabase, resetDatabaseInit } from "../../src/db/init";
+import { runNightlyCompression } from "../../src/compression/nightly";
 
 let sqlite: SqliteD1 | null = null;
 
@@ -37,7 +38,7 @@ async function candidateTags(seed: (s: SqliteD1) => void): Promise<string[]> {
   const { results } = await sqlite.db.prepare(`
     SELECT value as tag, COUNT(*) as count
     FROM entries, json_each(entries.tags)
-    WHERE ${isTopicTagSql()}
+    WHERE ${isCompressionTagSql()}
       AND entries.tags NOT LIKE '%"rolled-up"%'
       AND entries.tags NOT LIKE '%"synthesized"%'
       AND entries.tags NOT LIKE '%"auto-pattern"%'
@@ -51,6 +52,17 @@ async function candidateTags(seed: (s: SqliteD1) => void): Promise<string[]> {
 }
 
 describe("digest-candidate query", () => {
+  it("案件をまたぐ汎用タグはSQL候補から外し、具体的な案件タグだけを残す", async () => {
+    const tags = await candidateTags(s => {
+      for (const project of ["project-atlas", "project-cedar"]) {
+        for (let i = 0; i < 11; i++) s.seed({
+          id: `${project}-${i}`, content: `${project}の記録`, createdAt: 1,
+          tags: [project, "WORK", "task", "idea", "context", "personal", "Codex-Response"],
+        });
+      }
+    });
+    expect(tags.sort()).toEqual(["project-atlas", "project-cedar"]);
+  });
   it("excludes the tags the system writes, and keeps the ones the user does", async () => {
     const tags = await candidateTags(s => {
       // Eleven entries carrying a real topic plus every reserved namespace, exactly as an
@@ -59,7 +71,7 @@ describe("digest-candidate query", () => {
         s.seed({
           id: `e-${i}`, content: `memory ${i}`, createdAt: 1,
           tags: [
-            "work",
+            "project-atlas",
             "kind:semantic",
             "status:canonical",
             "volatility:state",
@@ -71,14 +83,14 @@ describe("digest-candidate query", () => {
       }
     });
 
-    expect(tags).toEqual(["work"]);
+    expect(tags).toEqual(["project-atlas"]);
   });
 
   it("does not let a bulk-written system tag outrank a real topic", async () => {
     const tags = await candidateTags(s => {
       // Distinct counts, so ORDER BY fully determines the order — SQLite does not promise
       // anything about ties, and the assertion below is about position.
-      for (let i = 0; i < 12; i++) s.seed({ id: `a-${i}`, content: "m", createdAt: 1, tags: ["work"] });
+      for (let i = 0; i < 12; i++) s.seed({ id: `a-${i}`, content: "m", createdAt: 1, tags: ["project-atlas"] });
       for (let i = 0; i < 11; i++) s.seed({ id: `b-${i}`, content: "m", createdAt: 1, tags: ["family"] });
       // The staleness pass tags in bulk, so its tags carry the higher count.
       for (let i = 0; i < 25; i++) {
@@ -88,7 +100,7 @@ describe("digest-candidate query", () => {
 
     // Ordered by count DESC, so a failure here is the system tags sitting at the head of
     // the list and taking the slots real topics would have had.
-    expect(tags).toEqual(["work", "family"]);
+    expect(tags).toEqual(["project-atlas", "family"]);
   });
 
   // A mixed-case reserved tag must never become a candidate. If one does, compressTag
@@ -116,7 +128,7 @@ describe("digest-candidate query", () => {
     });
 
     expect(tags).toEqual(["holiday-plans"]);
-    for (const tag of reserved) expect(isTopicTag(tag)).toBe(false);
+    for (const tag of reserved) expect(isCompressionTag(tag)).toBe(false);
   });
 
   it("reserves the namespace rather than the bare word", async () => {
@@ -132,6 +144,39 @@ describe("digest-candidate query", () => {
     });
 
     expect(tags.sort()).toEqual(["capsule", "capsule-slot", "kind", "stale", "status", "volatility"]);
+  });
+});
+
+describe("汎用タグによる案件横断の要約を防ぐ", () => {
+  it("夜間処理と直接実行の双方でAI呼出と原記憶変更を行わない", async () => {
+    resetDatabaseInit();
+    sqlite = makeSqliteD1();
+    const env = sqlite.admitEnv(makeTestEnv(undefined, {
+      DB: sqlite.db as unknown as D1Database,
+      OAUTH_KV: makeMemoryKV(),
+    }));
+    await initializeDatabase(env);
+    // 案件ごとは6件で要約対象外。汎用タグを合算すると12件となる再現条件。
+    for (const project of ["project-atlas", "project-cedar"]) {
+      for (let i = 0; i < 6; i++) sqlite.seed({
+        id: `${project}-${i}`, content: `${project}の固有の決定${i}`, createdAt: 1,
+        tags: [project, "work", "task", "idea", "context", "personal", "codex-response"],
+      });
+    }
+    const before = sqlite.rows();
+    const ai = vi.spyOn(env.AI, "run");
+    const pending: Promise<unknown>[] = [];
+    const ctx = {
+      waitUntil: (p: Promise<unknown>): void => { pending.push(p); },
+      passThroughOnException: vi.fn(),
+    } as unknown as ExecutionContext;
+    await runNightlyCompression(env, ctx);
+    for (const tag of ["work", "TASK", "idea", "context", "personal", "Codex-Response"]) {
+      expect(await compressTag(tag, env, ctx)).toEqual({ synthesizedId: null, entriesUsed: 0, text: "" });
+    }
+    await Promise.all(pending);
+    expect(ai).not.toHaveBeenCalled();
+    expect(sqlite.rows()).toEqual(before);
   });
 });
 
@@ -188,26 +233,26 @@ describe("compressTag membership", () => {
   it("never rolls up a capsule-tagged row, even on the topic being compressed", async () => {
     resetDatabaseInit();
     sqlite = makeSqliteD1();
-    const env = makeTestEnv(undefined, {
+    const env = sqlite.admitEnv(makeTestEnv(undefined, {
       DB: sqlite.db as unknown as D1Database,
       OAUTH_KV: makeMemoryKV(),
-    });
+    }));
     await initializeDatabase(env);
-    for (let i = 0; i < 12; i++) sqlite.seed({ id: `work-${i}`, content: `memory ${i}`, createdAt: 1 + i, tags: ["work"] });
+    for (let i = 0; i < 12; i++) sqlite.seed({ id: `work-${i}`, content: `memory ${i}`, createdAt: 1 + i, tags: ["project-atlas"] });
     sqlite.seed({
       id: "capsule-definition",
       content: "Definition",
       createdAt: 1,
-      tags: ["work", `${CAPSULE_TAG_PREFIX}core`, `${CAPSULE_SLOT_TAG_PREFIX}identity`, "status:canonical"],
+      tags: ["project-atlas", `${CAPSULE_TAG_PREFIX}core`, `${CAPSULE_SLOT_TAG_PREFIX}identity`, "status:canonical"],
     });
     sqlite.seed({
       id: "malformed-slot-only-definition",
       content: "Incomplete definition",
       createdAt: 1,
-      tags: ["work", `${CAPSULE_SLOT_TAG_PREFIX}preferences`, "status:canonical"],
+      tags: ["project-atlas", `${CAPSULE_SLOT_TAG_PREFIX}preferences`, "status:canonical"],
     });
 
-    const result = await compressTag("work", env, { waitUntil: () => {} } as unknown as ExecutionContext);
+    const result = await compressTag("project-atlas", env, { waitUntil: () => {} } as unknown as ExecutionContext);
 
     expect(result.synthesizedId).toBeTruthy();
     expect(result.entriesUsed).toBe(12);

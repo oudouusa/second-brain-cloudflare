@@ -19,7 +19,7 @@ describe("recall_count bump", () => {
     resetDatabaseInit();
     sqlite = makeSqliteD1();
     const kv = makeMemoryKV();
-    const bootEnv = makeTestEnv(undefined, { DB: sqlite.db as unknown as D1Database, OAUTH_KV: kv });
+    const bootEnv = sqlite.admitEnv(makeTestEnv(undefined, { DB: sqlite.db as unknown as D1Database, OAUTH_KV: kv }));
     await initializeDatabase(bootEnv);
     const roots = await ensureTenantBootstrap(bootEnv);
     const ids = Array.from({ length: n }, (_, i) => `m${i}`);
@@ -29,7 +29,7 @@ describe("recall_count bump", () => {
         .bind(roots.ownerPersonalWorkspaceId, id).run();
     }
     await kv.put(TAG_VOCABULARY_KEY, JSON.stringify({ tags: ["work"], rebuiltAt: Date.now() }));
-    const env: Env = makeTestEnv(undefined, {
+    const env: Env = sqlite.admitEnv(makeTestEnv(undefined, {
       DB: sqlite.db as unknown as D1Database,
       OAUTH_KV: kv,
       VECTORIZE: makeVectorizeMock({
@@ -37,12 +37,12 @@ describe("recall_count bump", () => {
           matches: ids.map((id, i) => ({ id, score: 0.9 - i * 0.01, metadata: { parentId: id, created_at: 1000 } })),
         }),
       }),
-    });
+    }));
     const deferred: Promise<unknown>[] = [];
     const ctx = { waitUntil: (p: Promise<unknown>) => deferred.push(p) } as unknown as ExecutionContext;
     sqlite.issued.length = 0;
     const res = await worker.fetch(
-      new Request(`http://localhost/recall?query=atlas+ledger+note&topK=${n}`, { headers: { Authorization: "Bearer test-token" } }),
+      new Request("http://localhost/recall", { method: "POST", headers: { Authorization: "Bearer test-token", "Content-Type": "application/json" }, body: JSON.stringify({ query: "atlas ledger note", topK: n, synthesize: false }) }),
       env, ctx,
     );
     await Promise.all(deferred);
@@ -54,8 +54,11 @@ describe("recall_count bump", () => {
     const { presented, issued, db } = await recallN(n);
     expect(presented.length).toBe(n);
     expect(issued.filter(s => s.includes("UPDATE entries SET recall_count"))).toHaveLength(1);
-    const rows = (await db.prepare(`SELECT id, recall_count FROM entries`).all()).results as { id: string; recall_count: number }[];
-    for (const r of rows) expect(r.recall_count).toBe(presented.includes(r.id) ? 1 : 0);
+    const rows = (await db.prepare(`SELECT id, recall_count, last_recalled_at FROM entries`).all()).results as { id: string; recall_count: number }[];
+    for (const r of rows) {
+      expect(r.recall_count).toBe(presented.includes(r.id) ? 1 : 0);
+      if (presented.includes(r.id)) expect((r as any).last_recalled_at).toEqual(expect.any(Number));
+    }
   });
 
   it("issues no bump statement when nothing is presented", async () => {

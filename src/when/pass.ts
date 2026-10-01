@@ -3,14 +3,14 @@
  * (src/when/heuristic.ts) could not anchor, ask the model whether this reads
  * as a commitment and, if so, when it is due.
  *
- * Budgeted hard, like every nightly pass sharing one scheduled() invocation:
- * at most WHEN_EXTRACT_PER_NIGHT model calls and, regardless of how many of
- * those are commitments, exactly one SELECT plus at most one batched UPDATE —
- * two D1 statements, well inside the ten this pass is held to.
+ * 夜間は候補2件、直接呼出しは最大20件。SELECTとbatch内のUPDATEは
+ * それぞれ1 SQLとして予約し、権限解放用の予算には触れない。
  *
  * The cursor is a KV keyset over (created_at, id), mirroring
  * src/insight/candidates.ts's ACCRUAL_CURSOR_KEY: cheap, and immune to a tie
  * group of same-millisecond captures being split across nights.
+ * 末尾に到達したら次回の巡回で先頭へ戻る。同じ入力の辞退判断は最大30日再利用する。
+ * 隔離もその巡回内で有効。モデル失敗は判断済みとして保存しない。
  *
  * Robustness contract mirrors src/insight/reason.ts: "declined" (the model
  * gave a real answer and it was not a due commitment) and "failed" (the call
@@ -48,6 +48,8 @@
  *     not one, so a single bad night for an otherwise-fine entry is not
  *     mistaken for a permanent block.
  */
+import { assertMemoryWritesAllowed, memoryWriteMarker } from "../migration/write-lock";
+import { reserveD1Sql } from "../runtime/d1-budget";
 import type { Env } from "../env";
 import { DEFAULTS, resolveConfig, type Config } from "../config";
 import { WHEN_PASS_MAX_TOKENS } from "../constants";
@@ -85,12 +87,15 @@ export interface WhenCursor {
   id?: string;
   failedId?: string;
   failCount?: number;
+  failedFingerprint?: string;
 }
 
 export interface WhenCandidate {
   id: string;
   content: string;
   created_at: number;
+  workspace_id: string;
+  tags: string;
 }
 
 /** Same tolerance as insight/candidates.ts's parseCursor: unreadable means "start from the top". */
@@ -107,6 +112,7 @@ export function parseWhenCursor(raw: string | null): WhenCursor | null {
     if (typeof parsed.failedId === "string" && typeof parsed.failCount === "number") {
       cursor.failedId = parsed.failedId;
       cursor.failCount = parsed.failCount;
+      if (typeof parsed.failedFingerprint === "string") cursor.failedFingerprint = parsed.failedFingerprint;
     }
     // A cursor with neither a position nor an active failure streak carries
     // nothing this pass can use — indistinguishable from absent.
@@ -118,20 +124,63 @@ export function parseWhenCursor(raw: string | null): WhenCursor | null {
 }
 
 /** Read-only: GET /extract/dry-run uses this to preview from the same position the real pass would start at. */
-export async function readWhenCursor(env: Env): Promise<WhenCursor | null> {
+export async function readWhenCursor(env: Env, workspaceId?: string | null): Promise<WhenCursor | null> {
   try {
-    return parseWhenCursor(await env.OAUTH_KV.get(WHEN_CURSOR_KEY));
+    return parseWhenCursor(await env.OAUTH_KV.get(workspaceId == null ? WHEN_CURSOR_KEY : `${WHEN_CURSOR_KEY}:${workspaceId}`));
   } catch (e) {
     console.error("When-extraction cursor read failed; starting from the top (non-fatal):", e);
     return null;
   }
 }
 
-async function writeWhenCursor(env: Env, cursor: WhenCursor): Promise<void> {
+async function writeWhenCursor(env: Env, cursor: WhenCursor, workspaceId?: string | null): Promise<void> {
   try {
-    await env.OAUTH_KV.put(WHEN_CURSOR_KEY, JSON.stringify(cursor));
+    await env.OAUTH_KV.put(workspaceId == null ? WHEN_CURSOR_KEY : `${WHEN_CURSOR_KEY}:${workspaceId}`, JSON.stringify(cursor));
   } catch (e) {
     console.error("When-extraction cursor write failed (non-fatal):", e);
+  }
+}
+
+// 辞退判断は派生キャッシュ。プロンプトや判定条件を変えるときは版も更新する。
+const WHEN_REVIEW_VERSION = 1;
+const WHEN_REVIEW_TTL_SECONDS = 30 * 24 * 60 * 60;
+
+interface WhenReview { key: string; fingerprint: string }
+async function digestWhenInput(value: unknown): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(JSON.stringify(value)));
+  return Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, "0")).join("");
+}
+
+async function whenReview(candidate: WhenCandidate, config: Readonly<Config>): Promise<WhenReview> {
+  const [key, fingerprint] = await Promise.all([
+    digestWhenInput([candidate.workspace_id, candidate.id]),
+    digestWhenInput([WHEN_REVIEW_VERSION, candidate.content, candidate.tags, candidate.workspace_id,
+      config.WHEN_LLM_MODEL, config.TIMEZONE, WHEN_CONFIDENCE_THRESHOLD, WHEN_MAX_PAST_MS,
+      WHEN_PASS_MAX_TOKENS, ENTRY_EXCERPT_CHARS]),
+  ]);
+  return { key: `when:review:${key}`, fingerprint };
+}
+
+async function hasWhenReview(env: Env, review: WhenReview, now: number): Promise<boolean> {
+  try {
+    const cached = JSON.parse(await env.OAUTH_KV.get(review.key) ?? "null");
+    return cached?.fingerprint === review.fingerprint
+      && typeof cached.expiresAt === "number" && Number.isFinite(cached.expiresAt)
+      && cached.expiresAt > now && cached.expiresAt <= now + WHEN_REVIEW_TTL_SECONDS * 1000;
+  } catch {
+    // キャッシュを信用できないときは通常のモデル判定へ戻す。
+    return false;
+  }
+}
+
+async function saveWhenReview(env: Env, review: WhenReview, now: number): Promise<void> {
+  try {
+    await env.OAUTH_KV.put(review.key, JSON.stringify({
+      fingerprint: review.fingerprint, expiresAt: now + WHEN_REVIEW_TTL_SECONDS * 1000,
+    }), { expirationTtl: WHEN_REVIEW_TTL_SECONDS });
+  } catch {
+    // 保存失敗は次の巡回で再評価するだけであり、正本やcursorを壊さない。
+    console.error("期限判定キャッシュを保存できませんでした");
   }
 }
 
@@ -140,10 +189,7 @@ function candidateSql(hasCursor: boolean, scopeClause: string | null, now: numbe
   const sliceClause = scopeClause ? `AND ${scopeClause}` : "";
   // validity: current: a replaced note is not a when-extraction candidate either (T-0089.2.1)
   // scope-exempt: cron: the nightly pass's own single-workspace slice is folded into `scope` by the caller, same exemption shape as the other nightly passes; a direct/manual caller with no slice walks the whole corpus, same as before v3. GET /extract/dry-run instead passes a real scopeWhere(auth), so that path IS scoped.
-  // Codex review class E (T-0089.4.2): a held row's content must never reach judgeCommitment's
-  // prompt — excludeHeld's own rule, enforced in SQL here since this candidate list is read-only
-  // ids-and-content, never post-processed in JS before the model call.
-  return `SELECT id, content, created_at FROM entries
+  return `SELECT id, content, created_at, workspace_id, tags FROM entries
           WHERE when_at IS NULL AND when_source IS NULL
             AND (${openLoopSql(now)} OR tags LIKE '%"volatility:volatile"%')
             AND ${NOT_HELD_SQL}
@@ -283,7 +329,7 @@ Respond with JSON only. No text outside the JSON object.
   if (!isReadableJsonObject(raw)) return { outcome: "failed" };
 
   const parsed = parseCommitmentJson(raw, config.TIMEZONE);
-  if (!parsed) return { outcome: "declined" };
+  if (!parsed) return { outcome: "failed" }; // 必須判定のない応答を辞退キャッシュに入れない
   if (!parsed.isCommitment) return { outcome: "declined" };
   if (parsed.confidence < WHEN_CONFIDENCE_THRESHOLD) return { outcome: "declined" };
   if (parsed.dueAt === null) return { outcome: "declined" }; // no anchor, nothing to persist
@@ -320,92 +366,121 @@ export async function runWhenExtractPass(
   env: Env,
   _ctx: ExecutionContext,
   workspaceId?: string | null,
+  limit = WHEN_EXTRACT_PER_NIGHT,
 ): Promise<WhenPassSummary> {
   await initializeDatabase(env);
   const cfg = await resolveConfig(env);
   const now = Date.now();
 
-  const cursor = await readWhenCursor(env);
+  const cursor = await readWhenCursor(env, workspaceId);
 
   let candidates: WhenCandidate[] = [];
+  const scan = reserveD1Sql(env, 2);
+  if (!scan) return { whenExtracted: 0, whenJudged: 0, whenSkipped: 0, ok: false };
+
   try {
     const slice: ScopeClause | null = workspaceId != null ? { clause: "workspace_id = ?", bindings: [workspaceId] } : null;
-    candidates = await fetchWhenCandidates(env, cursor, slice, WHEN_EXTRACT_PER_NIGHT);
+    await assertMemoryWritesAllowed(scan.env);
+    candidates = await fetchWhenCandidates(scan.env, cursor, slice, limit);
   } catch (e) {
     console.error("When-extraction candidate query failed (non-fatal):", e);
+    return { whenExtracted: 0, whenJudged: 0, whenSkipped: 0, ok: false };
+  } finally { scan.release(); }
+  // 末尾に到達したら次回は先頭から再評価する。古い記憶のタスク化・移動・編集も拾う。
+  // 同じ回で再走査せず、SQL予約とモデル呼出し上限を維持する。
+  if (!candidates.length) {
+    await writeWhenCursor(env, {}, workspaceId);
     return { whenExtracted: 0, whenJudged: 0, whenSkipped: 0, ok: true };
   }
+  const mutation = reserveD1Sql(env, candidates.length);
+  if (!mutation) return { whenExtracted: 0, whenJudged: 0, whenSkipped: 0, ok: false };
+  try {
+    env = mutation.env;
 
-  let whenJudged = 0;
-  let whenSkipped = 0;
-  const writes: D1PreparedStatement[] = [];
-  // The position this run WOULD advance the cursor to, kept separate from
-  // the write until the batch below (if any) actually lands — Finding 1.
-  let nextPosition: { createdAt: number; id: string } | null = null;
-  // Failure tracking to persist alongside (or instead of) a position —
-  // Finding 2. Absent unless this run's loop stopped on a "failed" outcome.
-  let nextFailure: { failedId: string; failCount: number } | undefined;
+    let whenJudged = 0;
+    let whenSkipped = 0;
+    const writes: D1PreparedStatement[] = [];
+    const reviews: WhenReview[] = [];
+    // The position this run WOULD advance the cursor to, kept separate from
+    // the write until the batch below (if any) actually lands — Finding 1.
+    let nextPosition: { createdAt: number; id: string } | null = null;
+    // Failure tracking to persist alongside (or instead of) a position —
+    // Finding 2. Absent unless this run's loop stopped on a "failed" outcome.
+    let nextFailure: { failedId: string; failCount: number; failedFingerprint: string } | undefined;
 
-  for (const candidate of candidates) {
-    const verdict = await judgeCommitment(candidate.content, now, env, cfg);
-    if (verdict.outcome === "failed") {
-      const priorCount = cursor?.failedId === candidate.id ? (cursor.failCount ?? 0) : 0;
-      const failCount = priorCount + 1;
-      if (failCount >= WHEN_QUARANTINE_AFTER) {
-        // Quarantined: advance PAST this one poisoned entry and reset the
-        // streak, rather than let it block the corpus behind it forever.
-        // What comes after it is not judged this same run — a fresh
-        // fetchWhenCandidates next time starts right there.
+    for (const candidate of candidates) {
+      const review = await whenReview(candidate, cfg);
+      if (await hasWhenReview(env, review, now)) {
         nextPosition = { createdAt: candidate.created_at, id: candidate.id };
         nextFailure = undefined;
-        whenSkipped++;
-      } else {
-        nextFailure = { failedId: candidate.id, failCount };
+        continue;
       }
-      break; // stop; do not advance the cursor's POSITION past this one, quarantine aside
+      const verdict = await judgeCommitment(candidate.content, now, env, cfg);
+      if (verdict.outcome === "failed") {
+        const priorCount = cursor?.failedId === candidate.id && cursor.failedFingerprint === review.fingerprint
+          ? (cursor.failCount ?? 0) : 0;
+        const failCount = priorCount + 1;
+        if (failCount >= WHEN_QUARANTINE_AFTER) {
+          // Quarantined: advance PAST this one poisoned entry and reset the
+          // streak, rather than let it block the corpus behind it forever.
+          // What comes after it is not judged this same run — a fresh
+          // fetchWhenCandidates next time starts right there.
+          nextPosition = { createdAt: candidate.created_at, id: candidate.id };
+          nextFailure = undefined;
+          whenSkipped++;
+        } else {
+          nextFailure = { failedId: candidate.id, failCount, failedFingerprint: review.fingerprint };
+        }
+        break; // stop; do not advance the cursor's POSITION past this one, quarantine aside
+      }
+      nextPosition = { createdAt: candidate.created_at, id: candidate.id };
+      nextFailure = undefined; // a real verdict landed — any prior streak on an earlier id no longer applies
+      whenJudged++;
+      if (verdict.outcome === "declined") reviews.push(review);
+      if (verdict.outcome === "commitment") {
+        writes.push(
+          // versioning: exempt: 上流同様の夜間期限推定。ユーザー編集とは別のhygiene。
+          env.DB.prepare(`UPDATE entries SET when_at = ?, when_kind = ?, when_source = 'model', when_label = ?, write_marker = ? WHERE id = ? AND content = ? AND workspace_id = ? AND tags = ? AND when_at IS NULL AND when_source IS NULL`)
+            .bind(verdict.dueAt, verdict.kind, verdict.what, memoryWriteMarker(env), candidate.id, candidate.content, candidate.workspace_id, candidate.tags),
+        );
+      }
     }
-    nextPosition = { createdAt: candidate.created_at, id: candidate.id };
-    nextFailure = undefined; // a real verdict landed — any prior streak on an earlier id no longer applies
-    whenJudged++;
-    if (verdict.outcome === "commitment") {
-      // versioning: exempt: hygiene — fills a missing date; the next due action's snapshot captures whatever this set
-      writes.push(
-        env.DB.prepare(`UPDATE entries SET when_at = ?, when_kind = ?, when_source = 'model', when_label = ? WHERE id = ?`)
-          .bind(verdict.dueAt, verdict.kind, verdict.what, candidate.id),
-      );
-    }
-  }
 
-  // One batch however many writes it carries — the whole reason the loop
-  // above collects statements instead of running them as it goes. Nothing
-  // about this run's cursor position is written unless this succeeds: a
-  // judged-but-unpersisted commitment must stay eligible to be asked about
-  // again, not be silently skipped because the cursor said it was handled.
-  let ok = true;
-  let whenExtracted = 0;
-  if (writes.length) {
-    try {
-      await env.DB.batch(writes);
-      whenExtracted = writes.length;
-    } catch (e) {
-      console.error("When-extraction batch write failed; not advancing the cursor this run (non-fatal):", e);
-      ok = false;
+    // One batch however many writes it carries — the whole reason the loop
+    // above collects statements instead of running them as it goes. Nothing
+    // about this run's cursor position is written unless this succeeds: a
+    // judged-but-unpersisted commitment must stay eligible to be asked about
+    // again, not be silently skipped because the cursor said it was handled.
+    let ok = true;
+    let whenExtracted = 0;
+    if (writes.length) {
+      try {
+        const results = await env.DB.batch(writes);
+        // Each CAS targets one entry; count committed candidates, not trigger writes.
+        whenExtracted = results.filter(result => (result.meta.changes ?? result.meta.rows_written ?? 0) > 0).length;
+        // 競合した候補は次回再評価し、古い本文からの期限を保存しない。
+        ok = whenExtracted === writes.length;
+      } catch (e) {
+        console.error("When-extraction batch write failed; not advancing the cursor this run (non-fatal):", e);
+        ok = false;
+      }
     }
-  }
 
-  if (ok) {
-    // Quarantine's resulting position always wins over an in-progress
-    // failure streak on some OTHER, earlier id — nextFailure is already
-    // cleared in that branch above, so this just persists whichever of the
-    // two applies (or neither, on an empty candidate list).
-    const toWrite: WhenCursor = {
-      ...(nextPosition ? { createdAt: nextPosition.createdAt, id: nextPosition.id } : (cursor?.createdAt !== undefined ? { createdAt: cursor.createdAt, id: cursor.id! } : {})),
-      ...(nextFailure ? nextFailure : {}),
-    };
-    if (toWrite.createdAt !== undefined || toWrite.failedId !== undefined) {
-      await writeWhenCursor(env, toWrite);
+    if (ok) {
+      for (const review of reviews) await saveWhenReview(env, review, now);
+      // Quarantine's resulting position always wins over an in-progress
+      // failure streak on some OTHER, earlier id — nextFailure is already
+      // cleared in that branch above, so this just persists whichever of the
+      // two applies (or neither, on an empty candidate list).
+      const toWrite: WhenCursor = {
+        ...(nextPosition ? { createdAt: nextPosition.createdAt, id: nextPosition.id } : (cursor?.createdAt !== undefined ? { createdAt: cursor.createdAt, id: cursor.id! } : {})),
+        ...(nextFailure ? nextFailure : {}),
+      };
+      if (toWrite.createdAt !== undefined || toWrite.failedId !== undefined) {
+        await writeWhenCursor(env, toWrite, workspaceId);
+      }
     }
-  }
 
-  return { whenExtracted, whenJudged, whenSkipped, ok };
+    return { whenExtracted, whenJudged, whenSkipped, ok };
+  } finally { mutation.release(); }
 }

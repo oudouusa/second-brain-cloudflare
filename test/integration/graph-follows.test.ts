@@ -19,7 +19,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { createEdge, inferEdgesOnWrite, GRAPH_FOLLOWS_WINDOW_MS } from "../../src/graph/edges";
 import { makeSqliteD1, type SqliteD1 } from "../helpers/sqlite-d1";
-import { makeTestEnv, makeMemoryKV } from "../helpers/make-env";
+import { makeTestEnv, makeVectorizeMock, makeMemoryKV } from "../helpers/make-env";
 import { captureEntry } from "../../src/capture/entry";
 import { resetDatabaseInit, initializeDatabase } from "../../src/db/init";
 import type { Env } from "../../src/env";
@@ -35,7 +35,7 @@ describe("follows edges", () => {
   beforeEach(async () => {
     resetDatabaseInit();
     sqlite = makeSqliteD1();
-    env = makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV() });
+    env = sqlite.admitEnv(makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV() }));
     await initializeDatabase(env);
   });
 
@@ -155,7 +155,7 @@ describe("follows edges", () => {
     function aiReturningKind(kind: string) {
       return {
         run: vi.fn().mockImplementation(async (model: string) => {
-          if (model.startsWith("@cf/baai/bge")) return { data: [new Array(384).fill(0.1)] };
+          if (model === "@cf/google/embeddinggemma-300m") return { data: [new Array(768).fill(0.1)] };
           const payload = JSON.stringify({
             response: `{"importance": 4, "canonical": false, "kind": "${kind}"}`,
           });
@@ -170,17 +170,17 @@ describe("follows edges", () => {
       } as any;
     }
 
-    /** 0.82: above EDGE_INFER_THRESHOLD, below DUPLICATE_FLAG_THRESHOLD. */
+    /** 0.75: above EDGE_INFER_THRESHOLD, below DUPLICATE_FLAG_THRESHOLD. */
     function envCapturing(ai: any): Env {
-      return makeTestEnv(undefined, {
+      return sqlite.admitEnv(makeTestEnv(undefined, {
         DB: sqlite.db as unknown as Env["DB"],
         OAUTH_KV: makeMemoryKV(),
         AI: ai,
-        VECTORIZE: {
-          query: async () => ({ matches: [{ id: "earlier", score: 0.82, metadata: { parentId: "earlier" } }] }),
+        VECTORIZE: makeVectorizeMock({
+          query: async () => ({ matches: [{ id: "earlier", score: 0.75, metadata: { parentId: "earlier" } }] }),
           insert: async () => ({}), upsert: async () => ({}), deleteByIds: async () => ({}), getByIds: async () => [],
-        } as any,
-      });
+        } as any),
+      }));
     }
 
     async function capture(ai: any): Promise<void> {
@@ -218,19 +218,19 @@ describe("follows edges", () => {
     it("types a follows edge between two entries both captured through the real path", async () => {
       const ai = aiReturningKind("episodic");
       const seen: string[] = [];
-      const envFor = () => makeTestEnv(undefined, {
+      const envFor = () => sqlite.admitEnv(makeTestEnv(undefined, {
         DB: sqlite.db as unknown as Env["DB"],
         OAUTH_KV: makeMemoryKV(),
         AI: ai,
-        VECTORIZE: {
+        VECTORIZE: makeVectorizeMock({
           // Answers with whatever has already been written, so the second
           // capture sees the first as a neighbour without it being seeded.
           query: async () => ({
-            matches: seen.map(id => ({ id, score: 0.82, metadata: { parentId: id } })),
+            matches: seen.map(id => ({ id, score: 0.75, metadata: { parentId: id } })),
           }),
           insert: async () => ({}), upsert: async () => ({}), deleteByIds: async () => ({}), getByIds: async () => [],
-        } as any,
-      });
+        } as any),
+      }));
 
       const runCapture = async (content: string) => {
         const pending: Promise<any>[] = [];
@@ -279,7 +279,7 @@ describe("follows edges", () => {
       let classifyCalls = 0;
       const ai = {
         run: vi.fn().mockImplementation(async (model: string, opts: any) => {
-          if (model.startsWith("@cf/baai/bge")) return { data: [new Array(384).fill(0.1)] };
+          if (model === "@cf/google/embeddinggemma-300m") return { data: [new Array(768).fill(0.1)] };
           // Counted by PROMPT, not by call: capture also runs a pre-existing
           // contradiction check on this path, which is not what is being
           // constrained here and would make a raw call count read as 2.
@@ -322,15 +322,15 @@ describe("follows edges", () => {
         batch: (st: any) => inner.batch(st),
         exec: (sql: string) => inner.exec(sql),
       };
-      const env2 = makeTestEnv(undefined, {
+      const env2 = sqlite.admitEnv(makeTestEnv(undefined, {
         DB: failingDb as unknown as Env["DB"],
         OAUTH_KV: makeMemoryKV(),
         AI: aiReturningKind("episodic"),
-        VECTORIZE: {
-          query: async () => ({ matches: [{ id: "earlier", score: 0.82, metadata: { parentId: "earlier" } }] }),
+        VECTORIZE: makeVectorizeMock({
+          query: async () => ({ matches: [{ id: "earlier", score: 0.75, metadata: { parentId: "earlier" } }] }),
           insert: async () => ({}), upsert: async () => ({}), deleteByIds: async () => ({}), getByIds: async () => [],
-        } as any,
-      });
+        } as any),
+      }));
       const pending: Promise<any>[] = [];
       const ctx2 = { waitUntil: (p: Promise<any>) => pending.push(p) } as unknown as ExecutionContext;
 
@@ -345,7 +345,7 @@ describe("follows edges", () => {
     it("still infers an edge when classification fails outright", async () => {
       const ai = {
         run: vi.fn().mockImplementation(async (model: string) => {
-          if (model.startsWith("@cf/baai/bge")) return { data: [new Array(384).fill(0.1)] };
+          if (model === "@cf/google/embeddinggemma-300m") return { data: [new Array(768).fill(0.1)] };
           throw new Error("model unavailable");
         }),
       } as any;
@@ -393,8 +393,8 @@ describe("follows edges", () => {
    *     budget on chunk embedding, and inference at one call per edge put a
    *     large multi-chunk capture over that line.
    *
-   * The sqlite facade counts a batch as one entry in `issued`, matching what the
-   * platform actually charges.
+   * The fork sqlite facade counts each statement inside a batch in `issued`;
+   * assert the network batch separately from the bounded statement budget.
    */
   it("writes every edge for one capture in a single batched D1 call", async () => {
     seedPair({
@@ -406,15 +406,17 @@ describe("follows edges", () => {
     });
 
     const before = sqlite.issued.length;
+    const batch = vi.spyOn(env.DB, "batch");
     await inferEdgesOnWrite("new", [
       { id: "earlier", score: 0.9 },
       { id: "other-a", score: 0.85 },
       { id: "other-b", score: 0.8 },
     ], env, { newKind: "episodic" });
 
-    // One endpoint SELECT, then one batch carrying the DELETE and all three
-    // edge writes. Per-edge calls would make this five.
-    expect(sqlite.issued.length - before).toBe(2);
+    // One network batch, but D1 charges its individual statements. Include
+    // the fork capability check and delete-marker fence in the budget.
+    expect(batch).toHaveBeenCalledTimes(1);
+    expect(sqlite.issued.length - before).toBeLessThanOrEqual(7);
     expect((await edges()).map(e => e.type).sort()).toEqual(["follows", "relates_to", "relates_to"]);
   });
 

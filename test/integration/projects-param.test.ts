@@ -55,6 +55,14 @@ async function settle(): Promise<void> {
   }
 }
 
+// forkの検索条件はURLへ載せずJSON本文で渡す。
+async function read(path: string, token = ALICE) {
+  const url = new URL(path, BASE);
+  const body: Record<string, unknown> = Object.fromEntries(url.searchParams);
+  for (const k of ["n", "topK", "top_k", "hops", "after", "before"]) if (body[k] !== undefined) body[k] = Number(body[k]);
+  return call("POST", url.pathname, token, body);
+}
+
 async function projectAudit() {
   await settle();
   const { results } = await env.DB.prepare(
@@ -118,7 +126,7 @@ beforeEach(async () => {
     // The tag-first recall branch fetches stored vectors by id and scores them locally.
     VECTORIZE: makeVectorizeMock({
       getByIds: (async (ids: string[]) =>
-        ids.map(id => ({ id, values: new Array(384).fill(0.1), metadata: { parentId: id.replace(/^v-/, "") } }))) as unknown as VectorizeIndex["getByIds"],
+        ids.map(id => ({ id, values: new Array(384).fill(0.1), metadata: { parentId: id.replace(/^v-/, "") } }))) as unknown as Vectorize["getByIds"],
     }),
   });
   await initializeDatabase(env);
@@ -152,18 +160,18 @@ describe("POST /capture with project", () => {
     expect(JSON.parse(row.tags)).toEqual(expect.arrayContaining(["project:website"]));
   });
 
-  it("caps the caller's tags only: 64 plus project and volatility stores 66", async () => {
-    const sixtyFour = Array.from({ length: 64 }, (_, i) => `t${i}`);
+  it("caps the caller's tags only: 自動付与を含めて16タグまで保存する", async () => {
+    const sixtyFour = Array.from({ length: 14 }, (_, i) => `t${i}`);
 
     const res = await call("POST", "/capture", ALICE, { content: "full tag list, worker adds two more", tags: sixtyFour, project: "website", volatility: "durable" });
 
     expect(res.status).toBe(200);
     const body = await jsonOf(res);
-    expect(body.tags).toHaveLength(66);
+    expect(body.tags).toHaveLength(16);
     const row = await sqlite.db.prepare(`SELECT tags FROM entries WHERE id = ?`).bind(body.id).first() as { tags: string };
     const stored = JSON.parse(row.tags) as string[];
-    expect(stored).toHaveLength(66);
-    expect(stored).toEqual(expect.arrayContaining(["project:website", "volatility:durable", "t0", "t63"]));
+    expect(stored).toHaveLength(16);
+    expect(stored).toEqual(expect.arrayContaining(["project:website", "volatility:durable", "t0", "t13"]));
     expect(await registry()).toEqual([{ id: "website", workspace_id: aliceWs, name: "website", status: "active" }]);
   });
 
@@ -221,7 +229,7 @@ describe("POST /capture with project", () => {
       DB: sqlite.db as unknown as Env["DB"],
       OAUTH_KV: makeMemoryKV(),
       VECTORIZE: makeVectorizeMock({
-        query: (async () => ({ matches: [{ id: "existing", score: 0.99, metadata: { parentId: "existing" } }] })) as unknown as VectorizeIndex["query"],
+        query: (async () => ({ matches: [{ id: "existing", score: 0.99, metadata: { parentId: "existing" } }] })) as unknown as Vectorize["query"],
       }),
     });
     seed("existing", aliceWs, []);
@@ -238,7 +246,7 @@ describe("POST /capture with project", () => {
   });
 });
 
-describe("GET /list with project", () => {
+describe("POST /list with project", () => {
   beforeEach(async () => {
     await createProject(ALICE, { id: "site", name: "Site", aliases: ["hosting"] });
     seed("member", aliceWs, ["project:site", "infra"]);
@@ -249,7 +257,7 @@ describe("GET /list with project", () => {
     seed("shared", companyWs, ["project:site"]);
   });
 
-  const ids = async (path: string, token = ALICE) => (await jsonOf(await call("GET", path, token))).map((e: any) => e.id).sort();
+  const ids = async (path: string, token = ALICE) => (await jsonOf(await read(path, token))).map((e: any) => e.id).sort();
 
   it("returns members and alias-matched entries across the readable layers, nothing else", async () => {
     // "shared" is a company-layer member: membership is the tag, wherever Alice can read it.
@@ -277,27 +285,27 @@ describe("GET /list with project", () => {
   });
 
   it("404s an unknown project and names the known ones", async () => {
-    const res = await call("GET", "/list?project=nope", ALICE);
+    const res = await read("/list?project=nope", ALICE);
 
     expect(res.status).toBe(404);
     expect(await jsonOf(res)).toEqual({ ok: false, error: 'unknown project "nope"', known_projects: ["site"] });
   });
 
   it("does not resolve a colleague's personal project", async () => {
-    const res = await call("GET", "/list?project=site", bobToken);
+    const res = await read("/list?project=site", bobToken);
     expect(res.status).toBe(404);
     expect((await jsonOf(res)).known_projects).toEqual([]);
   });
 
   it("400s an invalid slug and ignores an empty one", async () => {
-    const bad = await call("GET", "/list?project=Bad%20Slug!", ALICE);
+    const bad = await read("/list?project=Bad%20Slug!", ALICE);
     expect(bad.status).toBe(400);
     expect((await jsonOf(bad)).error).toBe(BAD_SLUG);
     expect((await ids("/list?project=&n=50")).length).toBe(5);
   });
 });
 
-describe("GET /digest with project", () => {
+describe("POST /digest with project", () => {
   beforeEach(async () => {
     await createProject(ALICE, { id: "site", name: "Site", aliases: ["hosting"] });
   });
@@ -308,13 +316,13 @@ describe("GET /digest with project", () => {
   };
 
   it("400s when both tag and project are given", async () => {
-    const res = await call("GET", "/digest?tag=x&project=site", ALICE);
+    const res = await read("/digest?tag=x&project=site", ALICE);
     expect(res.status).toBe(400);
     expect((await jsonOf(res)).error).toMatch(/tag or project/);
   });
 
   it("400s when neither is given", async () => {
-    const res = await call("GET", "/digest", ALICE);
+    const res = await read("/digest", ALICE);
     expect(res.status).toBe(400);
   });
 
@@ -322,7 +330,7 @@ describe("GET /digest with project", () => {
     seedMembers(8, 4);
     seed("outsider", aliceWs, ["infra"], { createdAt: OLD });
 
-    const res = await call("GET", "/digest?project=site", ALICE);
+    const res = await read("/digest?project=site", ALICE);
 
     const body = await jsonOf(res);
     expect(res.status).toBe(200);
@@ -338,12 +346,12 @@ describe("GET /digest with project", () => {
   it("uses the existing 10-entry threshold and says so", async () => {
     seedMembers(9);
 
-    const res = await call("GET", "/digest?project=site", ALICE);
+    const res = await read("/digest?project=site", ALICE);
 
     const body = await jsonOf(res);
     expect(body.project).toBe("site");
     expect(body.entry_id).toBeUndefined();
-    expect(body.error).toBe("Could not create digest: the project may have fewer than 10 eligible entries, or it was recently compressed.");
+    expect(body.error).toBe("Could not create digest: the project may have fewer than 10 eligible entries or was recently compressed");
     expect(body.source_count).toBe(0);
   });
 
@@ -351,17 +359,17 @@ describe("GET /digest with project", () => {
     seedMembers(12);
     await call("PATCH", "/projects/site", ALICE, { status: "archived" });
 
-    expect((await jsonOf(await call("GET", "/digest?project=site", ALICE))).entry_id).toBeTruthy();
+    expect((await jsonOf(await read("/digest?project=site", ALICE))).entry_id).toBeTruthy();
     seedMembers(0);
     for (let i = 20; i < 40; i++) seed(`n${i}`, aliceWs, ["project:site"], { createdAt: OLD + i });
-    const again = await jsonOf(await call("GET", "/digest?project=site", ALICE));
+    const again = await jsonOf(await read("/digest?project=site", ALICE));
     expect(again.entry_id).toBeUndefined();
   });
 
   it("404s an unknown project and never digests a colleague's", async () => {
-    expect((await call("GET", "/digest?project=nope", ALICE)).status).toBe(404);
+    expect((await read("/digest?project=nope", ALICE)).status).toBe(404);
     seedMembers(12);
-    expect((await call("GET", "/digest?project=site", bobToken)).status).toBe(404);
+    expect((await read("/digest?project=site", bobToken)).status).toBe(404);
     expect((await sqlite.db.prepare(`SELECT COUNT(*) AS n FROM entries WHERE tags LIKE '%"rolled-up"%'`).first() as { n: number }).n).toBe(0);
   });
 
@@ -379,26 +387,26 @@ describe("GET /digest with project", () => {
 
   it("refuses a bare project: tag through ?tag=, since only the registry drives project digests", async () => {
     seedMembers(12);
-    const body = await jsonOf(await call("GET", "/digest?tag=project:site", ALICE));
+    const body = await jsonOf(await read("/digest?tag=project:site", ALICE));
     expect(body.entry_id).toBeUndefined();
     expect((await sqlite.db.prepare(`SELECT COUNT(*) AS n FROM entries WHERE tags LIKE '%"rolled-up"%'`).first() as { n: number }).n).toBe(0);
   });
 });
 
-describe("GET /digest with the same slug in two workspaces", () => {
+describe("POST /digest with the same slug in two workspaces", () => {
   const rolledUpIds = async () =>
     ((await sqlite.db.prepare(`SELECT id FROM entries WHERE tags LIKE '%"rolled-up"%' ORDER BY id`).all()).results as { id: string }[]).map(r => r.id);
 
   it("never rolls up entries matched only by the other workspace's alias", async () => {
-    await createProjectRow(env.DB, aliceWs, { id: "roadmap", name: "Roadmap", aliases: ["q3"] });
-    await createProjectRow(env.DB, companyWs, { id: "roadmap", name: "Roadmap", aliases: ["pricing"] });
+    await createProjectRow(env.DB, aliceWs, { id: "roadmap", name: "Roadmap", aliases: ["q3"] }, sqlite.admitEnv(env));
+    await createProjectRow(env.DB, companyWs, { id: "roadmap", name: "Roadmap", aliases: ["pricing"] }, sqlite.admitEnv(env));
     for (let i = 0; i < 12; i++) seed(`p${i}`, aliceWs, ["project:roadmap"], { createdAt: OLD + i });
     for (let i = 0; i < 12; i++) seed(`c${i}`, companyWs, ["project:roadmap"], { createdAt: OLD + i });
     // Each is claimed only by the alias of the workspace it does NOT live in.
     for (let i = 0; i < 12; i++) seed(`ap${i}`, aliceWs, ["pricing"], { createdAt: OLD + i });
     for (let i = 0; i < 12; i++) seed(`cq${i}`, companyWs, ["q3"], { createdAt: OLD + i });
 
-    const res = await call("GET", "/digest?project=roadmap", ALICE);
+    const res = await read("/digest?project=roadmap", ALICE);
 
     expect(res.status).toBe(200);
     const rolled = await rolledUpIds();
@@ -408,13 +416,13 @@ describe("GET /digest with the same slug in two workspaces", () => {
   });
 
   it("uses each workspace's own aliases for that workspace's rollup", async () => {
-    await createProjectRow(env.DB, aliceWs, { id: "roadmap", name: "Roadmap", aliases: ["q3"] });
-    await createProjectRow(env.DB, companyWs, { id: "roadmap", name: "Roadmap", aliases: ["pricing"] });
+    await createProjectRow(env.DB, aliceWs, { id: "roadmap", name: "Roadmap", aliases: ["q3"] }, sqlite.admitEnv(env));
+    await createProjectRow(env.DB, companyWs, { id: "roadmap", name: "Roadmap", aliases: ["pricing"] }, sqlite.admitEnv(env));
     for (let i = 0; i < 6; i++) seed(`p${i}`, aliceWs, ["project:roadmap"], { createdAt: OLD + i });
     for (let i = 0; i < 6; i++) seed(`aq${i}`, aliceWs, ["q3"], { createdAt: OLD + i });
     for (let i = 0; i < 12; i++) seed(`cp${i}`, companyWs, ["pricing"], { createdAt: OLD + i });
 
-    expect((await call("GET", "/digest?project=roadmap", ALICE)).status).toBe(200);
+    expect((await read("/digest?project=roadmap", ALICE)).status).toBe(200);
 
     const rolled = await rolledUpIds();
     expect(rolled.filter(id => id.startsWith("aq") || id.startsWith("p"))).toHaveLength(12);
@@ -429,7 +437,7 @@ describe("GET /digest with the same slug in two workspaces", () => {
       .run();
     for (let i = 0; i < 12; i++) seed(`b${i}`, aliceWs, ["project:big"], { createdAt: OLD + i });
 
-    const res = await call("GET", "/digest?project=big", ALICE);
+    const res = await read("/digest?project=big", ALICE);
 
     expect(res.status).toBe(400);
     expect((await jsonOf(res)).error).toMatch(/narrow/);
@@ -481,7 +489,7 @@ describe("GET /graph with project", () => {
   });
 });
 
-describe("GET /recall with project", () => {
+describe("POST /recall with project", () => {
   beforeEach(async () => {
     await createProject(ALICE, { id: "site", name: "Site", aliases: ["hosting"] });
     seed("member", aliceWs, ["project:site"], { content: "site hosting notes about the deploy" });
@@ -492,7 +500,7 @@ describe("GET /recall with project", () => {
   });
 
   const recallIds = async (path: string, token = ALICE) => {
-    const res = await call("GET", path, token);
+    const res = await read(path, token);
     expect(res.status).toBe(200);
     return (await jsonOf(res)).results.map((r: any) => r.id).sort();
   };
@@ -516,16 +524,16 @@ describe("GET /recall with project", () => {
 
   it("returns an empty result set for a known project with no members", async () => {
     await createProject(ALICE, { id: "empty", name: "Empty" });
-    const res = await call("GET", "/recall?query=site%20hosting&project=empty", ALICE);
+    const res = await read("/recall?query=site%20hosting&project=empty", ALICE);
     expect(res.status).toBe(200);
     expect((await jsonOf(res)).results).toEqual([]);
   });
 
   it("404s an unknown project with the known slugs, and 400s a bad one", async () => {
-    const res = await call("GET", "/recall?query=x&project=nope", ALICE);
+    const res = await read("/recall?query=x&project=nope", ALICE);
     expect(res.status).toBe(404);
     expect(await jsonOf(res)).toEqual({ ok: false, error: 'unknown project "nope"', known_projects: ["site"] });
-    expect((await call("GET", "/recall?query=x&project=Bad%20Slug!", ALICE)).status).toBe(400);
+    expect((await read("/recall?query=x&project=Bad%20Slug!", ALICE)).status).toBe(400);
   });
 
   it("drops a graph-expanded neighbour that is not a member (hydration filter)", async () => {
@@ -537,7 +545,7 @@ describe("GET /recall with project", () => {
 
     expect(ids).toEqual(["aliased", "member"]);
     sqlite.issued.length = 0;
-    await call("GET", "/recall?query=site%20hosting%20notes&project=site&topK=10&hops=1", ALICE);
+    await read("/recall?query=site%20hosting%20notes&project=site&topK=10&hops=1", ALICE);
     const hydration = sqlite.issued.filter(s => s.includes("superseded_by_json") && /FROM entries WHERE id IN/.test(s));
     expect(hydration.length).toBeGreaterThan(0);
     for (const sql of hydration) expect(sql).toMatch(/tags LIKE \? ESCAPE/);

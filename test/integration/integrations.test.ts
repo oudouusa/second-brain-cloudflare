@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { disconnectAllPages } from "../helpers/disconnect-pages";
 import worker from "../../src/index";
 import { makeTestEnv, makeTestDb, makeMemoryKV } from "../helpers/make-env";
 import { req } from "../helpers/make-request";
@@ -44,7 +45,22 @@ function stubNotionApi(fixture: NotionFixture) {
       return new Response(JSON.stringify({ object: "user", type: "bot", name: "Second Brain", bot: { workspace_name: "Test Workspace" } }), { status: 200 });
     }
     if (url.endsWith("/search")) {
-      return new Response(JSON.stringify({ results: fixture.pages, has_more: false, next_cursor: null }), { status: 200 });
+      const body = JSON.parse(init?.body ?? "{}");
+      const start = Number(body.start_cursor ?? 0);
+      const size = Number(body.page_size ?? 10);
+      const end = Math.min(start + size, fixture.pages.length);
+      return new Response(JSON.stringify({
+        results: fixture.pages.slice(start, end),
+        has_more: end < fixture.pages.length,
+        next_cursor: end < fixture.pages.length ? String(end) : null,
+      }), { status: 200 });
+    }
+    const pageMatch = url.match(/\/pages\/([^/?]+)$/);
+    if (pageMatch) {
+      const page = fixture.pages.find(candidate => candidate.id === decodeURIComponent(pageMatch[1]));
+      return page
+        ? new Response(JSON.stringify(page), { status: 200 })
+        : new Response(JSON.stringify({ message: "not found" }), { status: 404 });
     }
     const m = url.match(/\/blocks\/([^/?]+)\/children/);
     if (m) {
@@ -74,6 +90,14 @@ describe("integrations routes", () => {
     worker.fetch(req("POST", "/integrations/notion/connect", { body: { token: "ntn_valid" } }), env, ctx);
   const sync = () =>
     worker.fetch(req("POST", "/integrations/notion/sync", { body: {} }), env, ctx);
+  const drainSync = async () => {
+    let last: any = null;
+    for (let i = 0; i < 100; i++) {
+      last = await (await sync()).json() as any;
+      if (!last.ok || last.remaining === 0) return last;
+    }
+    throw new Error("sync did not drain within 100 bounded calls");
+  };
 
   describe("GET /integrations", () => {
     it("requires auth", async () => {
@@ -154,6 +178,44 @@ describe("integrations routes", () => {
       expect(status.integrations[0].itemCount).toBe(1);
     });
 
+    it("fences a delayed sync after its provider operation is overtaken", async () => {
+      fixture.pages = [notionPage("late", "Late page", "2026-01-01T00:00:00.000Z")];
+      let releaseBlocks!: () => void;
+      const blocksMayReturn = new Promise<void>(resolve => { releaseBlocks = resolve; });
+      let blockFetchStarted!: () => void;
+      const blockFetch = new Promise<void>(resolve => { blockFetchStarted = resolve; });
+      vi.stubGlobal("fetch", vi.fn(async (input: any, init?: any) => {
+        const url = typeof input === "string" ? input : input.url;
+        if (url.endsWith("/users/me")) {
+          return new Response(JSON.stringify({ object: "user", type: "bot", name: "Second Brain", bot: { workspace_name: "Test Workspace" } }));
+        }
+        if (url.endsWith("/search")) {
+          return new Response(JSON.stringify({ results: fixture.pages, has_more: false, next_cursor: null }));
+        }
+        if (url.includes("/blocks/late/children")) {
+          blockFetchStarted();
+          await blocksMayReturn;
+          return new Response(JSON.stringify({ results: [paragraph("late body")], has_more: false, next_cursor: null }));
+        }
+        expect(init?.headers?.Authorization).toBe("Bearer ntn_valid");
+        return new Response("not found", { status: 404 });
+      }));
+      await connect();
+
+      const pendingSync = sync();
+      await blockFetch;
+      const state = db.integrationProviderGenerations.get("notion")!;
+      state.lease_owner = "new-disconnect-owner";
+      state.lease_expires_at = Date.now() + 60_000;
+      releaseBlocks();
+
+      const res = await pendingSync;
+      expect(res.status).toBe(409);
+      expect(db.entries).toHaveLength(0);
+      const status = await (await worker.fetch(req("GET", "/integrations"), env, ctx)).json() as any;
+      expect(status.integrations[0]).toMatchObject({ connected: true, itemCount: 0 });
+    });
+
     it("is a no-op when nothing changed", async () => {
       fixture.pages = [notionPage("p1", "Note", "2026-01-01T00:00:00.000Z")];
       fixture.blocks["p1"] = [paragraph("test")];
@@ -192,7 +254,7 @@ describe("integrations routes", () => {
       expect(db.entries).toHaveLength(1);
 
       fixture.pages = []; // page unshared
-      const data = await (await sync()).json() as any;
+      const data = await drainSync();
       expect(data).toMatchObject({ deleted: 1 });
       expect(db.entries).toHaveLength(0);
 
@@ -220,10 +282,22 @@ describe("integrations routes", () => {
       await connect();
 
       const first = await (await sync()).json() as any;
-      expect(first).toMatchObject({ created: 5, remaining: 2 });
-      const second = await (await sync()).json() as any;
-      expect(second).toMatchObject({ created: 2, remaining: 0 });
+      expect(first).toMatchObject({ created: 1, remaining: 6 });
+      const final = await drainSync();
+      expect(final).toMatchObject({ created: 1, remaining: 0 });
       expect(db.entries).toHaveLength(7);
+    });
+
+    it("persists the listing cursor and reaches pages beyond the first 50", async () => {
+      fixture.pages = Array.from({ length: 55 }, (_, i) =>
+        notionPage(`wide-${i}`, `Wide ${i}`, "2026-01-01T00:00:00.000Z"));
+      for (let i = 0; i < 55; i++) fixture.blocks[`wide-${i}`] = [paragraph(`body ${i}`)];
+      await connect();
+
+      const final = await drainSync();
+      expect(final).toMatchObject({ remaining: 0 });
+      expect(db.entries).toHaveLength(55);
+      expect(db.entries.some(entry => entry.content.includes("Wide 54"))).toBe(true);
     });
 
     // #290: the mirror store resolved config inside createEntry, so every item in
@@ -243,7 +317,7 @@ describe("integrations routes", () => {
 
       const result = await (await sync()).json() as any;
 
-      expect(result).toMatchObject({ created: 5 });
+      expect(result).toMatchObject({ created: 1 });
       expect(reads.filter(k => k === "config:overrides")).toHaveLength(1);
     });
 
@@ -267,7 +341,7 @@ describe("integrations routes", () => {
       fixture.pages = [notionPage("p1", "Note", "2026-01-01T00:00:00.000Z")];
       fixture.blocks["p1"] = [paragraph("test")];
       await connect();
-      await sync();
+      await drainSync();
     });
 
     it("409s on POST /update for a mirrored entry while connected", async () => {
@@ -302,7 +376,7 @@ describe("integrations routes", () => {
       fixture.blocks["p1"] = [paragraph("one")];
       fixture.blocks["p2"] = [paragraph("two")];
       await connect();
-      await sync();
+      await drainSync();
     });
 
     it("404s when not connected", async () => {
@@ -322,11 +396,106 @@ describe("integrations routes", () => {
     });
 
     it("purges mirrored memories when asked", async () => {
-      const res = await worker.fetch(
+      const first = await worker.fetch(
         req("POST", "/integrations/notion/disconnect", { body: { purge: true } }), env, ctx
       );
-      const data = await res.json() as any;
-      expect(data).toMatchObject({ ok: true, purged: 2, kept: 0 });
+      expect(first.status).toBe(202);
+      expect(await first.json()).toMatchObject({ ok: true, done: false, purged: 1, skipped: 0, next_cursor: "p1" });
+
+      const final = await worker.fetch(
+        req("POST", "/integrations/notion/disconnect", { body: { purge: true, cursor: "p1" } }), env, ctx
+      );
+      expect(final.status).toBe(202);
+      expect(await final.json()).toMatchObject({ ok: true, done: false, purged: 2 });
+      expect(await disconnectAllPages(body => worker.fetch(req("POST", "/integrations/notion/disconnect", { body: { ...body, cursor: "p2" } }), env, ctx)))
+        .toMatchObject({ ok: true, done: true, purged: 2, kept: 0 });
+      expect(db.entries).toHaveLength(0);
+    });
+
+    it("purges provider-source orphans missing from the KV item map", async () => {
+      db.entries.push({
+        id: "orphan-after-kv-failure",
+        content: "orphan",
+        tags: "[]",
+        source: "\u00a0notion\u00a0",
+        created_at: 1,
+        updated_at: 1,
+        vector_ids: "[]",
+        workspace_id: db.entries[0].workspace_id,
+        actor_id: db.entries[0].actor_id,
+      });
+
+      const result = await disconnectAllPages(body => worker.fetch(
+        req("POST", "/integrations/notion/disconnect", { body }), env, ctx));
+      expect(result).toMatchObject({ ok: true, done: true, purged: 3, kept: 0 });
+      expect(db.entries).toHaveLength(0);
+    });
+
+    it("purges a large mirror map in resumable pages and disconnects only after completion", async () => {
+      fixture.pages = Array.from({ length: 10 }, (_, i) =>
+        notionPage(`p${i + 1}`, `Note ${i + 1}`, `2026-01-${String(i + 1).padStart(2, "0")}T00:00:00.000Z`));
+      for (let i = 0; i < 10; i++) fixture.blocks[`p${i + 1}`] = [paragraph(`body ${i + 1}`)];
+      await drainSync();
+      expect(db.entries).toHaveLength(10);
+
+      let done = false;
+      let cursor: string | undefined;
+      let totalPurged = 0;
+      const statuses: number[] = [];
+      while (!done) {
+        const res = await worker.fetch(
+          req("POST", "/integrations/notion/disconnect", { body: { purge: true, ...(cursor === undefined ? {} : { cursor }) } }), env, ctx,
+        );
+        const data = await res.json() as any;
+        statuses.push(res.status);
+        expect(data.ok).toBe(true);
+        expect(data.purged - totalPurged).toBeLessThanOrEqual(1);
+        totalPurged = data.purged;
+        done = data.done;
+        cursor = data.next_cursor;
+        expect(statuses.length).toBeLessThanOrEqual(11);
+      }
+
+      expect(statuses).toEqual([...Array(10).fill(202), 200]);
+      expect(totalPurged).toBe(10);
+      expect(db.entries).toHaveLength(0);
+      const status = await (await worker.fetch(req("GET", "/integrations"), env, ctx)).json() as any;
+      expect(status.integrations[0].connected).toBe(false);
+    });
+
+    it("retains the integration cursor and failed item when a purge page is partial", async () => {
+      const first = await worker.fetch(
+        req("POST", "/integrations/notion/disconnect", { body: { purge: true } }), env, ctx,
+      );
+      expect(first.status).toBe(202);
+      expect(await first.json()).toMatchObject({ ok: true, done: false, purged: 1, next_cursor: "p1" });
+
+      const originalBatch = env.DB.batch.bind(env.DB);
+      let failed = false;
+      vi.spyOn(env.DB, "batch").mockImplementation(async statements => {
+        if (!failed && statements.some((stmt: any) => /INSERT INTO entries_trash/.test(stmt.__sql ?? stmt.sql ?? stmt.sourceSql?.() ?? ""))) {
+          failed = true; throw new Error("injected purge failure");
+        }
+        return originalBatch(statements);
+      });
+
+      const partial = await worker.fetch(
+        req("POST", "/integrations/notion/disconnect", { body: { purge: true, cursor: "p1" } }), env, ctx,
+      );
+      const partialData = await partial.json() as any;
+
+      expect(partial.status).toBe(503);
+      expect(partialData.ok).toBe(false);
+      expect(failed).toBe(true);
+      expect(db.entries).toHaveLength(1);
+      const during = await (await worker.fetch(req("GET", "/integrations"), env, ctx)).json() as any;
+      expect(during.integrations[0]).toMatchObject({ connected: true, itemCount: 2 });
+
+      const retry = await worker.fetch(
+        req("POST", "/integrations/notion/disconnect", { body: { purge: true, cursor: "p1" } }), env, ctx,
+      );
+      expect(retry.status).toBe(202);
+      expect(await disconnectAllPages(body => worker.fetch(req("POST", "/integrations/notion/disconnect", { body: { ...body, cursor: "p2" } }), env, ctx))).toMatchObject({ done: true, purged: 2 });
       expect(db.entries).toHaveLength(0);
     });
   });

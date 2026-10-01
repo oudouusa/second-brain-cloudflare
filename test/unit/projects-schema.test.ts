@@ -23,7 +23,7 @@ describe("projects schema", () => {
     d1 = makeSqliteD1();
     const cols = await columnsOf(d1, "projects");
 
-    expect(cols.map(c => c.name)).toEqual(["id", "workspace_id", "name", "description", "aliases", "status", "created_at", "updated_at"]);
+    expect(cols.map(c => c.name)).toEqual(["id", "workspace_id", "name", "description", "aliases", "status", "created_at", "updated_at", "restore_lease_owner", "write_marker"]);
     const pk = cols.filter(c => c.pk > 0).sort((a, b) => a.pk - b.pk).map(c => c.name);
     expect(pk).toEqual(["workspace_id", "id"]);
     const byName = Object.fromEntries(cols.map(c => [c.name, c]));

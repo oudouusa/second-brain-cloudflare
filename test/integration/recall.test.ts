@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import worker from "../../src/index"; import { captureEntry } from "../../src/capture/entry";
-import { makeTestEnv, makeTestDb, makeVectorizeMock } from "../helpers/make-env";
+import { makeTestEnv, makeTestDb, makeMemoryKV, makeVectorizeMock } from "../helpers/make-env";
 import { req } from "../helpers/make-request";
 import type { Env } from "../../src/env";
 import { D1Mock } from "../helpers/d1-mock";
@@ -12,8 +12,8 @@ import { setDbReady } from "../../src/runtime/state";
 function makeContradictionAI(response: string): Ai {
   return {
     run: vi.fn().mockImplementation(async (model: string) => {
-      if (model === "@cf/baai/bge-small-en-v1.5")
-        return { data: [new Array(384).fill(0.1)] };
+      if (model === "@cf/google/embeddinggemma-300m")
+        return { data: [new Array(768).fill(0.1)] };
       return new ReadableStream({
         start(c) {
           c.enqueue(new TextEncoder().encode(`data: {"response":${JSON.stringify(response)}}\n\n`));
@@ -37,10 +37,20 @@ function makeMatch(id: string, score: number, overrides: Record<string, any> = {
 
 // The AI mock embeds every query as 384 dims of 0.1 (make-env.ts) —
 // SIMILAR_VEC scores cosine 1.0 against it, DISSIMILAR_VEC scores ~0.
-const SIMILAR_VEC = new Array(384).fill(0.1);
+const SIMILAR_VEC = new Array(128).fill(0.1);
 const DISSIMILAR_VEC = Array.from({ length: 384 }, (_, i) => (i % 2 === 0 ? 0.1 : -0.1));
 
-describe("GET /recall", () => {
+describe("POST /recall", () => {
+  it("rejects GET so private queries cannot enter URL logs or browser history", async () => {
+    const env = makeTestEnv(makeTestDb());
+    const raw = new Request("http://localhost/recall?query=private-memory", {
+      method: "GET",
+      headers: { Authorization: "Bearer test-token" },
+    });
+    const res = await worker.fetch(raw, env, ctx);
+    expect(res.status).toBe(405);
+    expect(res.headers.get("Allow")).toBe("POST");
+  });
   let env: Env;
   let db: D1Mock;
 
@@ -50,11 +60,82 @@ describe("GET /recall", () => {
   });
 
   it("returns 400 when query is missing", async () => {
-    const res = await worker.fetch(req("GET", "/recall"), env, ctx);
+    const res = await worker.fetch(req("POST", "/recall"), env, ctx);
     expect(res.status).toBe(400);
     const data = await res.json() as any;
     expect(data.ok).toBe(false);
     expect(data.error).toBe("query is required");
+  });
+
+  it("rejects a non-boolean synthesize flag", async () => {
+    const res = await worker.fetch(req("POST", "/recall", {
+      body: { query: "memory", synthesize: "false" },
+    }), env, ctx);
+    expect(res.status).toBe(400);
+    expect(await res.json()).toMatchObject({ error: "synthesize must be a boolean" });
+  });
+
+  it("skips insight generation when synthesize=false", async () => {
+    db.entries.push(
+      { id: "entry-1", content: "First work memory", tags: '["work"]', source: "api", created_at: 1000, vector_ids: "[]", recall_count: 0, importance_score: 0 },
+      { id: "entry-2", content: "Second work memory", tags: '["work"]', source: "api", created_at: 2000, vector_ids: "[]", recall_count: 0, importance_score: 0 },
+    );
+    const aiRun = vi.fn().mockImplementation(async (model: string) => {
+      if (model === "@cf/google/embeddinggemma-300m") {
+        return { data: [new Array(768).fill(0.1)] };
+      }
+      throw new Error("synthesis should not run");
+    });
+    env = makeTestEnv(db, {
+      AI: { run: aiRun } as unknown as Ai,
+      VECTORIZE: makeVectorizeMock({
+        query: vi.fn().mockResolvedValue({
+          matches: [makeMatch("entry-1", 0.9), makeMatch("entry-2", 0.8)],
+        }),
+      }),
+    });
+
+    const res = await worker.fetch(req("POST", "/recall", {
+      body: { query: "work", synthesize: false },
+    }), env, ctx);
+    const data = await res.json() as any;
+
+    expect(res.status).toBe(200);
+    expect(data.results).toHaveLength(2);
+    expect(data.insight).toBeNull();
+    expect(aiRun).toHaveBeenCalledTimes(1);
+    expect(aiRun).toHaveBeenCalledWith("@cf/google/embeddinggemma-300m", expect.any(Object));
+  });
+
+  it("query-signal cacheの再読ではWorkers AIを呼ばない", async () => {
+    const kv = makeMemoryKV();
+    const aiRun = vi.fn().mockResolvedValue({ data: [new Array(768).fill(0.1)] });
+    env = makeTestEnv(db, {
+      AI: { run: aiRun } as unknown as Ai,
+      OAUTH_KV: kv,
+    });
+    const pending: Promise<unknown>[] = [];
+    const cacheCtx = {
+      waitUntil: (promise: Promise<unknown>) => { pending.push(promise); },
+    } as unknown as ExecutionContext;
+    const request = () => req("POST", "/recall", {
+      body: { query: "exact private cache question", synthesize: false },
+    });
+
+    const first = await worker.fetch(request(), env, cacheCtx);
+    await Promise.allSettled(pending.splice(0));
+    expect(aiRun).toHaveBeenCalledTimes(1);
+    aiRun.mockClear();
+    const second = await worker.fetch(request(), env, cacheCtx);
+    await Promise.allSettled(pending.splice(0));
+    const firstBody = await first.json() as any;
+    const secondBody = await second.json() as any;
+
+    expect(firstBody.query_signal_cache_hit).toBe(false);
+    expect(first.status).toBe(200);
+    expect(second.status).toBe(200);
+    expect(secondBody.query_signal_cache_hit).toBe(true);
+    expect(aiRun).not.toHaveBeenCalled();
   });
 
   it("never exposes internal candidate diagnostics in the HTTP response", async () => {
@@ -67,7 +148,7 @@ describe("GET /recall", () => {
       }),
     });
 
-    const res = await worker.fetch(req("GET", "/recall?query=atlas&hops=1"), env, ctx);
+    const res = await worker.fetch(req("POST", "/recall?query=atlas&hops=1"), env, ctx);
     const body = JSON.stringify(await res.json());
 
     for (const privateField of ["denseIds", "keywordIds", "operations", "eligibleRelatedIds", "finalIds"]) {
@@ -80,7 +161,7 @@ describe("GET /recall", () => {
       VECTORIZE: makeVectorizeMock({ query: vi.fn().mockResolvedValue({ matches: [] }) }),
     });
 
-    const res = await worker.fetch(req("GET", "/recall?query=anything"), env, ctx);
+    const res = await worker.fetch(req("POST", "/recall?query=anything"), env, ctx);
     expect(res.status).toBe(200);
     const data = await res.json() as any;
     expect(data.ok).toBe(true);
@@ -101,7 +182,7 @@ describe("GET /recall", () => {
       }),
     });
 
-    const res = await worker.fetch(req("GET", "/recall?query=memory"), env, ctx);
+    const res = await worker.fetch(req("POST", "/recall?query=memory"), env, ctx);
     expect(res.status).toBe(200);
     const data = await res.json() as any;
     expect(data.ok).toBe(true);
@@ -128,7 +209,7 @@ describe("GET /recall", () => {
       }),
     });
 
-    const res = await worker.fetch(req("GET", "/recall?query=memory"), env, ctx);
+    const res = await worker.fetch(req("POST", "/recall?query=memory"), env, ctx);
     const data = await res.json() as any;
     expect(data.results[0].truncated).toBe(true);
     expect(data.results[0].content.length).toBeLessThan(big.length);
@@ -147,7 +228,7 @@ describe("GET /recall", () => {
       }),
     });
 
-    const res = await worker.fetch(req("GET", "/recall?query=memory&full=1"), env, ctx);
+    const res = await worker.fetch(req("POST", "/recall?query=memory&full=1"), env, ctx);
     const data = await res.json() as any;
     expect(data.results[0].truncated).toBe(false);
     expect(data.results[0].content).toBe(big);
@@ -165,7 +246,7 @@ describe("GET /recall", () => {
       }),
     });
 
-    const res = await worker.fetch(req("GET", "/recall?query=memory"), env, ctx);
+    const res = await worker.fetch(req("POST", "/recall?query=memory"), env, ctx);
     const data = await res.json() as any;
     expect(data.results).toHaveLength(1);
     expect(data.results[0].id).toBe("entry-1");
@@ -183,7 +264,7 @@ describe("GET /recall", () => {
     ]);
     env = makeTestEnv(db, { VECTORIZE: makeVectorizeMock({ query: queryMock, getByIds: getByIdsMock }) });
 
-    const res = await worker.fetch(req("GET", "/recall?query=memory&tag=work"), env, ctx);
+    const res = await worker.fetch(req("POST", "/recall?query=memory&tag=work"), env, ctx);
     const data = await res.json() as any;
     expect(data.results).toHaveLength(1);
     expect(data.results[0].id).toBe("entry-1");
@@ -197,7 +278,7 @@ describe("GET /recall", () => {
     const getByIdsMock = vi.fn().mockResolvedValue([]);
     env = makeTestEnv(db, { VECTORIZE: makeVectorizeMock({ query: queryMock, getByIds: getByIdsMock }) });
 
-    const res = await worker.fetch(req("GET", "/recall?query=memory&tag=nonexistent"), env, ctx);
+    const res = await worker.fetch(req("POST", "/recall?query=memory&tag=nonexistent"), env, ctx);
     const data = await res.json() as any;
     expect(data.ok).toBe(true);
     expect(data.results).toEqual([]);
@@ -210,7 +291,7 @@ describe("GET /recall", () => {
     const queryMock = vi.fn().mockResolvedValue({ matches: [] });
     env = makeTestEnv(db, { VECTORIZE: makeVectorizeMock({ query: queryMock }) });
 
-    await worker.fetch(req("GET", "/recall?query=memory&topK=999"), env, ctx);
+    await worker.fetch(req("POST", "/recall?query=memory&topK=999"), env, ctx);
     const [, opts] = queryMock.mock.calls[0];
     expect(opts.topK).toBeLessThanOrEqual(50);
   });
@@ -226,7 +307,7 @@ describe("GET /recall", () => {
     ]);
     env = makeTestEnv(db, { VECTORIZE: makeVectorizeMock({ getByIds: getByIdsMock }) });
 
-    const res = await worker.fetch(req("GET", "/recall?query=memory&tag=work"), env, ctx);
+    const res = await worker.fetch(req("POST", "/recall?query=memory&tag=work"), env, ctx);
     const data = await res.json() as any;
     expect(data.results.map((r: any) => r.id)).toEqual(["entry-2", "entry-1"]);
     expect(data.results[0].score).toBeGreaterThan(data.results[1].score);
@@ -241,31 +322,28 @@ describe("GET /recall", () => {
     ]);
     env = makeTestEnv(db, { VECTORIZE: makeVectorizeMock({ getByIds: getByIdsMock }) });
 
-    const res = await worker.fetch(req("GET", "/recall?query=memory&tag=work"), env, ctx);
+    const res = await worker.fetch(req("POST", "/recall?query=memory&tag=work"), env, ctx);
     const data = await res.json() as any;
     expect(data.results).toHaveLength(1);
     expect(data.results[0].id).toBe("entry-1");
   });
 
-  it("returns empty results when all of the tag's vectors are stale", async () => {
+  it("degrades to keyword recall when getByIds and the filtered query return no vectors", async () => {
     db.entries.push(
       { id: "entry-1", content: "Orphaned memory", tags: '["work"]', source: "api", created_at: 1000, vector_ids: '["entry-1"]', recall_count: 0, importance_score: 0 },
     );
     const getByIdsMock = vi.fn().mockResolvedValue([]);
     env = makeTestEnv(db, { VECTORIZE: makeVectorizeMock({ getByIds: getByIdsMock }) });
 
-    const res = await worker.fetch(req("GET", "/recall?query=memory&tag=work"), env, ctx);
+    const res = await worker.fetch(req("POST", "/recall?query=memory&tag=work"), env, ctx);
     const data = await res.json() as any;
     expect(data.ok).toBe(true);
-    expect(data.results).toEqual([]);
+    expect(data.semantic_unavailable).toBe(true);
+    expect(data.results.map((r: any) => r.id)).toEqual(["entry-1"]);
     expect(getByIdsMock).toHaveBeenCalledWith(["entry-1"]);
   });
 
-  // FIX 2 (final review): a tagged entry with no vector yet used to be
-  // dropped entirely. It now degrades to keyword-only fusion instead —
-  // same as when Vectorize itself is unavailable — so an exact keyword
-  // match still surfaces instead of returning nothing.
-  it("returns a keyword-only match without calling Vectorize's getByIds/query when tagged entries have no vectors", async () => {
+  it("keeps keyword recall available when tagged entries have no vectors", async () => {
     db.entries.push(
       { id: "entry-1", content: "Unvectorized memory", tags: '["work"]', source: "api", created_at: 1000, vector_ids: "[]", recall_count: 0, importance_score: 0 },
     );
@@ -273,11 +351,34 @@ describe("GET /recall", () => {
     const getByIdsMock = vi.fn().mockResolvedValue([]);
     env = makeTestEnv(db, { VECTORIZE: makeVectorizeMock({ query: queryMock, getByIds: getByIdsMock }) });
 
-    const res = await worker.fetch(req("GET", "/recall?query=memory&tag=work"), env, ctx);
+    const res = await worker.fetch(req("POST", "/recall?query=memory&tag=work"), env, ctx);
+    const data = await res.json() as any;
+    expect(data.semantic_unavailable).toBe(true);
+    expect(data.results.map((r: any) => r.id)).toEqual(["entry-1"]);
+    expect(getByIdsMock).not.toHaveBeenCalled();
+    expect(queryMock).not.toHaveBeenCalled();
+  });
+
+  it("uses a parentId metadata query when production getByIds returns empty", async () => {
+    db.entries.push(
+      { id: "entry-1", content: "Semantic-only telescope note", tags: '["work"]', source: "api", created_at: 1000, vector_ids: '["entry-1"]', recall_count: 0, importance_score: 0 },
+    );
+    const getByIdsMock = vi.fn().mockResolvedValue([]);
+    const queryMock = vi.fn().mockResolvedValue({
+      matches: [{ id: "entry-1", score: 0.99, values: SIMILAR_VEC, metadata: { parentId: "entry-1", isUpdate: false } }],
+    });
+    env = makeTestEnv(db, { VECTORIZE: makeVectorizeMock({ query: queryMock, getByIds: getByIdsMock }) });
+
+    const res = await worker.fetch(req("POST", "/recall?query=observatory&tag=work"), env, ctx);
     const data = await res.json() as any;
     expect(data.results.map((r: any) => r.id)).toEqual(["entry-1"]);
-    expect(getByIdsMock).not.toHaveBeenCalled(); // no vector ids to fetch — never called at all
-    expect(queryMock).not.toHaveBeenCalled(); // memberFirst never queries Vectorize directly
+    expect(data.semantic_unavailable).toBe(false);
+    expect(queryMock).toHaveBeenCalledWith(expect.any(Array), {
+      topK: 20,
+      filter: { parentId: { $in: ["entry-1"] } },
+      returnMetadata: "all",
+      returnValues: true,
+    });
   });
 
   it("batches getByIds calls at 20 IDs (Vectorize error 40007 above that)", async () => {
@@ -288,7 +389,7 @@ describe("GET /recall", () => {
     const getByIdsMock = vi.fn().mockResolvedValue([]);
     env = makeTestEnv(db, { VECTORIZE: makeVectorizeMock({ getByIds: getByIdsMock }) });
 
-    await worker.fetch(req("GET", "/recall?query=memory&tag=work"), env, ctx);
+    await worker.fetch(req("POST", "/recall?query=memory&tag=work"), env, ctx);
     expect(getByIdsMock).toHaveBeenCalledTimes(3);
     expect(getByIdsMock.mock.calls[0][0]).toEqual(manyIds.slice(0, 20));
     expect(getByIdsMock.mock.calls[1][0]).toEqual(manyIds.slice(20, 40));
@@ -303,7 +404,7 @@ describe("GET /recall", () => {
     const getByIdsMock = vi.fn().mockResolvedValue([]);
     env = makeTestEnv(db, { VECTORIZE: makeVectorizeMock({ getByIds: getByIdsMock }) });
 
-    await worker.fetch(req("GET", "/recall?query=memory&tag=work"), env, ctx);
+    await worker.fetch(req("POST", "/recall?query=memory&tag=work"), env, ctx);
     expect(getByIdsMock).toHaveBeenCalledTimes(1);
     expect(getByIdsMock.mock.calls[0][0]).toEqual(["shared-vec"]);
   });
@@ -319,7 +420,7 @@ describe("GET /recall", () => {
     );
     env = makeTestEnv(db, { VECTORIZE: makeVectorizeMock({ getByIds: getByIdsMock }) });
 
-    const res = await worker.fetch(req("GET", "/recall?query=memory&tag=work&topK=2"), env, ctx);
+    const res = await worker.fetch(req("POST", "/recall?query=memory&tag=work&topK=2"), env, ctx);
     const data = await res.json() as any;
     expect(data.results).toHaveLength(2);
   });
@@ -334,7 +435,7 @@ describe("GET /recall", () => {
     ]);
     env = makeTestEnv(db, { VECTORIZE: makeVectorizeMock({ getByIds: getByIdsMock }) });
 
-    const res = await worker.fetch(req("GET", "/recall?query=memory&tag=work"), env, ctx);
+    const res = await worker.fetch(req("POST", "/recall?query=memory&tag=work"), env, ctx);
     const data = await res.json() as any;
     expect(data.results).toHaveLength(1);
     expect(data.results[0].id).toBe("entry-1");
@@ -353,7 +454,7 @@ describe("GET /recall", () => {
     env = makeTestEnv(db, { VECTORIZE: makeVectorizeMock({ getByIds: getByIdsMock }) });
     const prepareSpy = vi.spyOn(db, "prepare");
 
-    const res = await worker.fetch(req("GET", "/recall?query=memory&tag=work"), env, ctx);
+    const res = await worker.fetch(req("POST", "/recall?query=memory&tag=work"), env, ctx);
     const data = await res.json() as any;
     expect(data.ok).toBe(true);
     expect(data.results).toHaveLength(5); // default topK
@@ -367,7 +468,7 @@ describe("GET /recall", () => {
       { id: "entry-1", content: "Work meeting notes", tags: '["work"]', source: "api", created_at: 1000, vector_ids: '["entry-1"]', recall_count: 0, importance_score: 0 },
     );
     const aiRun = vi.fn().mockImplementation(async (model: string) => {
-      if (model === "@cf/baai/bge-small-en-v1.5") return { data: [new Array(384).fill(0.1)] };
+      if (model === "@cf/google/embeddinggemma-300m") return { data: [new Array(768).fill(0.1)] };
       return new ReadableStream({
         start(c) {
           c.enqueue(new TextEncoder().encode('data: {"response":"work"}\n\n'));
@@ -383,11 +484,11 @@ describe("GET /recall", () => {
       }),
     });
 
-    const res = await worker.fetch(req("GET", "/recall?query=work+meeting"), env, ctx);
+    const res = await worker.fetch(req("POST", "/recall?query=work+meeting"), env, ctx);
     expect(res.status).toBe(200);
     // "work" is a known tag AND appears as a keyword in the query → LLM not called for inference
     // (embed call uses BGE model; only LLM calls use other models)
-    const llmCalls = aiRun.mock.calls.filter((args: any[]) => args[0] !== "@cf/baai/bge-small-en-v1.5");
+    const llmCalls = aiRun.mock.calls.filter((args: any[]) => args[0] !== "@cf/google/embeddinggemma-300m");
     expect(llmCalls).toHaveLength(0);
   });
 
@@ -404,7 +505,7 @@ describe("GET /recall", () => {
       }),
     });
 
-    const res = await worker.fetch(req("GET", "/recall?query=memory"), env, ctx);
+    const res = await worker.fetch(req("POST", "/recall?query=memory"), env, ctx);
     expect(res.status).toBe(200);
     const data = await res.json() as any;
     expect(data.ok).toBe(true);
@@ -425,7 +526,7 @@ describe("GET /recall", () => {
       }),
     });
 
-    const res = await worker.fetch(req("GET", "/recall?query=memory&kind=episodic"), env, ctx);
+    const res = await worker.fetch(req("POST", "/recall?query=memory&kind=episodic"), env, ctx);
     expect(res.status).toBe(200);
     const data = await res.json() as any;
     expect(data.ok).toBe(true);
@@ -435,10 +536,10 @@ describe("GET /recall", () => {
 
   it("query with no matching keywords makes no LLM call for tag inference", async () => {
     db.entries.push(
-      { id: "entry-1", content: "Office lease renewal", tags: '["work"]', source: "api", created_at: 1000, vector_ids: '["entry-1"]', recall_count: 0, importance_score: 0 },
+      { id: "entry-1", content: "Office lease renewal", tags: '["work"]', source: "api", created_at: 1000, vector_ids: '["entry-1"]', recall_count: 0, importance_score: 0, workspace_id: "", actor_id: "" },
     );
     const aiRun = vi.fn().mockImplementation(async (model: string) => {
-      if (model === "@cf/baai/bge-small-en-v1.5") return { data: [new Array(384).fill(0.1)] };
+      if (model === "@cf/google/embeddinggemma-300m") return { data: [new Array(768).fill(0.1)] };
       return new ReadableStream({
         start(c) {
           c.enqueue(new TextEncoder().encode('data: {"response":"work"}\n\n'));
@@ -455,10 +556,10 @@ describe("GET /recall", () => {
     });
 
     // "quarterly planning" — no hashtags, "work" is not a whole word in this query
-    const res = await worker.fetch(req("GET", "/recall?query=quarterly+planning"), env, ctx);
+    const res = await worker.fetch(req("POST", "/recall?query=quarterly+planning"), env, ctx);
     expect(res.status).toBe(200);
     // only the embedding runs; tag inference costs no AI call
-    const llmCalls = aiRun.mock.calls.filter((args: any[]) => args[0] !== "@cf/baai/bge-small-en-v1.5");
+    const llmCalls = aiRun.mock.calls.filter((args: any[]) => args[0] !== "@cf/google/embeddinggemma-300m");
     expect(llmCalls).toHaveLength(0);
   });
 
@@ -475,16 +576,16 @@ describe("GET /recall", () => {
       }),
     });
 
-    const res = await worker.fetch(req("GET", "/recall?query=fact"), env, ctx);
+    const res = await worker.fetch(req("POST", "/recall?query=fact"), env, ctx);
     expect(res.status).toBe(200);
     const data = await res.json() as any;
     expect(data.results[0].id).toBe("survivor");
     expect(data.results[1].id).toBe("shaky");
   });
 
-  // ── End-to-end: captureEntry WRITES contradiction_wins → recallEntries READS and reranks ──
+  // captureからrecallまで、時間上の置換と通常rerankを確認する。
 
-  it("e2e: captureEntry writes contradiction_wins=1; subsequent recall ranks the winner above a peer with imp=3,wins=0 (real rerank, not seeded)", async () => {
+  it("時間上の置換はcontradiction_winsを増やさず、訂正後の記憶を通常rerankで検索できる", async () => {
     // Phase 1 — CAPTURE: resolve a contradiction through production captureEntry.
     //
     // Seed the non-canonical incumbent "old-fact" that the new entry will beat.
@@ -503,17 +604,7 @@ describe("GET /recall", () => {
       contradiction_losses: 0,
     });
 
-    // Seed an uncontested peer with importance_score=3, contradiction_wins=0.
-    // Rerank math (verified against src/index.ts rerankWithTimeDecay):
-    //   peer:   imp=3, net=0 → effectiveImp=3 → importanceMultiplier = 0.8+(3/5)*0.4 = 1.04
-    //   winner: imp=0 (unclassified), net=+1 (1 win 0 losses)
-    //           → base=3 (unscored-but-contested neutral midpoint)
-    //           → adj = sign(1)*log1p(1)*1.0 = ln(2) ≈ 0.693
-    //           → effectiveImp = 3+0.693 = 3.693
-    //           → importanceMultiplier = 0.8+(3.693/5)*0.4 = 1.0954
-    //   winner importanceMultiplier (1.0954) > peer (1.04), so winner ranks first.
-    //   Tie-breaker guard: peer is placed FIRST in the Vectorize matches array so that
-    //   without the win boost, the peer would be listed first — the win is the sole differentiator.
+    // 時間上の置換では勝敗カウンタを変えない。importance=3のpeerが未分類の新記憶より上位になる。
     db.entries.push({
       id: "peer",
       content: "Uncontested peer fact",
@@ -542,19 +633,14 @@ describe("GET /recall", () => {
     const captureCtx = { waitUntil: (_: Promise<any>) => {} } as any as ExecutionContext;
     const captureResult = await captureEntry("I moved to Seattle", [], "api", captureEnv, captureCtx);
 
-    // Assert production code wrote contradiction_wins=1 on the new entry
     expect(captureResult.status).toBe("contradiction");
     if (captureResult.status !== "contradiction") return;
     const winnerId = captureResult.id;
 
     const winnerRow = db.entries.find(e => e.id === winnerId);
     expect(winnerRow).toBeDefined();
-    expect(winnerRow!.contradiction_wins).toBe(1); // written by production, not seeded
+    expect(winnerRow!.contradiction_wins).toBe(0); // 4.0は過去の事実を誤りとして罰しない
 
-    // Phase 2 — RECALL: the shared db now has winner (wins=1, imp=0) and peer (wins=0, imp=3).
-    // Configure Vectorize to return [peer first, winner second] at equal score 0.9 —
-    // without the win boost the peer would appear first (it's listed first in matches).
-    // The real rerank formula must lift the winner above the peer.
     const recallEnv = makeTestEnv(db, {
       VECTORIZE: makeVectorizeMock({
         query: vi.fn().mockResolvedValue({
@@ -563,14 +649,12 @@ describe("GET /recall", () => {
       }),
     });
 
-    const res = await worker.fetch(req("GET", "/recall?query=where do I live"), recallEnv, ctx);
+    const res = await worker.fetch(req("POST", "/recall?query=where do I live"), recallEnv, ctx);
     expect(res.status).toBe(200);
     const data = await res.json() as any;
     expect(data.ok).toBe(true);
-    // Winner (contradiction_wins=1, imp=0 → effectiveImp≈3.69) must rank above
-    // peer (contradiction_wins=0, imp=3 → effectiveImp=3.0) even though peer was listed first.
-    expect(data.results[0].id).toBe(winnerId);
-    expect(data.results[1].id).toBe("peer");
+    expect(data.results[0].id).toBe("peer");
+    expect(data.results[1].id).toBe(winnerId);
   });
 
   // ── Hybrid recall: keyword fusion surfaces exact-identifier matches ──
@@ -598,7 +682,7 @@ describe("GET /recall", () => {
     env = makeTestEnv(db, { VECTORIZE: makeVectorizeMock({ query: queryMock }) });
     const prepareSpy = vi.spyOn(db, "prepare");
 
-    const res = await worker.fetch(req("GET", "/recall?query=release+v1.9"), env, ctx);
+    const res = await worker.fetch(req("POST", "/recall?query=release+v1.9"), env, ctx);
     const data = await res.json() as any;
 
     // Keyword search ran on this recall — it's always-on, not a fallback
@@ -630,7 +714,7 @@ describe("GET /recall", () => {
     );
     env = makeTestEnv(db, { VECTORIZE: makeVectorizeMock({ getByIds: getByIdsMock }) });
 
-    const res = await worker.fetch(req("GET", "/recall?query=release+v1.9&tag=rel"), env, ctx);
+    const res = await worker.fetch(req("POST", "/recall?query=release+v1.9&tag=rel"), env, ctx);
     const data = await res.json() as any;
     expect(data.results[0].id).toBe("v19");
   });
@@ -648,7 +732,7 @@ describe("GET /recall — missing Vectorize index", () => {
     });
     const ctx = { waitUntil: (_: Promise<any>) => {} } as any;
 
-    const res = await worker.fetch(req("GET", "/recall?query=pricing"), env, ctx);
+    const res = await worker.fetch(req("POST", "/recall?query=pricing"), env, ctx);
     expect(res.status).toBe(200);
     const data = await res.json() as any;
     expect(data.ok).toBe(true);
@@ -666,7 +750,7 @@ describe("GET /recall — missing Vectorize index", () => {
       VECTORIZE: makeVectorizeMock({ getByIds: vi.fn().mockRejectedValue(new Error("index not found")) }),
     });
     const ctx = { waitUntil: (_: Promise<any>) => {} } as any;
-    const res = await worker.fetch(req("GET", "/recall?query=pricing&tag=finance"), env, ctx);
+    const res = await worker.fetch(req("POST", "/recall?query=pricing&tag=finance"), env, ctx);
     expect(res.status).toBe(200);
     const data = await res.json() as any;
     expect(data.ok).toBe(true);
@@ -685,7 +769,7 @@ describe("GET /recall — missing Vectorize index", () => {
       .mockRejectedValueOnce(new Error("widen failed"));
     const env = makeTestEnv(db, { VECTORIZE: makeVectorizeMock({ query }) });
     const ctx = { waitUntil: (_: Promise<any>) => {} } as any;
-    const res = await worker.fetch(req("GET", "/recall?query=widen"), env, ctx);
+    const res = await worker.fetch(req("POST", "/recall?query=widen"), env, ctx);
     expect(res.status).toBe(200);
     const data = await res.json() as any;
     expect(data.semantic_unavailable).toBe(false);
@@ -708,9 +792,7 @@ describe("GET /recall — auto-pattern exclusion, against real SQLite", () => {
     return {
       prepare: (sql: string) => s.db.prepare(sql),
       exec: (sql: string) => s.db.exec(sql),
-      // ensureTenantBootstrap batches its provisioning statements; the facade
-      // underneath already implements this, the narrow wrapper just has to pass it.
-      batch: (stmts: never[]) => s.db.batch(stmts),
+      batch: (statements: any[]) => s.db.batch(statements),
     };
   }
 
@@ -747,7 +829,7 @@ describe("GET /recall — auto-pattern exclusion, against real SQLite", () => {
     });
     const ctx = { waitUntil: (_: Promise<any>) => {} } as any;
 
-    const res = await worker.fetch(req("GET", "/recall?query=pricing"), env, ctx);
+    const res = await worker.fetch(req("POST", "/recall", { body: { query: "pricing" } }), env, ctx);
     expect(res.status).toBe(200);
     const data = await res.json() as any;
     expect(data.results.map((r: any) => r.id)).toEqual(["normal"]);

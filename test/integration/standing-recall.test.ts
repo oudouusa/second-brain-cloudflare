@@ -24,7 +24,7 @@ import worker from "../../src/index";
 import { resetDatabaseInit, initializeDatabase } from "../../src/db/init";
 import { ensureTenantBootstrap } from "../../src/lib/tenancy";
 
-const DIM = 384;
+const DIM = 128;
 const pad = (xy: number[]): number[] => [...xy, ...new Array(DIM - xy.length).fill(0)];
 const ON_TOPIC = pad([1, 0]);
 
@@ -33,20 +33,13 @@ const ON_TOPIC = pad([1, 0]);
 // only whether the standing text embeds close to (or, unused here, far from) the cached items.
 function aiFor(vector: number[] = ON_TOPIC) {
   const run = vi.fn(async (model: string, input?: { text?: string | string[] }) => {
-    if (typeof model === "string" && model.startsWith("@cf/baai/bge")) {
+    if (typeof model === "string" && model === DEFAULTS.EMBEDDING_MODEL) {
       const texts = Array.isArray(input?.text) ? input!.text : [input?.text as string];
-      return { data: texts.map(() => vector) };
+      return { data: texts.map(() => [...vector, ...new Array(768 - vector.length).fill(0)]) };
     }
     throw new Error(`unexpected AI.run model in standing-recall test: ${model}`);
   });
   return { ai: { run } as unknown as Ai, run };
-}
-
-function withValidityColumns(sqlite: SqliteD1): SqliteD1 {
-  sqlite.db.prepare(`ALTER TABLE entries ADD COLUMN updated_at INTEGER`).run();
-  sqlite.db.prepare(`ALTER TABLE entries ADD COLUMN valid_from INTEGER`).run();
-  sqlite.db.prepare(`ALTER TABLE entries ADD COLUMN valid_until INTEGER`).run();
-  return sqlite;
 }
 
 function insertEntry(sqlite: SqliteD1, opts: {
@@ -82,19 +75,19 @@ afterEach(() => open.splice(0).forEach(s => s.close()));
 
 /** By default finds nothing on its own: no seeded root, an empty Vectorize index, no keyword hit. */
 async function setup(opts: { ai?: Ai; denseMatches?: { id: string; score: number; created_at: number }[] } = {}) {
-  const sqlite = withValidityColumns(makeSqliteD1());
+  const sqlite = makeSqliteD1();
   open.push(sqlite);
   const kv = makeMemoryKV();
   await kv.put(TAG_VOCABULARY_KEY, JSON.stringify({ tags: [], rebuiltAt: Date.now() }));
   const matches = (opts.denseMatches ?? []).map(m => ({ id: m.id, score: m.score, metadata: { parentId: m.id, created_at: m.created_at } }));
-  const env: Env = makeTestEnv(undefined, {
+  const env: Env = sqlite.admitEnv(makeTestEnv(undefined, {
     DB: sqlite.db as unknown as D1Database,
     OAUTH_KV: kv,
     VECTORIZE: makeVectorizeMock({ query: vi.fn().mockResolvedValue({ matches }) }),
     ...(opts.ai ? { AI: opts.ai } : {}),
-  });
+  }));
   const ctx = { waitUntil: (_: Promise<unknown>) => {} } as ExecutionContext;
-  return { env, ctx, sqlite, kv };
+  return { env: sqlite.admitEnv(env), ctx, sqlite, kv };
 }
 
 describe("standing fires in recall", () => {
@@ -228,8 +221,8 @@ describe("GET /standing", () => {
   beforeEach(async () => {
     resetDatabaseInit();
     resetStandingIsolateState();
-    sqlite = withValidityColumns(makeSqliteD1());
-    env = makeTestEnv(undefined, { DB: sqlite.db as unknown as D1Database, OAUTH_KV: makeMemoryKV(), AUTH_TOKEN: "owner-token" });
+    sqlite = makeSqliteD1();
+    env = sqlite.admitEnv(makeTestEnv(undefined, { DB: sqlite.db as unknown as D1Database, OAUTH_KV: makeMemoryKV(), AUTH_TOKEN: "owner-token" }));
     await initializeDatabase(env);
     await ensureTenantBootstrap(env);
     token = "owner-token";

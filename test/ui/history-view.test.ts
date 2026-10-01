@@ -408,8 +408,10 @@ describe("renderHistory — footers", () => {
 
 describe("renderHistory — Show all", () => {
   it("fetches /entry/version once and toggles", async () => {
-    const fetchImpl = vi.fn(async (url: string) => {
-      expect(url).toContain("/entry/version?id=e1&seq=6");
+    const fetchImpl = vi.fn(async (url: string, init: any) => {
+      expect(url).toMatch(/\/entry\/version$/);
+      expect(init.method).toBe("POST");
+      expect(JSON.parse(init.body)).toEqual({ id: "e1", seq: 6 });
       return { json: async () => ({ ok: true, id: "e1", seq: 6, content: "The full text before change 6, much longer than the preview." }) };
     });
     const ctx = load(fetchImpl);
@@ -437,7 +439,7 @@ describe("renderHistory — Undo and Restore actions", () => {
         expect(JSON.parse(init.body)).toEqual({ id: "e1" });
         return { ok: true, status: 200, json: async () => ({ ok: true, id: "e1", status: "reverted" }) };
       }
-      if (url.includes("/entry?id=")) {
+      if (url.endsWith("/entry")) {
         return { ok: true, json: async () => ({ ok: true, entry: { id: "e1", history: { items: [] } } }) };
       }
       throw new Error("unexpected url " + url);
@@ -448,7 +450,7 @@ describe("renderHistory — Undo and Restore actions", () => {
     const undoBtn = liStubs[0].querySelector('[data-action="undo"]');
     await undoBtn.onclick();
     expect(ctx.__calls.some((c: any) => c.url.includes("/undo"))).toBe(true);
-    expect(ctx.__calls.some((c: any) => c.url.includes("/entry?id=e1"))).toBe(true);
+    expect(ctx.__calls.some((c: any) => c.url.endsWith("/entry") && c.init.method === "POST" && JSON.parse(c.init.body).id === "e1")).toBe(true);
   });
 
   it("Restore opens a primary confirm with the date and posts to_version", async () => {
@@ -457,7 +459,7 @@ describe("renderHistory — Undo and Restore actions", () => {
         expect(JSON.parse(init.body)).toEqual({ id: "e1", to_version: 6 });
         return { ok: true, status: 200, json: async () => ({ ok: true, id: "e1", status: "restored" }) };
       }
-      if (url.includes("/entry?id=")) {
+      if (url.endsWith("/entry")) {
         return { ok: true, json: async () => ({ ok: true, entry: { id: "e1", history: { items: [] } } }) };
       }
       throw new Error("unexpected url " + url);

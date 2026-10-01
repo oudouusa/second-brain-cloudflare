@@ -94,7 +94,7 @@ beforeEach(async () => {
   mkdirSync(project);
   resetDatabaseInit();
   sqlite = makeSqliteD1();
-  env = makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV() });
+  env = sqlite.admitEnv(makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV() }));
   await initializeDatabase(env);
   await ensureTenantBootstrap(env);
 });
@@ -105,7 +105,7 @@ function baseEnv(extraEnv: Record<string, string>) {
     PATH: process.env.PATH,
     HOME: scratch, XDG_CACHE_HOME: join(scratch, "cache"),
     SECOND_BRAIN_URL: origin, SECOND_BRAIN_TOKEN: "test-token",
-    ...extraEnv,
+    ...extraEnv, WRITE_ADMISSION_TOKEN: extraEnv.WRITE_ADMISSION_TOKEN,
   } as unknown as NodeJS.ProcessEnv; // wrangler's types make AUTH_TOKEN required; the hook must not inherit it
 }
 
@@ -167,7 +167,7 @@ function transcriptFor(sessionId: string) {
 const workerPayload = (sessionId = "cx1") => ({ sessionId, cwd: project, transcriptPath: transcriptFor(sessionId), reason: "close" });
 
 describe("session-start.js", () => {
-  it("makes a recall request GET /recall accepts, and prints the exact hookSpecificOutput.additionalContext shape", async () => {
+  it("POST /recallで受理されるJSONを送り, and prints the exact hookSpecificOutput.additionalContext shape", async () => {
     const r = await runStart(startPayload());
     expect(r.code, r.stderr).toBe(0);
 
@@ -181,11 +181,11 @@ describe("session-start.js", () => {
     expect(parsed.hookSpecificOutput.additionalContext).toContain("a remembered thing");
     expect(parsed.hookSpecificOutput.additionalContext.trimStart().startsWith("{")).toBe(false);
 
-    const recalls = captured.filter(c => c.url.startsWith("/recall?"));
+    const recalls = captured.filter(c => c.method === "POST" && c.url === "/recall");
     expect(recalls.length).toBeGreaterThanOrEqual(1);
     // The project arm 404s until the project's first capture registers it,
     // so seed one capture with the same project before replaying.
-    const slug = new URL(`http://x${recalls[0].url}`).searchParams.get("project");
+    const slug = JSON.parse(recalls[0].body).project;
     expect(slug).toBeTruthy();
     const seed = await worker.fetch(
       new Request("http://localhost/capture", {

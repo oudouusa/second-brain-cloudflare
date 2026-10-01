@@ -1,0 +1,88 @@
+[
+  {
+    "case": "migration-deferred-ja",
+    "repeat": 1,
+    "checks_after_review": {
+      "japanese_present": true,
+      "unsupported_years": [],
+      "nonempty": true,
+      "citations_in_range": true,
+      "required_citations_present": true,
+      "unexpected_letters": []
+    },
+    "manual_verdict": "主要結論と根拠は適合",
+    "note": "延期・未定の結論、必要な引用、日本語を確認。"
+  },
+  {
+    "case": "unknown-release-ja",
+    "repeat": 1,
+    "checks_after_review": {
+      "japanese_present": true,
+      "unsupported_years": [],
+      "nonempty": true,
+      "citations_in_range": true,
+      "required_citations_present": true,
+      "unexpected_letters": []
+    },
+    "manual_verdict": "主要結論と根拠は適合",
+    "note": "延期・未定の結論、必要な引用、日本語を確認。"
+  },
+  {
+    "case": "migration-deferred-ja",
+    "repeat": 2,
+    "checks_after_review": {
+      "japanese_present": true,
+      "unsupported_years": [],
+      "nonempty": true,
+      "citations_in_range": true,
+      "required_citations_present": true,
+      "unexpected_letters": []
+    },
+    "manual_verdict": "主要結論と根拠は適合",
+    "note": "延期・未定の結論、必要な引用、日本語を確認。"
+  },
+  {
+    "case": "unknown-release-ja",
+    "repeat": 2,
+    "checks_after_review": {
+      "japanese_present": true,
+      "unsupported_years": [
+        "2025"
+      ],
+      "nonempty": true,
+      "citations_in_range": true,
+      "required_citations_present": true,
+      "unexpected_letters": []
+    },
+    "manual_verdict": "要修正",
+    "note": "資料にない2025年を補完。公開未定という主要結論は正しい。"
+  },
+  {
+    "case": "migration-deferred-ja",
+    "repeat": 3,
+    "checks_after_review": {
+      "japanese_present": true,
+      "unsupported_years": [],
+      "nonempty": true,
+      "citations_in_range": true,
+      "required_citations_present": true,
+      "unexpected_letters": []
+    },
+    "manual_verdict": "主要結論と根拠は適合",
+    "note": "延期・未定の結論、必要な引用、日本語を確認。"
+  },
+  {
+    "case": "unknown-release-ja",
+    "repeat": 3,
+    "checks_after_review": {
+      "japanese_present": true,
+      "unsupported_years": [],
+      "nonempty": true,
+      "citations_in_range": true,
+      "required_citations_present": true,
+      "unexpected_letters": []
+    },
+    "manual_verdict": "主要結論と根拠は適合",
+    "note": "延期・未定の結論、必要な引用、日本語を確認。"
+  }
+]

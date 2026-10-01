@@ -10,7 +10,7 @@ import type { Env } from "../env";
  * second-brain-vectors-768) this constant silently goes stale. Never treat it as
  * the identity of the live index.
  */
-export const FALLBACK_VECTORIZE_INDEX_NAME = "second-brain-vectors";
+export const FALLBACK_VECTORIZE_INDEX_NAME = "second-brain-cf-eg128-v1";
 
 export interface VectorizeHealth {
   ok: boolean;

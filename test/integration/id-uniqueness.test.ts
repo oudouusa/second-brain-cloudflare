@@ -110,13 +110,15 @@ describe("structural: every insert into entries or entries_trash keeps ids uniqu
   });
 
   // A fresh random id: the file mints it with crypto.randomUUID() for exactly this insert.
-  const FRESH = new Set(["capture/entry.ts", "integrations/mirror.ts", "memory/undo.ts"]);
+  const FRESH = new Set(["capture/entry.ts", "integrations/mirror.ts", "memory/history.ts", "memory/undo.ts"]);
 
   it("finds the reviewed insert sites and no others", () => {
     expect(sites.map((s) => `${s.file}:${s.table}`).sort()).toEqual([
       "capture/entry.ts:entries",
       "entries/import.ts:entries",
       "integrations/mirror.ts:entries",
+      "memory/history.ts:entries",
+      "memory/rollover.ts:entries",
       "memory/trash.ts:entries",
       "memory/trash.ts:entries_trash",
       "memory/undo.ts:entries",
@@ -131,6 +133,11 @@ describe("structural: every insert into entries or entries_trash keeps ids uniqu
     for (const s of sites) {
       if (FRESH.has(s.file)) {
         expect(s.src, s.file).toMatch(/crypto\.randomUUID\(\)/);
+      } else if (s.file === "memory/rollover.ts") {
+        expect(s.src).toContain("async function rolloverEntryId(operationId: string)");
+        expect(s.sql).toMatch(/NOT EXISTS \(SELECT 1 FROM entries_trash/);
+        // live衝突は通常INSERTのPRIMARY KEYがbatchを中断する。trashは同SQLで照合する。
+        expect(s.sql).toMatch(/^INSERT INTO entries/);
       } else if (s.file === "entries/import.ts") {
         expect(s.sql).toMatch(/NOT EXISTS \(SELECT 1 FROM entries /);
         expect(s.sql).toMatch(/NOT EXISTS \(SELECT 1 FROM entries_trash /);

@@ -199,7 +199,7 @@ describe("the eight captured samples", () => {
       const env = makeTestEnv(makeTestDb(), {
         AI: makeAI(`{"insight": true, "shape": "connection", "text": ${JSON.stringify(SAMPLE_1)}}`),
       });
-      expect(await reasonOverPair(a, b, env)).toEqual({ outcome: "declined" });
+      expect(await reasonOverPair(a, b, env)).toEqual({ outcome: "invalid", reason: "restatement" });
     });
   });
 
@@ -228,7 +228,7 @@ describe("the eight captured samples", () => {
       const env = makeTestEnv(makeTestDb(), {
         AI: makeAI(`{"insight": true, "shape": "throughline", "text": ${JSON.stringify(SAMPLE_5)}}`),
       });
-      expect(await reasonOverPair(a, b, env)).toEqual({ outcome: "declined" });
+      expect(await reasonOverPair(a, b, env)).toEqual({ outcome: "invalid", reason: "language" });
     });
   });
 
@@ -255,17 +255,13 @@ describe("the eight captured samples", () => {
       expect(sharesVocabulary(SAMPLE_6, a, b)).toBe(true);
     });
 
-    it("survives the full floor end to end through reasonOverPair — a known, reported gap", async () => {
+    it("旧形式の英語応答は言語検証で見送る。意味の品質問題そのものを解消した証明ではない", async () => {
       const a = { content: "GitHub discussion: opened an issue asking whether D1 can be joined with Vectorize results in a single query, or whether the app has to fetch vector matches first and then hit D1 separately for each row. Got a reply confirming there is no native join, so every retrieval does two round trips." };
       const b = { content: "Posted on Reddit asking how others handle D1 latency when paired with Vectorize for a RAG-style app, getting inconsistent read replication delay after writes, where D1 returns stale rows right after a Vectorize-triggered insert until the replica catches up." };
       const env = makeTestEnv(makeTestDb(), {
         AI: makeAI(`{"insight": true, "shape": "connection", "text": ${JSON.stringify(SAMPLE_6)}}`),
       });
-      expect(await reasonOverPair(a, b, env)).toEqual({
-        outcome: "insight",
-        shape: "connection",
-        text: SAMPLE_6,
-      });
+      expect(await reasonOverPair(a, b, env)).toEqual({ outcome: "invalid", reason: "language" });
     });
   });
 
@@ -288,12 +284,12 @@ describe("the eight captured samples", () => {
       const a = { content: "Been turning over why AI chat memory feels wrong: it's a recency bias problem, everything treated as equally salient no matter how old, and it conflates episodic memory, what actually happened, with semantic memory, general facts, into one undifferentiated blob." };
       const b = { content: "Started building second-brain-cloudflare: entries get weighted by time instead of always surfacing whatever was said most recently, and the store keeps separate lanes so old and new information doesn't collapse into one bucket." };
       const env = makeTestEnv(makeTestDb(), {
-        AI: makeAI(`{"insight": true, "shape": "throughline", "text": ${JSON.stringify(SAMPLE_7)}}`),
+        AI: makeAI(JSON.stringify({insight:true, shape:"throughline", text:"情報の新しさに偏ることへの懸念を、時間による重み付けと記憶の種類を分ける設計へ反映しています。", evidence:{a:"a recency bias problem",b:"entries get weighted by time"}})),
       });
       expect(await reasonOverPair(a, b, env)).toEqual({
         outcome: "insight",
         shape: "throughline",
-        text: SAMPLE_7,
+        text: "情報の新しさに偏ることへの懸念を、時間による重み付けと記憶の種類を分ける設計へ反映しています。",
       });
     });
   });
@@ -332,13 +328,13 @@ describe("reasonOverPair()", () => {
 
   it("returns the insight when it names something from both entries", async () => {
     const env = makeTestEnv(makeTestDb(), {
-      AI: makeAI(`{"insight": true, "shape": "contradiction", "text": "You chose flat pricing for the first tier, then switched to usage-based pricing."}`),
+      AI: makeAI(JSON.stringify({insight:true,shape:"contradiction",text:'当初は固定料金を採用する方針でしたが、収益を取りこぼしていたため、従量制の料金へ切り替える判断に変更しています。',evidence:{a:"first tier of the product",b:"usage-based pricing"}})),
     });
     const out = await reasonOverPair(a, b, env);
     expect(out).toEqual({
       outcome: "insight",
       shape: "contradiction",
-      text: "You chose flat pricing for the first tier, then switched to usage-based pricing.",
+      text: '当初は固定料金を採用する方針でしたが、収益を取りこぼしていたため、従量制の料金へ切り替える判断に変更しています。',
     });
   });
 
@@ -346,21 +342,20 @@ describe("reasonOverPair()", () => {
     const env = makeTestEnv(makeTestDb(), {
       AI: makeAI(`{"insight": true, "shape": "throughline", "text": "You often talk about building a second brain and thinking about things."}`),
     });
-    expect(await reasonOverPair(a, b, env)).toEqual({ outcome: "declined" });
+    expect(await reasonOverPair(a, b, env)).toEqual({ outcome: "invalid", reason: "language" });
   });
 
   it("declines text that blows past the 600 character ceiling, with the same outcome as any other quality-floor failure", async () => {
     // A model that ignored "one or two sentences" and wrote paragraphs
     // instead. The dashboard renders `text` in full with no clipping (see
     // the comment on MAX_INSIGHT_TEXT_CHARS in src/insight/reason.ts), so
-    // this has to be a settled "declined" — same as the other floor
-    // failures — not a "failed" left pending for retry.
+    // 検証失敗として版ごとの限定再試行に渡す。モデル自身の拒否とは区別する。
     const longText = "You chose flat pricing for the first tier, then switched to usage-based pricing. ".repeat(10);
     expect(longText.length).toBeGreaterThan(600);
     const env = makeTestEnv(makeTestDb(), {
       AI: makeAI(`{"insight": true, "shape": "contradiction", "text": ${JSON.stringify(longText)}}`),
     });
-    expect(await reasonOverPair(a, b, env)).toEqual({ outcome: "declined" });
+    expect(await reasonOverPair(a, b, env)).toEqual({ outcome: "invalid", reason: "format" });
   });
 
   it("declines an explicit refusal", async () => {

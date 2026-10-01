@@ -30,7 +30,7 @@ it("every trash mutation is conditional on the exact row it read or the workspac
     const ownerRead = (await getTrashedEntry(t.env, owner, "id-restore"))!;
 
     // Interleaving: the owner's trash row expires and is purged; Bob captures and forgets the same id.
-    await t.env.DB.prepare("DELETE FROM entries_trash WHERE id = ?").bind("id-restore").run();
+    await t.sqlite.deleteFixtureRows("DELETE FROM entries_trash WHERE id = ?", "id-restore");
     t.seed("id-restore", { content: "Bob's private memory", actor_id: bob.userId, workspace_id: bob.personalWorkspaceId });
     await forget("id-restore", bob.userId, bob.personalWorkspaceId);
 
@@ -49,7 +49,7 @@ it("every trash mutation is conditional on the exact row it read or the workspac
     await forget("id-delete", owner.userId, owner.personalWorkspaceId);
     const ownerRead = (await getTrashedEntry(t.env, owner, "id-delete"))!;
 
-    await t.env.DB.prepare("DELETE FROM entries_trash WHERE id = ?").bind("id-delete").run();
+    await t.sqlite.deleteFixtureRows("DELETE FROM entries_trash WHERE id = ?", "id-delete");
     t.seed("id-delete", { content: "Bob's private memory", actor_id: bob.userId, workspace_id: bob.personalWorkspaceId });
     await forget("id-delete", bob.userId, bob.personalWorkspaceId);
 
@@ -64,8 +64,8 @@ it("every trash mutation is conditional on the exact row it read or the workspac
   {
     const { member: bob } = await createMember(t.env, { name: "Bob-purge" });
     await t.sqlite.db.exec(
-      `INSERT INTO entries_trash (id, workspace_id, actor_id, content, row_json, edges_json, vector_ids, deleted_at, deleted_by, channel, reason)
-       VALUES ('id-purge', '${t.roots.ownerPersonalWorkspaceId}', '', 'c', '{"created_at":1}', '[]', '[]', 1, '', 'rest', 'forget')`,
+      `INSERT INTO entries_trash (id, workspace_id, actor_id, content, row_json, edges_json, vector_ids, deleted_at, deleted_by, channel, reason, write_marker)
+       VALUES ('id-purge', '${t.roots.ownerPersonalWorkspaceId}', '', 'c', '{"created_at":1}', '[]', '[]', 1, '', 'rest', 'forget', '${t.sqlite.fixtureMarker()}')`,
     );
 
     const realBatch = t.env.DB.batch.bind(t.env.DB);
@@ -73,7 +73,7 @@ it("every trash mutation is conditional on the exact row it read or the workspac
     (t.env.DB as unknown as { batch: typeof realBatch }).batch = async (stmts) => {
       if (!swapped) {
         swapped = true;
-        await t.env.DB.prepare("DELETE FROM entries_trash WHERE id = ?").bind("id-purge").run();
+        await t.sqlite.deleteFixtureRows("DELETE FROM entries_trash WHERE id = ?", "id-purge");
         t.seed("id-purge", { content: "Bob's fresh memory", actor_id: bob.userId, workspace_id: bob.personalWorkspaceId });
         await forget("id-purge", bob.userId, bob.personalWorkspaceId);
       }
@@ -149,7 +149,7 @@ it("every trash mutation resists a same-millisecond, rowid-reusing row swap, not
       const ownerRead = (await getTrashedEntry(env.env, owner, "x"))!;
       const ownerRowid = (await env.one<{ rowid: number }>("SELECT rowid FROM entries_trash WHERE id = ?", "x"))!.rowid;
 
-      await env.env.DB.prepare("DELETE FROM entries_trash WHERE id = ?").bind("x").run();
+      await env.sqlite.deleteFixtureRows("DELETE FROM entries_trash WHERE id = ?", "x");
       env.seed("x", { content: "Bob's memory", actor_id: bob.userId, workspace_id: bob.personalWorkspaceId });
       await forgetEntry("x", env.env, { actorId: bob.userId, channel: "rest" }, { reason: "forget", config: DEFAULTS, purge: false }, bob.personalWorkspaceId);
       const bobTrash = (await env.one<{ rowid: number; deleted_at: number }>("SELECT rowid, deleted_at FROM entries_trash WHERE id = ?", "x"))!;
@@ -177,7 +177,7 @@ it("every trash mutation resists a same-millisecond, rowid-reusing row swap, not
       const ownerRead = (await getTrashedEntry(env.env, owner, "x"))!;
       const ownerRowid = (await env.one<{ rowid: number }>("SELECT rowid FROM entries_trash WHERE id = ?", "x"))!.rowid;
 
-      await env.env.DB.prepare("DELETE FROM entries_trash WHERE id = ?").bind("x").run();
+      await env.sqlite.deleteFixtureRows("DELETE FROM entries_trash WHERE id = ?", "x");
       env.seed("x", { content: "Bob's memory", actor_id: bob.userId, workspace_id: bob.personalWorkspaceId });
       await forgetEntry("x", env.env, { actorId: bob.userId, channel: "rest" }, { reason: "forget", config: DEFAULTS, purge: false }, bob.personalWorkspaceId);
       const bobRowid = (await env.one<{ rowid: number }>("SELECT rowid FROM entries_trash WHERE id = ?", "x"))!.rowid;
@@ -199,8 +199,8 @@ it("every trash mutation resists a same-millisecond, rowid-reusing row swap, not
       vi.spyOn(Date, "now").mockReturnValue(FROZEN);
       const { member: bob } = await createMember(env.env, { name: "Bob" });
       await env.sqlite.db.exec(
-        `INSERT INTO entries_trash (id, workspace_id, actor_id, content, row_json, edges_json, vector_ids, deleted_at, deleted_by, channel, reason, nonce)
-         VALUES ('x', '${env.roots.ownerPersonalWorkspaceId}', '', 'c', '{"created_at":1}', '[]', '[]', 1, '', 'rest', 'forget', lower(hex(randomblob(16))))`,
+        `INSERT INTO entries_trash (id, workspace_id, actor_id, content, row_json, edges_json, vector_ids, deleted_at, deleted_by, channel, reason, nonce, write_marker)
+         VALUES ('x', '${env.roots.ownerPersonalWorkspaceId}', '', 'c', '{"created_at":1}', '[]', '[]', 1, '', 'rest', 'forget', lower(hex(randomblob(16))), '${env.sqlite.fixtureMarker()}')`,
       );
       const ownerRowid = (await env.one<{ rowid: number }>("SELECT rowid FROM entries_trash WHERE id = ?", "x"))!.rowid;
 
@@ -209,7 +209,7 @@ it("every trash mutation resists a same-millisecond, rowid-reusing row swap, not
       (env.env.DB as unknown as { batch: typeof realBatch }).batch = async (stmts) => {
         if (!swapped) {
           swapped = true;
-          await env.env.DB.prepare("DELETE FROM entries_trash WHERE id = ?").bind("x").run();
+          await env.sqlite.deleteFixtureRows("DELETE FROM entries_trash WHERE id = ?", "x");
           env.seed("x", { content: "Bob's fresh memory", actor_id: bob.userId, workspace_id: bob.personalWorkspaceId });
           await forgetEntry("x", env.env, { actorId: bob.userId, channel: "rest" }, { reason: "forget", config: DEFAULTS, purge: false }, bob.personalWorkspaceId);
         }
@@ -248,7 +248,7 @@ it("every trash mutation resists a same-millisecond, rowid-reusing row swap, not
       env.seed("bob-row", { content: "bob's own", workspace_id: bob.personalWorkspaceId, actor_id: bob.userId });
       await forgetEntry("bob-row", env.env, { actorId: bob.userId, channel: "rest" }, { reason: "forget", config: DEFAULTS, purge: false }, bob.personalWorkspaceId);
       const bobRowidBefore = (await env.one<{ rowid: number }>("SELECT rowid FROM entries_trash WHERE id = ?", "bob-row"))!.rowid;
-      await env.env.DB.prepare("DELETE FROM entries_trash WHERE id = ?").bind("bob-row").run();
+      await env.sqlite.deleteFixtureRows("DELETE FROM entries_trash WHERE id = ?", "bob-row");
       env.seed("bob-row", { content: "bob's own, again", workspace_id: bob.personalWorkspaceId, actor_id: bob.userId });
       await forgetEntry("bob-row", env.env, { actorId: bob.userId, channel: "rest" }, { reason: "forget", config: DEFAULTS, purge: false }, bob.personalWorkspaceId);
       const bobRowid = (await env.one<{ rowid: number }>("SELECT rowid FROM entries_trash WHERE id = ?", "bob-row"))!.rowid;

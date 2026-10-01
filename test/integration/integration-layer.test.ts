@@ -24,8 +24,8 @@ import { makeTestEnv, makeMemoryKV } from "../helpers/make-env";
 import { resetDatabaseInit, initializeDatabase } from "../../src/db/init";
 import { ensureTenantBootstrap } from "../../src/lib/tenancy";
 import { createMember } from "../../src/lib/team-admin";
-import { loadIntegration } from "../../src/integrations";
-import { mirrorWriteContext } from "../../src/integrations/mirror";
+import { acquireIntegrationOperation, releaseIntegrationOperation, loadIntegration, getProvider } from "../../src/integrations";
+import { INTEGRATION_SYNC_CRON, mirrorWriteContext } from "../../src/integrations/mirror";
 import type { Env } from "../../src/env";
 
 const ctx = { waitUntil: (_: Promise<any>) => {} } as unknown as ExecutionContext;
@@ -105,6 +105,40 @@ afterEach(() => {
 });
 
 describe("POST /integrations/notion/layer", () => {
+  it.each(["connect", "sync", "layer", "move", "disconnect"])("同期中は%sを拒否し、保存先と既存のleaseを保持する", async (action) => {
+    await call("POST", "/integrations/notion/connect", ADMIN, { token: "admin-notion-token" });
+    const admitted = sqlite.admitEnv(env);
+    const operation = await acquireIntegrationOperation(admitted, "notion", "sync");
+    try {
+      const response = await call("POST", `/integrations/notion/${action}`, ADMIN, { token: "admin-notion-token", workspace: "company" });
+      expect(response.status).toBe(409);
+      expect((await loadIntegration(env, "notion"))?.config?.mirrorWorkspace).toBe("personal");
+      expect(await env.DB.prepare("SELECT lease_owner FROM integration_provider_generation WHERE provider = ?")
+        .bind("notion").first()).toEqual({ lease_owner: operation.owner });
+    } finally {
+      await releaseIntegrationOperation(admitted, operation);
+    }
+    expect((await call("POST", `/integrations/notion/${action}`, ADMIN, { token: "admin-notion-token", workspace: "company" })).status).toBe(200);
+  });
+
+  it.each([
+    ["connect", 400], ["sync", 404], ["layer", 404], ["move", 404], ["disconnect", 404],
+  ] as const)("%sが途中終了してもleaseを解放する", async (action, status) => {
+    expect((await call("POST", `/integrations/notion/${action}`, ADMIN, {})).status).toBe(status);
+    expect((await call("POST", "/integrations/notion/connect", ADMIN, { token: "admin-notion-token" })).status).toBe(200);
+  });
+
+  it("同期の例外後もleaseを解放して再試行できる", async () => {
+    await call("POST", "/integrations/notion/connect", ADMIN, { token: "admin-notion-token" });
+    const sync = vi.spyOn(getProvider("notion")!, "sync").mockRejectedValueOnce(new Error("同期の試験用障害"));
+    try {
+      expect((await call("POST", "/integrations/notion/sync", ADMIN)).status).toBe(500);
+    } finally {
+      sync.mockRestore();
+    }
+    expect((await call("POST", "/integrations/notion/sync", ADMIN)).status).toBe(200);
+  });
+
   it("an admin switches a connected integration from personal to company, and nothing else in the record moves", async () => {
     await call("POST", "/integrations/notion/connect", ADMIN, { token: "admin-notion-token" });
     // Give the record some state a naive whole-object rebuild would drop.
@@ -146,7 +180,7 @@ describe("POST /integrations/notion/layer", () => {
     let armed = true;
     (kv as any).get = async (key: string) => {
       const value = await realGet(key);
-      if (armed && key === "integrations:notion") {
+      if (armed && key.startsWith("integrations:notion:") && value !== null) {
         armed = false;
         const rec = JSON.parse(value as string);
         rec.config.landedMidRoute = "kept";
@@ -172,7 +206,7 @@ describe("POST /integrations/notion/layer", () => {
     let armed = true;
     (kv as any).get = async (key: string) => {
       const value = await realGet(key);
-      if (armed && key === "integrations:notion") { armed = false; await kv.delete(key); }
+      if (armed && key.startsWith("integrations:notion:") && value !== null) { armed = false; await kv.delete(key); }
       return value;
     };
 
@@ -180,7 +214,7 @@ describe("POST /integrations/notion/layer", () => {
 
     expect(res.status).toBe(404);
     expect(await res.json()).toEqual({ ok: false, error: "Notion is not connected" });
-    expect(await kv.get("integrations:notion")).toBeNull(); // nothing resurrected
+    expect(await loadIntegration(env, "notion")).toBeNull(); // 再作成されない
   });
 
   it("a member cannot change the layer", async () => {
@@ -254,7 +288,7 @@ describe("POST /integrations/notion/layer", () => {
     expect((await loadIntegration(env, "notion"))!.config.mirrorWorkspace).toBe("personal");
   });
 
-  it("after a change to company, mirrorWriteContext resolves to the company workspace and a mirrored write actually lands there", async () => {
+  it.each(["HTTP", "定期"])("保存先切替後の%s同期がcompanyへ保存する", async (mode) => {
     stubNotion(["admin-notion-token"], [notionPage("p1", "Project Plan", "2026-01-01T00:00:00.000Z")], {
       p1: [paragraph("Ship the beta in March")],
     });
@@ -266,10 +300,17 @@ describe("POST /integrations/notion/layer", () => {
     const record = await loadIntegration(env, "notion");
     expect((await mirrorWriteContext(env, record)).workspaceId).toBe(roots.companyWorkspaceId);
 
-    const syncRes = await call("POST", "/integrations/notion/sync", ADMIN, {});
-    expect(syncRes.status).toBe(200);
-    const syncData = await syncRes.json() as any;
-    expect(syncData.created).toBe(1);
+    if (mode === "HTTP") {
+      const syncRes = await call("POST", "/integrations/notion/sync", ADMIN, {});
+      expect(syncRes.status).toBe(200);
+      const syncData = await syncRes.json() as any;
+      expect(syncData.created).toBe(1);
+    } else {
+      const pending: Promise<unknown>[] = [];
+      const scheduledCtx = { waitUntil: (p: Promise<unknown>) => pending.push(p) } as unknown as ExecutionContext;
+      await worker.scheduled({ cron: INTEGRATION_SYNC_CRON, scheduledTime: Date.now() } as ScheduledEvent, env, scheduledCtx);
+      while (pending.length) await Promise.all(pending.splice(0));
+    }
 
     const rows = await sqlite.db.prepare(
       `SELECT workspace_id FROM entries WHERE source = 'notion'`,

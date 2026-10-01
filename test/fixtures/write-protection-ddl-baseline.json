@@ -1,0 +1,41 @@
+{
+  "source": "origin/main@fa4ac4ceb2d0c3139e8354c39538f1b34743cfcf",
+  "fresh": {
+    "result": {
+      "changed": true
+    },
+    "schemaVersion": {
+      "version": 8
+    },
+    "statementCount": 74,
+    "statementsSha256": "5a2ef6a7a5bc9107d1fca4ae90fb83bfd1a343edc46a217d750cf6ead5515ebe",
+    "objectCount": 101,
+    "sqliteMasterSha256": "756c8592f535313c7bea4f4791d38bc52b130cf18a41ef9f30579f8b7989c47d"
+  },
+  "v3": {
+    "result": {
+      "changed": true
+    },
+    "schemaVersion": {
+      "version": 8
+    },
+    "statementCount": 36,
+    "statementsSha256": "d7c7afbb999307b465ef0fb1a3100f700871251c975187c9fe0fe915fba6e513",
+    "objectCount": 102,
+    "sqliteMasterSha256": "ffb5a7da8965f08230517c6eb24843ebf80309b2f15a25fa0e03aaaeafa124e4"
+  },
+  "v7": {
+    "result": {
+      "changed": true
+    },
+    "schemaVersion": {
+      "version": 8
+    },
+    "statementCount": 12,
+    "statementsSha256": "d796d53b7669691f376dd94668bcc7ad75ea17eefe94907602267dbf6f0ddd79",
+    "objectCount": 101,
+    "sqliteMasterSha256": "8450f3c32da7c148303fb97f0b0c8b9d784c43318cd641a3b4962c9414b8e3ad"
+  },
+  "referenceObjectCount": 101,
+  "referenceSqliteMasterSha256": "8450f3c32da7c148303fb97f0b0c8b9d784c43318cd641a3b4962c9414b8e3ad"
+}

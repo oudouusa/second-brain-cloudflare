@@ -1,3 +1,5 @@
+import { chatGptEnvForWorkspaces, isChatGptOperationEnabled } from "../lib/chatgpt";
+import { assertMemoryWritesAllowed, memoryWriteMarker } from "../migration/write-lock";
 import type { Env } from "../env";
 import { DEFAULTS, resolveConfig, type Config } from "../config";
 import { inferEdgesOnWrite } from "../graph/edges";
@@ -6,7 +8,7 @@ import { extractHashtags } from "../text/hashtags";
 import { classifyThenInfer, scheduleClassifyAndTag } from "./classify";
 import { checkDuplicateAndContradiction } from "./duplicate";
 import { auditEvent, type AuditChannel, type ChangeContext } from "../lib/audit";
-import { deleteStaleVectors, embedContextForRow, reembedOrThrow, discardUpload, storeEntry } from "./store";
+import { deleteStaleVectors, embedContextForRow, reembedOrThrow, discardUpload, storeEntry, validateIndexableMemory } from "./store";
 import { tagsAfterWrite } from "../memory/stale";
 import { getVolatility, withVolatility } from "../memory/volatility";
 import { TAG_LIKE_ESCAPE, tagLikePattern } from "../memory/tag-sql";
@@ -82,7 +84,7 @@ export function buildEntryFilterQuery(params: {
 
 export type CaptureResult = (
   | { status: "blocked"; matchId: string; score: number }
-  | { status: "stored"; id: string; tags: string[]; held?: HeldInfo }
+  | { status: "stored"; id: string; tags: string[]; held?: HeldInfo; semanticUnavailable?: boolean; semanticUnavailableReason?: "workers_ai_quota_exhausted"; semanticRetryAt?: number; classificationDeferred?: boolean }
   | { status: "flagged"; id: string; matchId: string; score: number; held?: HeldInfo }
   | {
     status: "contradiction"; id: string; resolvedConflict: string; reason?: string;
@@ -174,13 +176,19 @@ export async function captureEntry(
   when?: { at: number; kind: WhenKind; source: WhenSource },
   opts: CaptureOptions = {},
 ): Promise<CaptureResult> {
+  env = chatGptEnvForWorkspaces(env, [writeCtx.workspaceId]);
+  await assertMemoryWritesAllowed(env);
   // Resolved once per capture and threaded through duplicate detection and
   // every embed below. Recall and capture must agree on EMBEDDING_MODEL or the
   // vectors they produce are not comparable.
   const cfg = config ?? await resolveConfig(env);
+  source = source.trim() || "api";
   // Who and which surface made the change, recorded on every version this capture writes.
   const change: ChangeContext = { actorId: writeCtx.actorId, channel: opts.channel ?? "unspecified" };
   const { content: c, tags: t } = normalizeCaptureInput(rawContent, tags);
+  // 保留保存もmetadataに使うタグ・sourceの上限は守る。本文の埋込み上限は
+  // 保留判定後に検査し、モデルへ渡さない長文のD1保存を妨げない。
+  validateIndexableMemory("capture", "", t, source);
 
   // Track 7 (Design 2.1 point 1, 4.1, 5.1): cross-validate before any duplicate check or
   // write, and fold in whichever mode's own tags into this capture's tag list. At most one
@@ -256,16 +264,18 @@ export async function captureEntry(
   // Codex review class D (T-0089.4.2): a `partial` score (over 32 KB, only the head and tail
   // scanned) holds too, reason too_long, not just an outright `hold` — see holdDecision.
   const decision = score ? holdDecision(score) : { hold: false as const };
+  if (!decision.hold) validateIndexableMemory("capture", c, t, source);
   // Codex review class E (T-0089.4.2): a held write's content is unreviewed — too_long included,
   // since only the head and tail were ever scanned — and must never reach a model prompt, the
   // same rule that governs every candidate ROW read for a prompt (excludeHeld, quarantine/tags.ts).
   // This costs an oversized-but-benign write its own automatic merge/contradiction verdict; it
   // lands as a standalone row instead (finding #1 already refuses to commit a merge for one
   // anyway), which is the smaller loss next to sending unscanned text into an AI call.
-  const { duplicate: dup, contradiction, mergeAction, neighbors } = await checkDuplicateAndContradiction(
+  const { duplicate: dup, contradiction, mergeAction, neighbors, semanticUnavailable } = await checkDuplicateAndContradiction(
     c, env, cfg, writeCtx.workspaceId, ctx, { skipModelCall: decision.hold },
   );
 
+  const classificationDeferred = !!semanticUnavailable && !isChatGptOperationEnabled(env, "classify");
   const definesCapsule = t.some(isCapsuleTag);
   if (definesCapsule && getStatus(t) === null) t.push("status:draft");
 
@@ -367,7 +377,7 @@ export async function captureEntry(
                 // scope-exempt: by-id: the merge target read above under this write's workspace, compare-and-set on the workspace, system-row identity, tags and content read
                 // updated_at clamped strictly past its own previous value (digest mark guard, see commitPerson below).
                 // versioning: snapshot
-                return env.DB.prepare(`UPDATE entries AS e SET content = ${contentIdx}, tags = ${tagsIdx}, updated_at = MAX(${nowIdx}, COALESCE(e.updated_at, e.created_at) + 1), vector_ids = ${vectorIdsIdx} WHERE e.id = ${idIdx} AND ${buildCasGuard(p, systemCasColumns)} AND COALESCE(e.actor_id, '') = '' AND e.source = ${p.add(existingSource)}`)
+                return env.DB.prepare(`UPDATE entries AS e SET write_marker = ${p.add(memoryWriteMarker(env))}, content = ${contentIdx}, tags = ${tagsIdx}, updated_at = MAX(${nowIdx}, COALESCE(e.updated_at, e.created_at) + 1), vector_ids = ${vectorIdsIdx} WHERE e.id = ${idIdx} AND ${buildCasGuard(p, systemCasColumns)} AND COALESCE(e.actor_id, '') = '' AND e.source = ${p.add(existingSource)}`)
                   .bind(...p.values());
               })(),
               pruneStatement(env, targetId, cfg.VERSION_KEEP),
@@ -411,7 +421,7 @@ export async function captureEntry(
                 // length as its change signal; a same-millisecond, same-length merge with no
                 // clamp would leave it unmoved and invisible to it).
                 // versioning: snapshot
-                return env.DB.prepare(`UPDATE entries AS e SET content = ${contentIdx}, tags = ${tagsIdx}, updated_at = MAX(${nowIdx}, COALESCE(e.updated_at, e.created_at) + 1), vector_ids = ${vectorIdsIdx} WHERE e.id = ${idIdx} AND ${buildCasGuard(p, personCasColumns)}`)
+                return env.DB.prepare(`UPDATE entries AS e SET write_marker = ${p.add(memoryWriteMarker(env))}, content = ${contentIdx}, tags = ${tagsIdx}, updated_at = MAX(${nowIdx}, COALESCE(e.updated_at, e.created_at) + 1), vector_ids = ${vectorIdsIdx} WHERE e.id = ${idIdx} AND ${buildCasGuard(p, personCasColumns)}`)
                   .bind(...p.values());
               })(),
               pruneStatement(env, targetId, cfg.VERSION_KEEP),
@@ -446,7 +456,7 @@ export async function captureEntry(
             // the closest near-duplicate in `neighbors` — and linking the survivor
             // to that is the junk edge suppression exists to prevent, arriving by
             // a different door.
-            classifyThenInfer(targetId, newContent, env, ctx, cfg, kind =>
+            if (!classificationDeferred) classifyThenInfer(targetId, newContent, env, ctx, cfg, kind =>
               inferEdgesOnWrite(targetId, neighbors, env, { suppressId: dup.matchId, newKind: kind }));
 
             // Only standing's tag is propagated by a merge (see refreshedTags above); a decision's or
@@ -535,7 +545,7 @@ export async function captureEntry(
 
   // versioning: exempt: creation — a new row has no prior state to keep
   const insertStatement = env.DB.prepare(
-    `INSERT INTO entries (id, content, tags, source, created_at, updated_at, vector_ids, workspace_id, actor_id, when_at, when_kind, when_source, when_label, valid_from, valid_until) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    `INSERT INTO entries (id, content, tags, source, created_at, updated_at, vector_ids, workspace_id, actor_id, when_at, when_kind, when_source, when_label, valid_from, valid_until, write_marker) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   ).bind(
     id, c, JSON.stringify(finalTags), source, now, now, "[]", writeCtx.workspaceId, writeCtx.actorId,
     resolvedWhen?.at ?? null, resolvedWhen?.kind ?? null, resolvedWhen?.source ?? null,
@@ -543,7 +553,7 @@ export async function captureEntry(
     // bare — no English prefix, see decisions/capture.ts's reviewLabel comment); the regex/caller-`when`
     // paths never generate one, matching every other when_label writer in this codebase.
     (resolvedWhen && "label" in resolvedWhen) ? resolvedWhen.label : null,
-    window.valid_from, window.valid_until,
+    window.valid_from, window.valid_until, memoryWriteMarker(env),
   );
 
   if (decision.hold) {
@@ -571,7 +581,7 @@ export async function captureEntry(
 
   // Indexed once the outcome is known, with the tags the row will actually keep: a system capture can
   // still be turned into a held draft by a lost compare-and-set below.
-  const scheduleIndex = (indexTags: string[]) => ctx.waitUntil(
+  const scheduleIndex = (indexTags: string[]) => !semanticUnavailable && ctx.waitUntil(
     storeEntry(env, id, c, indexTags, source, now, cfg, writeCtx)
       .then(stored => standingKnownVector(stored.values, id))
       .catch(e => console.error("Vectorize insert failed (non-fatal):", e))
@@ -601,22 +611,22 @@ export async function captureEntry(
         ? [...heldTags, CONFLICT_HELD_TAG] : heldTags;
       scheduleIndex(protectedTags);
       // versioning: exempt: protects the newcomer's own uncommitted row before its version chain exists
-      await env.DB.prepare(`UPDATE entries SET tags = ? WHERE id = ?`)
-        .bind(JSON.stringify(protectedTags), id).run();
+      await env.DB.prepare(`UPDATE entries SET tags = ?, write_marker = ? WHERE id = ?`)
+        .bind(JSON.stringify(protectedTags), memoryWriteMarker(env), id).run();
       // A system job's guess must not move the user's row: a win here would make it
       // permanently ineligible for digests (compression/eligibility.ts).
       if (opts.systemWrite === undefined && conflictSnapshot) {
         try {
           // versioning: exempt: counters, not undoable content
-          await env.DB.prepare(`UPDATE entries SET contradiction_wins = contradiction_wins + 1 WHERE id = ?`).bind(conflictId).run();
+          await env.DB.prepare(`UPDATE entries SET contradiction_wins = contradiction_wins + 1, write_marker = ? WHERE id = ?`).bind(memoryWriteMarker(env), conflictId).run();
           // versioning: exempt: counters, not undoable content
-          await env.DB.prepare(`UPDATE entries SET contradiction_losses = contradiction_losses + 1 WHERE id = ?`).bind(id).run();
+          await env.DB.prepare(`UPDATE entries SET contradiction_losses = contradiction_losses + 1, write_marker = ? WHERE id = ?`).bind(memoryWriteMarker(env), id).run();
         } catch (e) {
           console.error("Contradiction count update failed (non-fatal):", e);
         }
       }
       // This path draws no edges, so there is nothing to chain onto.
-      scheduleClassifyAndTag(id, c, env, ctx, cfg);
+      if (!classificationDeferred) scheduleClassifyAndTag(id, c, env, ctx, cfg);
       return {
         status: "contradiction_protected",
         id,
@@ -645,7 +655,7 @@ export async function captureEntry(
     const counter = (column: "contradiction_wins" | "contradiction_losses", rowId: string) => {
       const p = new Params();
       // versioning: exempt: counters, not undoable content
-      const sql = `UPDATE entries SET ${column} = ${column} + 1 WHERE id = ${p.add(rowId)} AND ${windowClosedSql(p, closedId, at)}`;
+      const sql = `UPDATE entries SET write_marker = ${p.add(memoryWriteMarker(env))}, ${column} = ${column} + 1 WHERE id = ${p.add(rowId)} AND ${windowClosedSql(p, closedId, at)}`;
       return env.DB.prepare(sql).bind(...p.values());
     };
     const results = await env.DB.batch([
@@ -662,9 +672,9 @@ export async function captureEntry(
       // would wrongly claim otherwise and permanently exclude it from insight candidates.
       const keptTags = finalTags.filter(tag => tag !== "contradiction-resolved");
       // versioning: exempt: protects the newcomer's own uncommitted row before its version chain exists
-      await env.DB.prepare(`UPDATE entries SET tags = ? WHERE id = ?`).bind(JSON.stringify(keptTags), id).run();
+      await env.DB.prepare(`UPDATE entries SET tags = ?, write_marker = ? WHERE id = ?`).bind(JSON.stringify(keptTags), memoryWriteMarker(env), id).run();
       scheduleIndex(keptTags);
-      classifyThenInfer(id, c, env, ctx, cfg, kind =>
+      if (!classificationDeferred) classifyThenInfer(id, c, env, ctx, cfg, kind =>
         inferEdgesOnWrite(id, neighbors, env, { suppressId, newKind: kind }));
       return withT7({ status: "stored", id, tags: keptTags });
     }
@@ -686,7 +696,7 @@ export async function captureEntry(
       });
     }
     scheduleIndex(finalTags);
-    classifyThenInfer(id, c, env, ctx, cfg, kind =>
+    if (!classificationDeferred) classifyThenInfer(id, c, env, ctx, cfg, kind =>
       inferEdgesOnWrite(id, neighbors.filter(n => n.id !== conflictId), env, { suppressId, newKind: kind }));
     return withT7({
       status: "contradiction", id, resolvedConflict: conflictId, reason: contradiction.reason,
@@ -694,7 +704,7 @@ export async function captureEntry(
     });
   }
   scheduleIndex(finalTags);
-  classifyThenInfer(id, c, env, ctx, cfg, kind =>
+  if (!classificationDeferred) classifyThenInfer(id, c, env, ctx, cfg, kind =>
     inferEdgesOnWrite(id, neighbors, env, { suppressId, newKind: kind }));
 
   if (dup.status === "flagged") {
@@ -705,5 +715,5 @@ export async function captureEntry(
   // content, plus anything the caller passed. The dashboard shows it back as a
   // capture receipt, so a person can see what the brain did with what they
   // wrote rather than trusting it silently.
-  return withT7({ status: "stored", id, tags: finalTags });
+  return withT7({ status: "stored", id, tags: finalTags, semanticUnavailable: semanticUnavailable ? true : undefined, semanticUnavailableReason: semanticUnavailable?.reason, semanticRetryAt: semanticUnavailable?.retryAt, classificationDeferred });
 }

@@ -1,8 +1,11 @@
 import type { Env } from "../env";
+import { assertMemoryWritesAllowed, isMemoryWriteFenceError, memoryWriteMarker } from "../migration/write-lock";
 import { D1_MAX_BOUND_PARAMS } from "../constants";
 import { edgeEndpointsReadableSql, isSymmetric, isValidEdgeType } from "../graph/edges";
 import type { EdgeProvenance } from "../graph/types";
 import { PROVENANCE_VALUES } from "../graph/types";
+import { isMemoryTier, type MemoryTier } from "../memory/tier";
+import { MemoryInputError, validateIndexableMemory } from "../capture/store";
 import { OWNER_WRITE_CONTEXT, type WriteContext } from "../lib/scope";
 import type { ChangeContext } from "../lib/audit";
 // MAX_ENTRY_ID_BYTES: the one bound on a caller-chosen entry id, applied through boundedEntryId.
@@ -20,14 +23,17 @@ import { changedRows } from "../memory/trash";
 
 /**
  * Default page size: array positions examined per call, inserts and skips alike.
- * Sized so a worst-case page (one existence lookup + one insert batch, then the
- * same again for edges) stays well inside this codebase's self-imposed D1
- * budget of ~50 calls per invocation (the platform's real ceiling is 1,000;
- * this stays tight for cost and 10 ms-CPU reasons), with room for the
- * schema-init probe on a cold isolate.
+ * Sized so a failed atomic batch plus all per-row retries still stays inside D1
+ * Free's 50 queries per invocation, with restore lease coordination room.
  */
-export const IMPORT_DEFAULT_LIMIT = 40;
-export const IMPORT_MAX_LIMIT = 1000;
+export const IMPORT_DEFAULT_LIMIT = 12;
+// Each statement inside DB.batch counts as a D1 query even though the batch is one
+// network round trip. Public callers may not raise a page beyond the safe default.
+export const IMPORT_MAX_LIMIT = 12;
+// 手動importは履歴掃除・hold・衝突時の2回retryまで含めて予算化する。
+// 残り10 queryはschema/admission/barrier/存在照合とbatch共通処理に確保する。
+export const IMPORT_MANUAL_WRITE_BUDGET = 40;
+export const MANUAL_IMPORT_MAX_ROWS = 10_000;
 /** D1 batch chunk size for inserts. */
 export const IMPORT_D1_BATCH_SIZE = 50;
 /** Edge endpoint lookups bind each id twice (source IN + target IN). */
@@ -47,9 +53,7 @@ export const EDGE_ENDPOINT_QUERY_BATCH = Math.floor(D1_MAX_BOUND_PARAMS / 2);
 // versioning: exempt: creation — an imported row has no prior state to keep
 // scope-exempt: by-id existence probes across every workspace: an id is unique deployment-wide
 const ENTRY_INSERT_SQL_TEMPLATE =
-  `INSERT INTO entries (id, content, tags, source, created_at, updated_at, vector_ids, recall_count, importance_score, contradiction_wins, contradiction_losses, workspace_id, actor_id, valid_from, valid_until)
-   SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15
-   WHERE NOT EXISTS (SELECT 1 FROM entries WHERE id = ?1) AND NOT EXISTS (SELECT 1 FROM entries_trash WHERE id = ?1)`;
+  `INSERT INTO entries (id, content, tags, source, created_at, updated_at, vector_ids, recall_count, importance_score, contradiction_wins, contradiction_losses, memory_tier, pinned, last_recalled_at, restore_lease_owner, write_marker, workspace_id, actor_id, when_at, when_kind, when_source, when_label, valid_from, valid_until) SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24 WHERE NOT EXISTS (SELECT 1 FROM entries WHERE id = ?1) AND NOT EXISTS (SELECT 1 FROM entries_trash WHERE id = ?1)`;
 
 function parseInsertColumns(sql: string): readonly string[] {
   const match = sql.match(/INSERT INTO entries \(([^)]+)\)/i);
@@ -101,21 +105,35 @@ export interface ExportEntry {
   importance_score?: number;
   contradiction_wins?: number;
   contradiction_losses?: number;
+  memory_tier?: MemoryTier;
+  pinned?: boolean;
+  last_recalled_at?: number | null;
+  when_at?: number | null;
+  when_kind?: string | null;
+  when_source?: string | null;
+  when_label?: string | null;
+  workspace_id?: string;
+  actor_id?: string;
   /** Track 2 (T-0089.2.1): absent in exports taken before validity windows; restored as NULL. */
   valid_from?: number | null;
   valid_until?: number | null;
 }
 
 export interface ExportEdge {
+  id?: string;
   source_id: string;
   target_id: string;
   type?: string;
   weight?: number;
   provenance?: string;
+  metadata?: Record<string, unknown>;
   created_at?: number;
+  updated_at?: number;
+  workspace_id?: string;
 }
 
 export interface ExportProject {
+  workspace_id?: string;
   id: string;
   name: string;
   description?: string;
@@ -140,14 +158,19 @@ export interface ImportOptions {
   offset?: number;
   /** Index into `edges` where this call's page starts. */
   edgeOffset?: number;
-  /** Index into `projects` where this call's page starts. */
+  /** Internal maintenance-barrier owner. Public import callers must not set this. */
+  writeLockOwner?: string;
+  /** Current D1 restore-page lease. Written into rows for the database trigger fence. */
+  restoreLeaseOwner?: string;
+  /** Renews and validates the restore lease immediately before every write batch. */
+  beforeWriteBatch?: () => Promise<void>;
+  /** Manual imports must be indexable; trusted R2 restores preserve legacy bytes. */
+  enforceIndexLimits?: boolean;
+  /** Workspace and author stamped on restored rows. */
   projectOffset?: number;
-  /**
-   * Whose workspace/actor the imported rows and edges are stamped with. Defaults
-   * to OWNER_WRITE_CONTEXT ('', '') so existing unit fixtures compile — routes
-   * that have a real Identity must pass one resolved at the edge.
-   */
   writeCtx?: WriteContext;
+  /** Trusted R2 restores preserve each exported row's original tenant metadata. */
+  preserveWriteContext?: boolean;
   /** Present, a standing:active row landing on this page invalidates the importer's own workspace cache (spec 15 2.6). */
   ctx?: ExecutionContext;
 }
@@ -172,6 +195,9 @@ export interface ImportSummary {
   remaining_entries: number;
   remaining_edges: number;
   remaining_projects: number;
+  /** R2履歴chunkのみ。通常HTTP importには存在しない。 */
+  remaining_history?: number;
+  next_history_offset?: number;
   /** Pass back as ?offset= to continue. Equals entries.length when entries are done. */
   next_offset: number;
   /** Pass back as ?edge_offset= to continue. Advances only once entries are done. */
@@ -183,15 +209,20 @@ export interface ImportSummary {
 }
 
 interface PendingEdge {
+  id: string;
   source_id: string;
   target_id: string;
   type: string;
   weight: number;
   provenance: EdgeProvenance;
+  metadata: string;
   created_at: number;
+  updatedAt: number;
+  workspaceId: string;
 }
 
 const DEFAULT_EDGE_WEIGHT = 0.5;
+export const MAX_IMPORT_ID_BYTES = 512;
 
 interface PendingInsert {
   id: string;
@@ -207,6 +238,15 @@ interface PendingInsert {
   importance_score: number;
   contradiction_wins: number;
   contradiction_losses: number;
+  memory_tier: MemoryTier;
+  pinned: boolean;
+  last_recalled_at: number | null;
+  when_at: number | null;
+  when_kind: string | null;
+  when_source: string | null;
+  when_label: string | null;
+  workspaceId: string;
+  actorId: string;
   valid_from: number | null;
   valid_until: number | null;
   /** The export's own row was held under one of the five recognized reasons, before
@@ -247,7 +287,17 @@ export function normalizedEdgeKey(sourceId: string, targetId: string, type: stri
   if (isValidEdgeType(type) && isSymmetric(type) && source > target) {
     [source, target] = [target, source];
   }
-  return `${source}\0${target}\0${type}`;
+  return JSON.stringify([source, target, type]);
+}
+
+function validateImportId(
+  value: string,
+  invalidReason: "invalid_id" | "invalid_endpoint",
+): { ok: true; value: string } | { ok: false; reason: "invalid_id" | "invalid_endpoint" } {
+  if (value.includes("\0") || new TextEncoder().encode(value).byteLength > MAX_IMPORT_ID_BYTES) {
+    return { ok: false, reason: invalidReason };
+  }
+  return { ok: true, value };
 }
 
 export function parseRequiredString(
@@ -266,6 +316,17 @@ export function parseRequiredString(
   return { ok: true, value: trimmed };
 }
 
+function parseContent(value: unknown): { ok: true; value: string } | { ok: false; reason: string } {
+  if (value === undefined || value === null || value === "") {
+    return { ok: false, reason: "missing_content" };
+  }
+  if (typeof value !== "string") return { ok: false, reason: "invalid_content" };
+  if (!value.trim()) return { ok: false, reason: "missing_content" };
+  // Whitespace is part of the memory: Markdown indentation, fenced-code trailing
+  // newlines, and deliberately padded plain text must round-trip byte for byte.
+  return { ok: true, value };
+}
+
 export function formatDbError(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error);
   return message.slice(0, 200);
@@ -277,15 +338,22 @@ export function parseImportBody(
   if (!body || typeof body !== "object") return { ok: false, error: "body must be an object" };
   const o = body as Record<string, unknown>;
   // 3 added projects; 2 (no projects) restores as before.
-  if (o.version !== undefined && o.version !== 2 && o.version !== 3) return { ok: false, error: "version must be 2 or 3" };
+  if (o.version !== undefined && o.version !== 1 && o.version !== 2 && o.version !== 3) return { ok: false, error: "version must be 1, 2 or 3" };
   if (!Array.isArray(o.entries)) return { ok: false, error: "entries must be an array" };
+  if (o.edges !== undefined && !Array.isArray(o.edges)) {
+    return { ok: false, error: "edges must be an array" };
+  }
   if (o.projects !== undefined && !Array.isArray(o.projects)) return { ok: false, error: "projects must be an array" };
+  const edges = (o.edges ?? []) as ExportEdge[];
+  if (o.entries.length + edges.length + ((o.projects as unknown[] | undefined)?.length ?? 0) > MANUAL_IMPORT_MAX_ROWS) {
+    return { ok: false, error: `manual import is limited to ${MANUAL_IMPORT_MAX_ROWS} rows` };
+  }
   return {
     ok: true,
     payload: {
       version: o.version as number | undefined,
       entries: o.entries as ExportEntry[],
-      edges: o.edges as ExportEdge[] | undefined,
+      edges,
       projects: o.projects as ExportProject[] | undefined,
     },
   };
@@ -330,6 +398,14 @@ async function loadExistingIds(env: Env, ids: string[], withTrash = true): Promi
 
 /** Versions left behind by an earlier life of an id are dropped in the same batch that inserts it,
  * unless the id is live or trashed now (then the insert takes a fresh id and this history is theirs). */
+function orphanVersionsStamp(env: Env, ids: string[]) {
+  return env.DB.prepare(
+    // scope-exempt: by-id: only orphan history for this import batch can be marked for deletion
+    `UPDATE entry_versions SET write_marker = ?2 WHERE entry_id IN (SELECT value FROM json_each(?1))
+       AND NOT EXISTS (SELECT 1 FROM entries e WHERE e.id = entry_versions.entry_id)
+       AND NOT EXISTS (SELECT 1 FROM entries_trash t WHERE t.id = entry_versions.entry_id)`,
+  ).bind(JSON.stringify(ids), memoryWriteMarker(env, "delete"));
+}
 function orphanVersionsDelete(env: Env, ids: string[]) {
   return env.DB.prepare(
     // scope-exempt: by-id: history of ids this batch inserts fresh; an imported row starts with none
@@ -445,7 +521,12 @@ export function parseCreatedAt(
   return { ok: true, value };
 }
 
-function bindInsert(env: Env, row: PendingInsert, writeCtx: WriteContext) {
+function bindInsert(
+  env: Env,
+  row: PendingInsert,
+  restoreLeaseOwner?: string,
+  writeCtx: WriteContext = OWNER_WRITE_CONTEXT,
+) {
   return env.DB.prepare(ENTRY_INSERT_SQL).bind(
     row.id,
     row.content,
@@ -458,8 +539,14 @@ function bindInsert(env: Env, row: PendingInsert, writeCtx: WriteContext) {
     row.importance_score,
     row.contradiction_wins,
     row.contradiction_losses,
+    row.memory_tier,
+    row.pinned ? 1 : 0,
+    row.last_recalled_at,
+    restoreLeaseOwner ?? null,
+    restoreLeaseOwner ? null : memoryWriteMarker(env),
     writeCtx.workspaceId,
     writeCtx.actorId,
+    row.when_at, row.when_kind, row.when_source, row.when_label,
     row.valid_from,
     row.valid_until,
   );
@@ -479,7 +566,7 @@ function bindInsert(env: Env, row: PendingInsert, writeCtx: WriteContext) {
 function rowStatements(
   env: Env, row: PendingInsert, writeCtx: WriteContext, change: ChangeContext, config: Readonly<Config>, now: number,
 ): D1PreparedStatement[] {
-  const insert = bindInsert(env, row, writeCtx);
+  const insert = bindInsert(env, row, undefined, writeCtx);
   if (!row.holdPlan) return [insert];
   const { reasons, score, signals } = row.holdPlan;
   const hold = holdStatements(env, { snapshotStatement, pruneStatement, versionKeep: config.VERSION_KEEP }, {
@@ -494,8 +581,8 @@ function rowStatements(
 async function attemptInsertRow(
   env: Env, row: PendingInsert, writeCtx: WriteContext, change: ChangeContext, config: Readonly<Config>, now: number,
 ): Promise<boolean> {
-  const written = await env.DB.batch([orphanVersionsDelete(env, [row.id]), ...rowStatements(env, row, writeCtx, change, config, now)]);
-  return insertLanded(written[1]);
+  const written = await env.DB.batch([orphanVersionsStamp(env, [row.id]), orphanVersionsDelete(env, [row.id]), ...rowStatements(env, row, writeCtx, change, config, now)]);
+  return insertLanded(written[2]);
 }
 
 /**
@@ -519,7 +606,8 @@ async function retryInsertRow(
       results.push(importedResult(row));
       return;
     }
-  } catch {
+  } catch (error) {
+    if (isMemoryWriteFenceError(error)) throw error;
     // A thrown error on the same-id retry is treated the same as a silent `changes: 0` below:
     // either way this attempt did not land the row.
   }
@@ -539,6 +627,7 @@ async function retryInsertRow(
     counters.failed++;
     results.push({ id: row.id, status: "failed", reason: "insert_error", detail: "collision persisted under a freshly minted id" });
   } catch (e) {
+    if (isMemoryWriteFenceError(e)) throw e;
     counters.failed++;
     results.push({ id: row.id, status: "failed", reason: "insert_error", detail: formatDbError(e) });
   }
@@ -552,14 +641,38 @@ async function flushInsertBatch(
   counters: { imported: number; failed: number },
   writeCtx: WriteContext,
   config: Readonly<Config>,
+  opts: ImportOptions,
 ): Promise<void> {
   if (!batch.length) return;
 
+  await opts.beforeWriteBatch?.();
+  if (opts.restoreLeaseOwner) {
+    const stmts = batch.map(row => bindInsert(env, row, opts.restoreLeaseOwner,
+      opts.preserveWriteContext ? { workspaceId: row.workspaceId, actorId: row.actorId } : writeCtx));
+    let written: D1Result[];
+    try { written = await env.DB.batch(stmts); }
+    catch (error) {
+      if (isMemoryWriteFenceError(error)) throw error;
+      counters.failed += batch.length;
+      for (const row of batch) results.push({ id: row.id, status: "failed", reason: "insert_error", detail: formatDbError(error) });
+      return;
+    }
+    for (const [i, row] of batch.entries()) {
+      existingIds.add(row.id);
+      if (insertLanded(written[i])) { counters.imported++; results.push(importedResult(row)); }
+      else results.push({ id: row.id, status: "skipped", reason: "already_imported" });
+    }
+    return;
+  }
   const change: ChangeContext = { actorId: writeCtx.actorId, channel: "rest" };
+  // trusted restoreの通常admission経路でも、各行の保存済みtenant/actorを保持する。
+  const contextFor = (row: PendingInsert): WriteContext => opts.preserveWriteContext
+    ? { workspaceId: row.workspaceId, actorId: row.actorId } : writeCtx;
   const now = Date.now();
   const orphanIds = batch.map(row => row.id);
-  const perRow = batch.map(row => rowStatements(env, row, writeCtx, change, config, now));
-  const stmts = [orphanVersionsDelete(env, orphanIds), ...perRow.flat()];
+  const perRow = batch.map(row => rowStatements(env, row, contextFor(row),
+    { ...change, actorId: contextFor(row).actorId }, config, now));
+  const stmts = [orphanVersionsStamp(env, orphanIds), orphanVersionsDelete(env, orphanIds), ...perRow.flat()];
   const collided: PendingInsert[] = [];
   try {
     const written = await env.DB.batch(stmts);
@@ -568,7 +681,7 @@ async function flushInsertBatch(
     // INSERT lost its `WHERE NOT EXISTS` guard to a genuine collision writes nothing here -- not a
     // thrown error, just `changes: 0` on its own INSERT -- and is retried alone below, same as a
     // row from a batch that threw outright.
-    let offset = 1;
+    let offset = 2;
     for (const [i, row] of batch.entries()) {
       if (insertLanded(written[offset])) {
         existingIds.add(row.id);
@@ -579,12 +692,14 @@ async function flushInsertBatch(
       }
       offset += perRow[i].length;
     }
-  } catch {
+  } catch (error) {
+    if (isMemoryWriteFenceError(error)) throw error;
     collided.push(...batch);
   }
 
+  if (collided.length) await opts.beforeWriteBatch?.();
   for (const row of collided) {
-    await retryInsertRow(env, row, writeCtx, change, config, now, existingIds, results, counters);
+    await retryInsertRow(env, row, contextFor(row), { ...change, actorId: contextFor(row).actorId }, config, now, existingIds, results, counters);
   }
 }
 
@@ -603,23 +718,27 @@ async function loadReadableIds(env: Env, ids: string[], readable: string[]): Pro
   return found;
 }
 
-function bindEdgeInsert(env: Env, edge: PendingEdge, writeCtx: WriteContext, readable: string[]) {
+function bindEdgeInsert(env: Env, edge: PendingEdge, restoreLeaseOwner: string | undefined, writeCtx: WriteContext, readable: string[] = [writeCtx.workspaceId]) {
   let source = edge.source_id;
   let target = edge.target_id;
   if (isValidEdgeType(edge.type) && isSymmetric(edge.type) && source > target) {
     [source, target] = [target, source];
   }
-  const now = Date.now();
-  const readableJson = JSON.stringify(readable);
   return env.DB.prepare(
-    // scope-exempt: by-id: the guard reads only this edge's endpoints, scoped by the importer's readable workspaces
-    `INSERT INTO edges (id, source_id, target_id, type, weight, provenance, metadata, created_at, updated_at, workspace_id)
-     SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-     WHERE ${edgeEndpointsReadableSql("?", "?", "?")}
-     ON CONFLICT(source_id, target_id, type) DO UPDATE SET weight = max(weight, excluded.weight), updated_at = excluded.updated_at`,
+    `INSERT INTO edges (id, source_id, target_id, type, weight, provenance, metadata, created_at, updated_at, restore_lease_owner, write_marker, workspace_id)
+     SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+     WHERE ${restoreLeaseOwner ? "1" : edgeEndpointsReadableSql("?", "?", "?")}
+     ON CONFLICT(source_id, target_id, type) DO UPDATE SET
+       weight = max(weight, excluded.weight),
+       updated_at = excluded.updated_at,
+       restore_lease_owner = excluded.restore_lease_owner,
+       write_marker = excluded.write_marker,
+       workspace_id = excluded.workspace_id`,
   ).bind(
-    crypto.randomUUID(), source, target, edge.type, edge.weight, edge.provenance, "{}", edge.created_at, now,
-    writeCtx.workspaceId, source, readableJson, target, readableJson,
+    edge.id, source, target, edge.type, edge.weight, edge.provenance, edge.metadata,
+    edge.created_at, edge.updatedAt, restoreLeaseOwner ?? null,
+    restoreLeaseOwner ? null : memoryWriteMarker(env), writeCtx.workspaceId,
+    ...(restoreLeaseOwner ? [] : [source, JSON.stringify(readable), target, JSON.stringify(readable)]),
   );
 }
 
@@ -629,12 +748,16 @@ async function flushEdgeBatch(
   existingEdgeKeys: Set<string>,
   results: ImportResultItem[],
   counters: { imported: number; failed: number; skipped: number },
-  writeCtx: WriteContext,
-  readable: string[],
+  opts: Pick<ImportOptions, "restoreLeaseOwner" | "beforeWriteBatch" | "writeCtx" | "preserveWriteContext">,
 ): Promise<void> {
   if (!batch.length) return;
 
-  const stmts = batch.map(row => bindEdgeInsert(env, row, writeCtx, readable));
+  await opts.beforeWriteBatch?.();
+  const writeCtx = opts.writeCtx ?? OWNER_WRITE_CONTEXT;
+  const contextFor = (row: PendingEdge): WriteContext => opts.preserveWriteContext
+    ? { workspaceId: row.workspaceId, actorId: "" }
+    : writeCtx;
+  const stmts = batch.map(row => bindEdgeInsert(env, row, opts.restoreLeaseOwner, contextFor(row)));
   try {
     const written = await env.DB.batch(stmts);
     for (const [i, row] of batch.entries()) {
@@ -650,10 +773,12 @@ async function flushEdgeBatch(
         status: "imported",
       });
     }
-  } catch {
+  } catch (error) {
+    if (isMemoryWriteFenceError(error)) throw error;
+    await opts.beforeWriteBatch?.();
     for (const row of batch) {
       try {
-        const res = await bindEdgeInsert(env, row, writeCtx, readable).run();
+        const res = await bindEdgeInsert(env, row, opts.restoreLeaseOwner, contextFor(row)).run();
         const key = normalizedEdgeKey(row.source_id, row.target_id, row.type);
         existingEdgeKeys.add(key);
         if ((res?.meta?.changes ?? 1) === 0) { counters.skipped++; continue; }
@@ -680,70 +805,67 @@ async function flushEdgeBatch(
 }
 
 const PROJECT_INSERT_SQL =
-  `INSERT INTO projects (id, workspace_id, name, description, aliases, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(workspace_id, id) DO NOTHING`;
+  `INSERT INTO projects (id, workspace_id, name, description, aliases, status, created_at, updated_at, restore_lease_owner, write_marker) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(workspace_id, id) DO NOTHING`;
 
-async function loadExistingProjectIds(env: Env, workspaceId: string, ids: string[]): Promise<Set<string>> {
-  const found = new Set<string>();
-  // The workspace id takes one of the bound parameters.
-  const chunk = D1_MAX_BOUND_PARAMS - 1;
-  for (let i = 0; i < ids.length; i += chunk) {
-    const batch = ids.slice(i, i + chunk);
-    const { results } = await env.DB.prepare(
-      `SELECT id FROM projects WHERE workspace_id = ? AND id IN (${batch.map(() => "?").join(", ")})`,
-    ).bind(workspaceId, ...batch).all() as { results: { id: string }[] };
-    for (const row of results) found.add(row.id);
-  }
-  return found;
-}
-
-function bindProjectInsert(env: Env, p: ImportedProject, writeCtx: WriteContext) {
+type ProjectImportRow = ImportedProject & { workspaceId: string };
+function bindProjectInsert(env: Env, p: ProjectImportRow, opts: ImportOptions) {
   return env.DB.prepare(PROJECT_INSERT_SQL).bind(
-    p.id, writeCtx.workspaceId, p.name, p.description, JSON.stringify(p.aliases), p.status, p.created_at, p.updatedAt,
+    p.id, p.workspaceId, p.name, p.description, JSON.stringify(p.aliases), p.status, p.created_at, p.updatedAt,
+    opts.restoreLeaseOwner ?? null, memoryWriteMarker(env),
   );
 }
 
-/**
- * One page of projects, into the caller's workspace. An existing (workspace, id) keeps
- * its row, as an existing entry id does. Nothing is queried for an empty page.
- */
+/** workspaceとslugの組を維持する。手動importでは呼出元workspaceへ正規化する。 */
 async function importProjectsPage(
   env: Env,
   page: ExportProject[],
   writeCtx: WriteContext,
   results: ImportResultItem[],
+  opts: ImportOptions,
 ): Promise<{ imported: number; skipped: number; failed: number }> {
   const counts = { imported: 0, skipped: 0, failed: 0 };
   if (!page.length) return counts;
-
-  const parsed = page.map(raw => parseImportedProject(raw));
-  const existing = await loadExistingProjectIds(env, writeCtx.workspaceId, parsed.flatMap(p => (p.ok ? [p.project.id] : [])));
-
-  const pending: ImportedProject[] = [];
-  for (const p of parsed) {
+  const valid: ProjectImportRow[] = [];
+  for (const raw of page) {
+    const p = parseImportedProject(raw);
     if (!p.ok) {
       counts.failed++;
       results.push({ project_id: p.id, status: "failed", reason: "invalid_project", detail: p.detail });
-    } else if (existing.has(p.project.id)) {
-      counts.skipped++;
     } else {
-      // Queued ids count as seen, so a duplicate later in the page is a skip.
-      existing.add(p.project.id);
-      pending.push(p.project);
+      valid.push({ ...p.project, workspaceId: opts.preserveWriteContext && typeof raw.workspace_id === "string" ? raw.workspace_id : writeCtx.workspaceId });
     }
   }
-
+  if (!valid.length) return counts;
+  const existing = new Set<string>();
+  const key = (ws: string, id: string) => JSON.stringify([ws, id]);
+  for (let i = 0; i < valid.length; i += Math.floor(D1_MAX_BOUND_PARAMS / 2)) {
+    const slice = valid.slice(i, i + Math.floor(D1_MAX_BOUND_PARAMS / 2));
+    const rows = await env.DB.prepare(
+      `SELECT workspace_id, id FROM projects WHERE ${slice.map(() => "(workspace_id = ? AND id = ?)").join(" OR ")}`,
+    ).bind(...slice.flatMap(p => [p.workspaceId, p.id])).all<{ workspace_id: string; id: string }>();
+    for (const row of rows.results) existing.add(key(row.workspace_id, row.id));
+  }
+  const pending: ProjectImportRow[] = [];
+  for (const p of valid) {
+    const k = key(p.workspaceId, p.id);
+    if (existing.has(k)) { counts.skipped++; continue; }
+    existing.add(k);
+    pending.push(p);
+  }
   for (let i = 0; i < pending.length; i += IMPORT_D1_BATCH_SIZE) {
     const chunk = pending.slice(i, i + IMPORT_D1_BATCH_SIZE);
-    const settle = (p: ImportedProject) => { counts.imported++; results.push({ project_id: p.id, status: "imported" }); };
+    const settle = (p: ProjectImportRow) => { counts.imported++; results.push({ project_id: p.id, status: "imported" }); };
+    await opts.beforeWriteBatch?.();
     try {
-      await env.DB.batch(chunk.map(p => bindProjectInsert(env, p, writeCtx)));
+      await env.DB.batch(chunk.map(p => bindProjectInsert(env, p, opts)));
       chunk.forEach(settle);
-    } catch {
+    } catch (e) {
+      if (isMemoryWriteFenceError(e)) throw e;
+      await opts.beforeWriteBatch?.();
       for (const p of chunk) {
-        try {
-          await bindProjectInsert(env, p, writeCtx).run();
-          settle(p);
-        } catch (e) {
+        try { await bindProjectInsert(env, p, opts).run(); settle(p); }
+        catch (e) {
+          if (isMemoryWriteFenceError(e)) throw e;
           counts.failed++;
           results.push({ project_id: p.id, status: "failed", reason: "insert_error", detail: formatDbError(e) });
         }
@@ -754,16 +876,14 @@ async function importProjectsPage(
 }
 
 /**
- * One page of a restore. `offset`/`edgeOffset` are positions in the payload arrays (entries in
- * oldest-first order, see oldestFirst),
- * and a call examines exactly one page: entries[offset .. offset+limit), then — only
- * once the entries array is exhausted — edges[edgeOffset .. edgeOffset+limit).
+ * One page of a restore. `offset`/`edgeOffset` are positions in the payload arrays,
+ * and a call examines exactly one phase: entries[offset .. offset+limit), or — only
+ * when the call starts with entries exhausted — edges[edgeOffset .. edgeOffset+limit).
  *
- * Positional paging is what keeps the cost flat against this codebase's
- * self-imposed D1 budget (~50 calls per invocation; the platform's real
- * ceiling is 1,000). Each page resolves only its own ids: one chunked existence lookup plus
+ * Positional paging is what keeps the cost flat on the D1 free plan (~50 queries per
+ * invocation). Each page resolves only its own ids: one chunked existence lookup plus
  * one insert batch, so a default page costs 2-3 round trips whether the file holds
- * 40 entries or 50,000, and page 500 costs the same as page 1. The alternative —
+ * 12 entries or 50,000, and page 500 costs the same as page 1. The alternative —
  * scanning from the top and skipping — re-resolves every already-imported id on
  * every call, which is how a 5,000-entry restore spends its whole daily budget
  * before finishing.
@@ -796,14 +916,16 @@ export async function importExportPayload(
   body: ExportPayload,
   opts: ImportOptions = {},
 ): Promise<ImportSummary> {
+  await assertMemoryWritesAllowed(env, opts.writeLockOwner);
   const limit = opts.limit ?? IMPORT_DEFAULT_LIMIT;
-  const entries = oldestFirst(body.entries);
+  // R2の再開cursorは旧ファイル内位置を指す。新規HTTP importだけ時系列へ並べる。
+  const entries = opts.restoreLeaseOwner ? body.entries : oldestFirst(body.entries);
   const edges = body.edges ?? [];
-  const offset = Math.min(Math.max(opts.offset ?? 0, 0), entries.length);
-  const edgeOffset = Math.min(Math.max(opts.edgeOffset ?? 0, 0), edges.length);
   const projects = body.projects ?? [];
   const projectOffset = Math.min(Math.max(opts.projectOffset ?? 0, 0), projects.length);
   const writeCtx = opts.writeCtx ?? OWNER_WRITE_CONTEXT;
+  const offset = Math.min(Math.max(opts.offset ?? 0, 0), entries.length);
+  const edgeOffset = Math.min(Math.max(opts.edgeOffset ?? 0, 0), edges.length);
   // Import edges are automatic (round 5): both endpoints in the importer's own workspace, where the
   // imported entries land and the edge is stamped. Anything else is skipped like a missing endpoint.
   const readable = [writeCtx.workspaceId];
@@ -819,7 +941,7 @@ export async function importExportPayload(
 
   // ---- entries page ------------------------------------------------------------
   const page = entries.slice(offset, offset + limit);
-  const next_offset = offset + page.length;
+  let next_offset = offset;
 
   // Codex review, T-0102 B1: an import is scored on the rest channel like any other REST write,
   // so genuinely suspicious imported content is held rather than landing straight into recall.
@@ -829,16 +951,25 @@ export async function importExportPayload(
   // Parse the whole page before touching D1, so the existence lookup can be one
   // chunked query over exactly the ids that might insert.
   const parsedPage: ({ row: PendingInsert } | { failure: ImportEntryResult })[] = [];
+  let manualWriteBudget = 0;
   for (const entry of page) {
-    const parsed = parseEntryRow(entry);
+    const parsed = parseEntryRow(entry, opts.enforceIndexLimits === true, opts.preserveWriteContext === true);
     // One rule for every caller-chosen id (T-0089.1.1): over MAX_ENTRY_ID_BYTES it would leave no room
     // for the per-upload vector suffix under Vectorize's 64-byte limit, so the row takes a minted id.
-    if ("row" in parsed) {
+    if ("row" in parsed && !opts.restoreLeaseOwner) {
       const bounded = await boundedEntryId(parsed.row.id);
       if (bounded !== parsed.row.id) parsed.row = { ...parsed.row, originalId: parsed.row.id, id: bounded };
       parsed.row = { ...parsed.row, holdPlan: importHoldPlan(parsed.row, config) };
     }
+    if (!opts.restoreLeaseOwner && "row" in parsed) {
+      // 通常1 statement、holdはINSERT + snapshot/cleanup/update/prune + eventの6。
+      // 初回 + 同ID retry + 衝突照合 + 新ID retry、retryごとのorphan stamp/delete。
+      const cost = 3 * (parsed.row.holdPlan ? 6 : 1) + 5;
+      if (manualWriteBudget + cost > IMPORT_MANUAL_WRITE_BUDGET) break;
+      manualWriteBudget += cost;
+    }
     parsedPage.push(parsed);
+    next_offset++;
   }
 
   // Codex review, T-0102 B3, then director follow-up MAJOR (round 2 re-review): a reused id used
@@ -892,11 +1023,11 @@ export async function importExportPayload(
     if (p.row.tags.includes("standing:active")) importedStanding = true;
 
     if (pendingBatch.length >= IMPORT_D1_BATCH_SIZE) {
-      await flushInsertBatch(env, pendingBatch.splice(0), existingIds, results, batchCounters, writeCtx, config);
+      await flushInsertBatch(env, pendingBatch.splice(0), existingIds, results, batchCounters, writeCtx, config, opts);
     }
   }
   if (pendingBatch.length) {
-    await flushInsertBatch(env, pendingBatch.splice(0), existingIds, results, batchCounters, writeCtx, config);
+    await flushInsertBatch(env, pendingBatch.splice(0), existingIds, results, batchCounters, writeCtx, config, opts);
   }
   imported += batchCounters.imported;
   failed += batchCounters.failed;
@@ -910,16 +1041,16 @@ export async function importExportPayload(
   let next_edge_offset = edgeOffset;
   let next_project_offset = projectOffset;
   let projectCounts = { imported: 0, skipped: 0, failed: 0 };
-  if (remaining_entries === 0) {
+  if (offset >= entries.length) {
     const edgePage = edges.slice(edgeOffset, edgeOffset + limit);
     next_edge_offset = edgeOffset + edgePage.length;
 
     type ParsedEdge = { edge: PendingEdge } | { failure: ImportEdgeResult };
     const parsedEdges: ParsedEdge[] = [];
     for (const edge of edgePage) {
-      const parsed = parseEdgeRow(edge);
+      const parsed = parseEdgeRow(edge, opts.preserveWriteContext === true);
       // An endpoint over MAX_ENTRY_ID_BYTES was imported under its minted id: follow it there.
-      if ("edge" in parsed) {
+      if ("edge" in parsed && !opts.restoreLeaseOwner) {
         const [source_id, target_id] = await Promise.all([boundedEntryId(parsed.edge.source_id), boundedEntryId(parsed.edge.target_id)]);
         parsed.edge = { ...parsed.edge, source_id, target_id };
       }
@@ -932,7 +1063,7 @@ export async function importExportPayload(
     const endpoints = [
       ...new Set(parsedEdges.flatMap(p => ("edge" in p ? [p.edge.source_id, p.edge.target_id] : []))),
     ];
-    const readableIds = await loadReadableIds(env, endpoints, readable);
+    const readableIds = opts.preserveWriteContext ? (await loadExistingIds(env, endpoints, false)).live : await loadReadableIds(env, endpoints, readable);
     const existingEdgeKeys = await loadExistingEdgeKeys(env, endpoints);
 
     const pendingEdgeBatch: PendingEdge[] = [];
@@ -958,21 +1089,22 @@ export async function importExportPayload(
       pendingEdgeBatch.push(p.edge);
 
       if (pendingEdgeBatch.length >= IMPORT_D1_BATCH_SIZE) {
-        await flushEdgeBatch(env, pendingEdgeBatch.splice(0), existingEdgeKeys, results, edgeBatchCounters, writeCtx, readable);
+        await flushEdgeBatch(env, pendingEdgeBatch.splice(0), existingEdgeKeys, results, edgeBatchCounters, opts);
       }
     }
     if (pendingEdgeBatch.length) {
-      await flushEdgeBatch(env, pendingEdgeBatch.splice(0), existingEdgeKeys, results, edgeBatchCounters, writeCtx, readable);
+      await flushEdgeBatch(env, pendingEdgeBatch.splice(0), existingEdgeKeys, results, edgeBatchCounters, opts);
     }
     edges_imported += edgeBatchCounters.imported;
     edges_failed += edgeBatchCounters.failed;
     edges_skipped += edgeBatchCounters.skipped;
 
-    // Projects ride the same call as the edges page, on their own cursor, so a client
-    // that only knows entries and edges still restores the first page of them.
+    // Projectsは次の呼出しで処理し、edge書込みとSQL予算を分ける。
+  }
+  if (offset >= entries.length && edgeOffset >= edges.length) {
     const projectPage = projects.slice(projectOffset, projectOffset + limit);
     next_project_offset = projectOffset + projectPage.length;
-    projectCounts = await importProjectsPage(env, projectPage, writeCtx, results);
+    projectCounts = await importProjectsPage(env, projectPage, writeCtx, results, opts);
   }
 
   return {
@@ -1000,7 +1132,11 @@ export async function importExportPayload(
 }
 
 /** Parse one entry row into an insertable record, or the failure to report. */
-function parseEntryRow(entry: ExportEntry): { row: PendingInsert } | { failure: ImportEntryResult } {
+function parseEntryRow(
+  entry: ExportEntry,
+  enforceIndexLimits: boolean,
+  preserveWriteContext = false,
+): { row: PendingInsert } | { failure: ImportEntryResult } {
   if (!isImportRecordObject(entry)) {
     return { failure: { id: "", status: "failed", reason: "invalid_entry" } };
   }
@@ -1009,9 +1145,13 @@ function parseEntryRow(entry: ExportEntry): { row: PendingInsert } | { failure: 
     const id = typeof entry.id === "string" ? entry.id : String(entry.id ?? "");
     return { failure: { id, status: "failed", reason: idParsed.reason } };
   }
-  const id = idParsed.value;
+  const validId = validateImportId(idParsed.value, "invalid_id");
+  if (!validId.ok) {
+    return { failure: { id: idParsed.value, status: "failed", reason: validId.reason } };
+  }
+  const id = validId.value;
 
-  const contentParsed = parseRequiredString(entry.content, "missing_content", "invalid_content");
+  const contentParsed = parseContent(entry.content);
   if (!contentParsed.ok) return { failure: { id, status: "failed", reason: contentParsed.reason } };
   // Rahil's decision (18-copy-deck.md 6.8): 128 KB per note is the cap on a NEW capture. A 3.7
   // export can carry a note that was already over it (Codex review, T-0102 B2: skipping it here
@@ -1026,7 +1166,8 @@ function parseEntryRow(entry: ExportEntry): { row: PendingInsert } | { failure: 
   // never coincidental, whatever its other tags, status:draft included or not).
   const rawTags = Array.isArray(entry.tags) ? normalizeTagList(entry.tags) : [];
   const originalHoldReason = heldReason(rawTags);
-  const tagsParsed = parseTags(entry.tags);
+  const tagsParsed = preserveWriteContext && Array.isArray(entry.tags) && entry.tags.every(t => typeof t === "string")
+    ? { ok: true as const, tags: entry.tags } : parseTags(entry.tags);
   if (!tagsParsed.ok) return { failure: { id, status: "failed", reason: tagsParsed.reason } };
 
   let source = "import";
@@ -1034,7 +1175,11 @@ function parseEntryRow(entry: ExportEntry): { row: PendingInsert } | { failure: 
     if (typeof entry.source !== "string") {
       return { failure: { id, status: "failed", reason: "invalid_source" } };
     }
-    source = entry.source.trim() || "import";
+    // Export/restore is a round trip, not a data-cleaning boundary. New capture
+    // already canonicalizes source, while a legacy owner-defined value must not
+    // change merely because it passed through R2. The backup mirror gate trims
+    // only for classification, so padded provider IDs are rejected, not laundered.
+    source = entry.source;
   }
 
   const createdAtParsed = parseCreatedAt(entry.created_at);
@@ -1065,6 +1210,50 @@ function parseEntryRow(entry: ExportEntry): { row: PendingInsert } | { failure: 
   const lossesParsed = parseOptionalNumber(entry.contradiction_losses, "invalid_contradiction_losses");
   if (!lossesParsed.ok) return { failure: { id, status: "failed", reason: lossesParsed.reason } };
 
+  const memoryTier = entry.memory_tier ?? "warm";
+  if (!isMemoryTier(memoryTier)) {
+    return { failure: { id, status: "failed", reason: "invalid_memory_tier" } };
+  }
+  const pinned = entry.pinned ?? false;
+  if (typeof pinned !== "boolean") {
+    return { failure: { id, status: "failed", reason: "invalid_pinned" } };
+  }
+  const lastRecalledAt = entry.last_recalled_at ?? null;
+  if (lastRecalledAt !== null && (typeof lastRecalledAt !== "number" || !Number.isFinite(lastRecalledAt))) {
+    return { failure: { id, status: "failed", reason: "invalid_last_recalled_at" } };
+  }
+
+  const whenAt = entry.when_at ?? null;
+  const whenKind = entry.when_kind ?? null;
+  const whenSource = entry.when_source ?? null;
+  const whenLabel = entry.when_label ?? null;
+  if ((whenAt !== null && (typeof whenAt !== "number" || !Number.isSafeInteger(whenAt) || !Number.isFinite(new Date(whenAt).getTime())))
+    || (whenKind !== null && !["due", "event", "wake"].includes(whenKind))
+    || (whenSource !== null && !["explicit", "regex", "model", "cleared"].includes(whenSource))
+    || (whenLabel !== null && (typeof whenLabel !== "string" || whenLabel.length > 120 || whenLabel.includes("\0")))) {
+    return { failure: { id, status: "failed", reason: "invalid_when" } };
+  }
+
+  const workspaceId = preserveWriteContext ? entry.workspace_id ?? "" : "";
+  const actorId = preserveWriteContext ? entry.actor_id ?? "" : "";
+  if (typeof workspaceId !== "string" || typeof actorId !== "string"
+    || workspaceId.includes("\0") || actorId.includes("\0")
+    || new TextEncoder().encode(workspaceId).byteLength > MAX_IMPORT_ID_BYTES
+    || new TextEncoder().encode(actorId).byteLength > MAX_IMPORT_ID_BYTES) {
+    return { failure: { id, status: "failed", reason: "invalid_write_context" } };
+  }
+
+  if (enforceIndexLimits) {
+    try {
+      validateIndexableMemory(id, contentParsed.value, tagsParsed.tags, source);
+    } catch (error) {
+      if (error instanceof MemoryInputError) {
+        return { failure: { id, status: "failed", reason: "index_limit", detail: error.message } };
+      }
+      throw error;
+    }
+  }
+
   return {
     row: {
       id,
@@ -1077,6 +1266,12 @@ function parseEntryRow(entry: ExportEntry): { row: PendingInsert } | { failure: 
       importance_score: importanceParsed.value,
       contradiction_wins: winsParsed.value,
       contradiction_losses: lossesParsed.value,
+      memory_tier: memoryTier,
+      pinned,
+      last_recalled_at: lastRecalledAt,
+      when_at: whenAt, when_kind: whenKind, when_source: whenSource, when_label: whenLabel,
+      workspaceId,
+      actorId,
       originalHoldReason,
       ...importedWindow(entry.valid_from, entry.valid_until, created_at),
     },
@@ -1135,13 +1330,29 @@ function importedWindow(from: unknown, until: unknown, createdAt: number, now = 
 }
 
 /** Parse one edge row into an insertable record, or the failure to report. */
-function parseEdgeRow(edge: ExportEdge): { edge: PendingEdge } | { failure: ImportEdgeResult } {
+function parseEdgeRow(
+  edge: ExportEdge,
+  preserveWriteContext = false,
+): { edge: PendingEdge } | { failure: ImportEdgeResult } {
   if (!isImportRecordObject(edge)) {
     return { failure: { source_id: "", target_id: "", type: "", status: "failed", reason: "invalid_edge" } };
   }
   const sourceParsed = parseRequiredString(edge.source_id, "missing_endpoint", "invalid_endpoint");
   const targetParsed = parseRequiredString(edge.target_id, "missing_endpoint", "invalid_endpoint");
   const type = typeof edge.type === "string" ? edge.type.trim() || "relates_to" : "relates_to";
+  const workspaceId = preserveWriteContext ? edge.workspace_id ?? "" : "";
+  if (typeof workspaceId !== "string" || workspaceId.includes("\0")
+    || new TextEncoder().encode(workspaceId).byteLength > MAX_IMPORT_ID_BYTES) {
+    return {
+      failure: {
+        source_id: typeof edge.source_id === "string" ? edge.source_id : "",
+        target_id: typeof edge.target_id === "string" ? edge.target_id : "",
+        type,
+        status: "failed",
+        reason: "invalid_write_context",
+      },
+    };
+  }
 
   if (!sourceParsed.ok || !targetParsed.ok) {
     const reason = !sourceParsed.ok ? sourceParsed.reason : !targetParsed.ok ? targetParsed.reason : "missing_endpoint";
@@ -1155,8 +1366,21 @@ function parseEdgeRow(edge: ExportEdge): { edge: PendingEdge } | { failure: Impo
       },
     };
   }
-  const source_id = sourceParsed.value;
-  const target_id = targetParsed.value;
+  const validSource = validateImportId(sourceParsed.value, "invalid_endpoint");
+  const validTarget = validateImportId(targetParsed.value, "invalid_endpoint");
+  if (!validSource.ok || !validTarget.ok) {
+    return {
+      failure: {
+        source_id: sourceParsed.value,
+        target_id: targetParsed.value,
+        type,
+        status: "failed",
+        reason: "invalid_endpoint",
+      },
+    };
+  }
+  const source_id = validSource.value;
+  const target_id = validTarget.value;
 
   if (!isValidEdgeType(type)) {
     return { failure: { source_id, target_id, type, status: "failed", reason: "invalid_type" } };
@@ -1174,15 +1398,41 @@ function parseEdgeRow(edge: ExportEdge): { edge: PendingEdge } | { failure: Impo
     edge.provenance && typeof edge.provenance === "string" && isValidProvenance(edge.provenance)
       ? edge.provenance
       : "explicit";
+  const rawId = edge.id ?? crypto.randomUUID();
+  const idParsed = parseRequiredString(rawId, "missing_id", "invalid_id");
+  if (!idParsed.ok) {
+    return { failure: { source_id, target_id, type, status: "failed", reason: idParsed.reason } };
+  }
+  const validId = validateImportId(idParsed.value, "invalid_id");
+  if (!validId.ok) {
+    return { failure: { source_id, target_id, type, status: "failed", reason: validId.reason } };
+  }
+  const metadata = edge.metadata ?? {};
+  if (!isImportRecordObject(metadata)) {
+    return { failure: { source_id, target_id, type, status: "failed", reason: "invalid_metadata" } };
+  }
+  const createdAtParsed = parseCreatedAt(edge.created_at);
+  if (!createdAtParsed.ok) {
+    return { failure: { source_id, target_id, type, status: "failed", reason: createdAtParsed.reason } };
+  }
+  const created_at = createdAtParsed.value;
+  const updatedAt = edge.updated_at ?? created_at;
+  if (typeof updatedAt !== "number" || !Number.isFinite(updatedAt)) {
+    return { failure: { source_id, target_id, type, status: "failed", reason: "invalid_updated_at" } };
+  }
 
   return {
     edge: {
+      id: validId.value,
       source_id,
       target_id,
       type,
       weight: weightParsed.value,
       provenance,
-      created_at: typeof edge.created_at === "number" ? edge.created_at : Date.now(),
+      metadata: JSON.stringify(metadata),
+      created_at,
+      updatedAt,
+      workspaceId,
     },
   };
 }

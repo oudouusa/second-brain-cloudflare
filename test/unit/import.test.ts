@@ -5,6 +5,8 @@ import {
   ENTRY_INSERT_COLUMNS,
   ENTRY_INSERT_SQL,
   EDGE_ENDPOINT_QUERY_BATCH,
+  IMPORT_DEFAULT_LIMIT,
+  IMPORT_MAX_LIMIT,
   formatDbError,
   isImportRecordObject,
   parseCreatedAt,
@@ -110,10 +112,10 @@ describe("import helpers", () => {
   });
 
   it("parseImportLimit clamps invalid and oversized values", () => {
-    expect(parseImportLimit(null)).toBe(40);
-    expect(parseImportLimit("0")).toBe(40);
-    expect(parseImportLimit("50")).toBe(50);
-    expect(parseImportLimit("99999")).toBe(1000);
+    expect(parseImportLimit(null)).toBe(IMPORT_DEFAULT_LIMIT);
+    expect(parseImportLimit("0")).toBe(IMPORT_DEFAULT_LIMIT);
+    expect(parseImportLimit("50")).toBe(IMPORT_MAX_LIMIT);
+    expect(parseImportLimit("99999")).toBe(IMPORT_MAX_LIMIT);
   });
 
   it("formatDbError truncates long messages", () => {

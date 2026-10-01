@@ -30,8 +30,8 @@
  * way the test above does for the older surfaces.
  */
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { Client } from "@modelcontextprotocol/client";
+import { InMemoryTransport } from "@modelcontextprotocol/client";
 import { buildMcpServer } from "../../src/mcp/server";
 import { recallEntries } from "../../src/recall/search";
 import { buildGraph, expandGraph, getConnections } from "../../src/graph/traverse";
@@ -68,7 +68,7 @@ async function call(name: string, args: Record<string, unknown> = {}) {
 beforeEach(async () => {
   resetDatabaseInit();
   sqlite = makeSqliteD1();
-  env = makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV() });
+  env = sqlite.admitEnv(makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV() }));
   await initializeDatabase(env);
   await ensureTenantBootstrap(env);
   identity = (await resolveIdentityFromToken("test-token", env))!;
@@ -103,10 +103,10 @@ describe("held text: the agent-facing reader inventory", () => {
     ).bind("held-seed--readable-neighbor", "held-seed", "readable-neighbor").run();
 
     // recall (dense arm rejected so the keyword arm, matching the seeded text, is the only source)
-    const recallEnv = makeTestEnv(undefined, {
+    const recallEnv = sqlite.admitEnv(makeTestEnv(undefined, {
       DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV(),
       VECTORIZE: makeVectorizeMock({ query: (async () => { throw new Error("index unavailable"); }) as never }),
-    });
+    }));
     const { matches } = await recallEntries({ query: "ignore previous instructions", topK: 5, synthesize: false }, recallEnv, ctx);
     expect(JSON.stringify(matches), "recall").not.toContain(HELD_MARKER);
 

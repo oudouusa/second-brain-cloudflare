@@ -1,3 +1,5 @@
+import type { Env } from "../env";
+import { memoryWriteMarker } from "../migration/write-lock";
 // Project registry: a thin, workspace-bound row per project. Membership is NOT stored
 // here; it lives on entries as the reserved `project:<slug>` tag (see src/tags/system.ts).
 // Every read takes the caller's readable workspace ids, every write one exact workspace.
@@ -198,6 +200,7 @@ export async function createProject(
   db: D1Database,
   ws: string,
   input: { id?: string; name: string; description?: string; aliases?: string[] },
+  env?: Env,
 ): Promise<ProjectRow> {
   const name = cleanText(input.name, "name", MAX_PROJECT_NAME_CHARS, true);
   const description = input.description === undefined ? "" : cleanText(input.description, "description", MAX_PROJECT_DESCRIPTION_CHARS, false);
@@ -213,13 +216,13 @@ export async function createProject(
 
   const created_at = Date.now();
   const inserted = await db.prepare(
-    `INSERT INTO projects (id, workspace_id, name, description, aliases, status, created_at) VALUES (?, ?, ?, ?, ?, 'active', ?) ON CONFLICT(workspace_id, id) DO NOTHING RETURNING id`,
-  ).bind(slug, ws, name, description, JSON.stringify(aliases), created_at).first();
+    `INSERT INTO projects (id, workspace_id, name, description, aliases, status, created_at, write_marker) VALUES (?, ?, ?, ?, ?, 'active', ?, ?) ON CONFLICT(workspace_id, id) DO NOTHING RETURNING id`,
+  ).bind(slug, ws, name, description, JSON.stringify(aliases), created_at, memoryWriteMarker(env ?? { DB: db } as Env)).first();
   if (!inserted) throw new SlugTakenError(`project "${slug}" already exists`);
   return { id: slug, workspace_id: ws, name, description, aliases, status: "active", created_at, updated_at: null };
 }
 
-export async function updateProject(db: D1Database, ws: string, slug: string, patch: ProjectPatch): Promise<ProjectRow> {
+export async function updateProject(db: D1Database, ws: string, slug: string, patch: ProjectPatch, env?: Env): Promise<ProjectRow> {
   const sets: string[] = [];
   const binds: unknown[] = [];
   const next: Partial<ProjectRow> = {};
@@ -236,25 +239,28 @@ export async function updateProject(db: D1Database, ws: string, slug: string, pa
   if (!current) throw new ProjectNotFoundError(`unknown project "${slug}"`);
 
   const updated_at = Date.now();
-  await db.prepare(`UPDATE projects SET ${sets.join(", ")}, updated_at = ? WHERE workspace_id = ? AND id = ?`)
-    .bind(...binds, updated_at, ws, slug).run();
+  await db.prepare(`UPDATE projects SET ${sets.join(", ")}, updated_at = ?, write_marker = ? WHERE workspace_id = ? AND id = ?`)
+    .bind(...binds, updated_at, memoryWriteMarker(env ?? { DB: db } as Env), ws, slug).run();
   return { ...current, ...next, updated_at };
 }
 
 /** Removes the registry row only; member entries keep their project: tag. */
-export async function deleteProject(db: D1Database, ws: string, slug: string): Promise<boolean> {
-  const deleted = await db.prepare(`DELETE FROM projects WHERE workspace_id = ? AND id = ? RETURNING id`).bind(ws, slug).first();
-  return deleted !== null;
+export async function deleteProject(db: D1Database, ws: string, slug: string, env?: Env): Promise<boolean> {
+  const [, deleted] = await db.batch([
+    db.prepare(`UPDATE projects SET write_marker = ? WHERE workspace_id = ? AND id = ?`).bind(memoryWriteMarker(env ?? { DB: db } as Env, "delete"), ws, slug),
+    db.prepare(`DELETE FROM projects WHERE workspace_id = ? AND id = ?`).bind(ws, slug),
+  ]);
+  return Number(deleted.meta.changes ?? 0) > 0;
 }
 
 /**
  * Auto-create for capture with an unknown project. One statement, never overwrites an
  * existing (possibly archived or renamed) row. True only when this call created it.
  */
-export async function ensureProject(db: D1Database, ws: string, slug: string): Promise<boolean> {
+export async function ensureProject(db: D1Database, ws: string, slug: string, env?: Env): Promise<boolean> {
   assertSlug(slug, "slug");
   const inserted = await db.prepare(
-    `INSERT INTO projects (id, workspace_id, name, description, aliases, status, created_at) VALUES (?, ?, ?, '', '[]', 'active', ?) ON CONFLICT(workspace_id, id) DO NOTHING RETURNING id`,
-  ).bind(slug, ws, slug, Date.now()).first();
+    `INSERT INTO projects (id, workspace_id, name, description, aliases, status, created_at, write_marker) VALUES (?, ?, ?, '', '[]', 'active', ?, ?) ON CONFLICT(workspace_id, id) DO NOTHING RETURNING id`,
+  ).bind(slug, ws, slug, Date.now(), memoryWriteMarker(env ?? { DB: db } as Env)).first();
   return inserted !== null;
 }

@@ -4,11 +4,14 @@
  * clause, not a mock's string match — is what is actually under test.
  */
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { runWhenExtractPass, readWhenCursor, WHEN_CURSOR_KEY, WHEN_EXTRACT_PER_NIGHT } from "../../src/when/pass";
+import { runWhenExtractPass as runUnadmittedWhenExtractPass, readWhenCursor, WHEN_CURSOR_KEY, WHEN_EXTRACT_PER_NIGHT } from "../../src/when/pass";
 import { makeSqliteD1, type SqliteD1 } from "../helpers/sqlite-d1";
 import { makeTestEnv, makeMemoryKV, makeVectorizeMock } from "../helpers/make-env";
 import { initializeDatabase, resetDatabaseInit } from "../../src/db/init";
 import type { Env } from "../../src/env";
+
+const runWhenExtractPass: typeof runUnadmittedWhenExtractPass = (env, ctx, workspaceId, limit) =>
+  runUnadmittedWhenExtractPass(sq!.admitEnv(env), ctx, workspaceId, limit);
 
 const ctx = { waitUntil: (_: Promise<unknown>) => {} } as unknown as ExecutionContext;
 
@@ -22,7 +25,6 @@ function dbOf(s: SqliteD1) {
     async batch(stmts: { run(): Promise<any> }[]) {
       const out: any[] = [];
       for (const st of stmts) out.push(await st.run());
-      s.issued.splice(s.issued.length - stmts.length, stmts.length, `BATCH(${stmts.length})`);
       return out.map((r: any) => ({ ...r, meta: { changes: 1, ...r?.meta } }));
     },
   };
@@ -116,6 +118,22 @@ describe("runWhenExtractPass — the prefilter", () => {
 });
 
 describe("runWhenExtractPass — persistence and cursor", () => {
+  it("AFTER trigger の書込みが増えても確定した候補だけを数えて cursor を進める", async () => {
+    sq = await migrated();
+    seedOpenLoop(sq, "loop-1", "File the annual report", 1000);
+    await sq.db.exec(`CREATE TABLE when_trigger_probe (entry_id TEXT);
+      CREATE TRIGGER when_trigger_probe_update AFTER UPDATE OF when_at ON entries
+      BEGIN INSERT INTO when_trigger_probe (entry_id) VALUES (NEW.id); END;`);
+    const env = makeTestEnv(dbOf(sq) as any, {
+      OAUTH_KV: makeMemoryKV(),
+      AI: makeAI(`{"is_commitment": true, "what": "File the report", "due_at": "2027-01-30", "confidence": 0.9}`),
+    });
+    const summary = await runWhenExtractPass(env, ctx, null);
+    expect(summary).toMatchObject({ whenExtracted: 1, ok: true });
+    expect((await sq.db.prepare("SELECT entry_id FROM when_trigger_probe").all()).results).toEqual([{ entry_id: "loop-1" }]);
+    expect(await readWhenCursor(env)).toEqual({ createdAt: 1000, id: "loop-1" });
+  });
+
   it("persists when_at/when_kind/when_source/when_label only for confident commitments", async () => {
     sq = await migrated();
     seedOpenLoop(sq, "loop-1", "File the annual report", 1000);
@@ -223,7 +241,7 @@ describe("runWhenExtractPass — persistence and cursor", () => {
 });
 
 describe("runWhenExtractPass — budget", () => {
-  it("costs at most 10 D1 statements and at most WHEN_EXTRACT_PER_NIGHT model calls at a full slate", async () => {
+  it("夜間2候補のbatch内SQLも1文ずつ数え、10文以内に収める", async () => {
     sq = await migrated();
     for (let i = 0; i < WHEN_EXTRACT_PER_NIGHT + 5; i++) {
       seedOpenLoop(sq, `loop-${i}`, `Candidate ${i}`, 1000 + i);
@@ -232,15 +250,13 @@ describe("runWhenExtractPass — budget", () => {
     const env = makeTestEnv(dbOf(sq) as any, { OAUTH_KV: makeMemoryKV(), AI: ai });
 
     sq.issued.length = 0;
-    const summary = await runWhenExtractPass(env, ctx, null);
+    const summary = await runWhenExtractPass(env, ctx, null, 2);
 
-    expect((ai.run as any).mock.calls.length).toBeLessThanOrEqual(WHEN_EXTRACT_PER_NIGHT);
-    expect(summary.whenJudged).toBe(WHEN_EXTRACT_PER_NIGHT);
-    // One SELECT (the prefilter) plus one BATCH (every persisted commitment,
-    // however many) — the whole point of collecting writes instead of running
-    // them as they are decided.
+    expect((ai.run as any).mock.calls.length).toBeLessThanOrEqual(2);
+    expect(summary.whenJudged).toBe(2);
+    // 排他確認1文、候補SELECT1文、期限UPDATE2文。batchを1文には数えない。
     expect(sq.issued.length).toBeLessThanOrEqual(10);
-    expect(sq.issued.length).toBe(2);
+    expect(sq.issued.length).toBe(4);
   });
 
   it("costs one SELECT and no batch when nothing is a commitment", async () => {
@@ -251,7 +267,7 @@ describe("runWhenExtractPass — budget", () => {
     sq.issued.length = 0;
     await runWhenExtractPass(env, ctx, null);
 
-    expect(sq.issued.length).toBe(1);
+    expect(sq.issued.length).toBe(2);
   });
 });
 
@@ -450,5 +466,119 @@ describe("runWhenExtractPass — Finding 2: bounded quarantine for a permanently
     errorSpy.mockRestore();
 
     expect(summary.whenSkipped).toBe(0); // poison-b's own count is 1, not inherited from poison-a
+  });
+});
+
+describe("期限の辞退判断を入力の指紋で再利用する", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  it("同じ記憶の次巡回ではモデルを呼ばず、本文をKVに保存しない", async () => {
+    sq = await migrated();
+    seedOpenLoop(sq, "private-id", "機密の本文", 1000);
+    const kv = makeMemoryKV();
+    const put = vi.spyOn(kv, "put");
+    const ai = makeAI('{"is_commitment":false}');
+    const env = makeTestEnv(dbOf(sq) as any, { OAUTH_KV: kv, AI: ai });
+    expect((await runWhenExtractPass(env, ctx, "", 2)).whenJudged).toBe(1);
+    await runWhenExtractPass(env, ctx, "", 2); // 末尾到達
+    sq.issued.length = 0;
+    expect((await runWhenExtractPass(env, ctx, "", 2)).whenJudged).toBe(0);
+    expect(ai.run).toHaveBeenCalledTimes(1);
+    expect(sq.issued).toHaveLength(2); // 排他確認と候補走査のみ
+    const reviews = put.mock.calls.filter(([key]) => key.startsWith("when:review:"));
+    expect(reviews).toHaveLength(1);
+    expect(JSON.stringify(reviews)).not.toContain("機密の本文");
+    expect(JSON.stringify(reviews)).not.toContain("private-id");
+    expect(reviews[0][2]).toEqual({ expirationTtl: 30 * 24 * 60 * 60 });
+  });
+
+  it.each(["本文", "タグ", "workspace", "モデル", "timezone"])("%sが変われば未変更のupdated_atでも再評価する", async kind => {
+    sq = await migrated();
+    seedOpenLoop(sq, "task", "作業", 1000);
+    const kv = makeMemoryKV();
+    const ai = makeAI('{"is_commitment":false}');
+    const env = makeTestEnv(dbOf(sq) as any, { OAUTH_KV: kv, AI: ai });
+    await runWhenExtractPass(env, ctx, "", 2);
+    await runWhenExtractPass(env, ctx, "", 2);
+    if (kind === "本文") await sq.db.prepare("UPDATE entries SET content='変更後' WHERE id='task'").run();
+    if (kind === "タグ") await sq.db.prepare("UPDATE entries SET tags='[\"task\",\"project:work\"]' WHERE id='task'").run();
+    if (kind === "workspace") await sq.db.prepare("UPDATE entries SET workspace_id='other' WHERE id='task'").run();
+    if (kind === "モデル") await kv.put("config:overrides", JSON.stringify({ WHEN_LLM_MODEL: "別モデル" }));
+    if (kind === "timezone") await kv.put("config:overrides", JSON.stringify({ TIMEZONE: "Asia/Tokyo" }));
+    expect((await runWhenExtractPass(env, ctx, kind === "workspace" ? "other" : "", 2)).whenJudged).toBe(1);
+    expect(ai.run).toHaveBeenCalledTimes(2);
+  });
+
+  it("削除期限を過ぎたKV値が読めても30日後には再評価する", async () => {
+    sq = await migrated();
+    seedOpenLoop(sq, "task", "作業", 1000);
+    const ai = makeAI('{"is_commitment":false}');
+    const env = makeTestEnv(dbOf(sq) as any, { OAUTH_KV: makeMemoryKV(), AI: ai });
+    await runWhenExtractPass(env, ctx, "", 2);
+    await runWhenExtractPass(env, ctx, "", 2);
+    vi.spyOn(Date, "now").mockReturnValue(Date.now() + 31 * 24 * 60 * 60 * 1000);
+    expect((await runWhenExtractPass(env, ctx, "", 2)).whenJudged).toBe(1);
+    expect(ai.run).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(["破損", "読取障害", "書込障害"])("KVの%sでは通常のモデル判定へ戻る", async failure => {
+    sq = await migrated();
+    seedOpenLoop(sq, "task", "作業", 1000);
+    const kv = makeMemoryKV();
+    const get = kv.get.bind(kv);
+    const put = kv.put.bind(kv);
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    if (failure === "書込障害") vi.spyOn(kv, "put").mockImplementation(async (key, value, options) => {
+      if (key.startsWith("when:review:")) throw new Error("KV error");
+      return put(key, value, options);
+    });
+    const ai = makeAI('{"is_commitment":false}');
+    const env = makeTestEnv(dbOf(sq) as any, { OAUTH_KV: kv, AI: ai });
+    await runWhenExtractPass(env, ctx, "", 2);
+    await runWhenExtractPass(env, ctx, "", 2);
+    if (failure !== "書込障害") vi.spyOn(kv, "get").mockImplementation((async (key: string) => {
+      if (key.startsWith("when:review:")) {
+        if (failure === "読取障害") throw new Error("KV error");
+        return "{broken";
+      }
+      return get(key);
+    }) as any);
+    expect((await runWhenExtractPass(env, ctx, "", 2)).whenJudged).toBe(1);
+    expect(ai.run).toHaveBeenCalledTimes(2);
+  });
+
+  it("モデル失敗はキャッシュせず、本文変更で失敗回数もリセットする", async () => {
+    sq = await migrated();
+    seedOpenLoop(sq, "task", "作業", 1000);
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const kv = makeMemoryKV();
+    const ai = makeAI("unused");
+    vi.mocked(ai.run).mockRejectedValue(new Error("AI unavailable"));
+    const env = makeTestEnv(dbOf(sq) as any, { OAUTH_KV: kv, AI: ai });
+    await runWhenExtractPass(env, ctx, "", 2);
+    await runWhenExtractPass(env, ctx, "", 2);
+    await sq.db.prepare("UPDATE entries SET content='別の作業' WHERE id='task'").run();
+    expect((await runWhenExtractPass(env, ctx, "", 2)).whenSkipped).toBe(0);
+    expect((await readWhenCursor(env, ""))?.failCount).toBe(1);
+    expect((await kv.list({ prefix: "when:review:" })).keys).toHaveLength(0);
+    expect(ai.run).toHaveBeenCalledTimes(3);
+  });
+
+  it.each(["保存失敗", "CAS競合"])("同じ回の%sでは辞退判断のキャッシュも確定しない", async failure => {
+    sq = await migrated();
+    seedOpenLoop(sq, "decline", "判断1", 1000);
+    seedOpenLoop(sq, "commit", "判断2", 2000);
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const kv = makeMemoryKV();
+    const ai = makeAI('{"is_commitment":true,"what":"作業","due_at":"2027-01-30","confidence":0.9}');
+    vi.mocked(ai.run).mockImplementationOnce(makeAI('{"is_commitment":false}').run);
+    if (failure === "CAS競合") vi.mocked(ai.run).mockImplementationOnce(async () => {
+      await sq!.db.prepare("UPDATE entries SET content='競合後' WHERE id='commit'").run();
+      return makeAI('{"is_commitment":true,"what":"作業","due_at":"2027-01-30","confidence":0.9}').run("model", {});
+    });
+    const env = makeTestEnv((failure === "保存失敗" ? dbWithFailingBatch(sq) : sq.db) as any, { OAUTH_KV: kv, AI: ai });
+    expect((await runWhenExtractPass(env, ctx, "", 2)).ok).toBe(false);
+    expect((await kv.list({ prefix: "when:review:" })).keys).toHaveLength(0);
+    expect(await readWhenCursor(env, "")).toBeNull();
   });
 });

@@ -76,8 +76,8 @@ describe("purge", () => {
   it("purgeLimit adapts to VERSION_KEEP and is capped by the ceiling", () => {
     expect(purgeLimit(20, 10, 1000)).toBe(10); // 1000 / 49 = 20, ceiling 10
     expect(purgeLimit(500, 10, 1000)).toBe(1); // 1000 / 1009 = 0, at least one
-    expect(purgeLimit(20, 400, 5000)).toBe(102); // 5000 / 49
-    expect(purgeLimit(5, 400, 5000)).toBe(263); // 5000 / 19
+    expect(purgeLimit(20, 400, 5000)).toBe(100); // 5000 / 49
+    expect(purgeLimit(5, 400, 5000)).toBe(250); // 5000 / (10 + 2 * 5), including the delete marker
   });
 
   it("is chosen from the real version counts: a row trashed with 500 versions is costed at 500", async () => {
@@ -156,7 +156,7 @@ describe("purge", () => {
     const realBatch = t.env.DB.batch.bind(t.env.DB);
     let injected = false;
     (t.env.DB as any).batch = async (stmts: any[]) => {
-      const first = String(stmts[0]?.sourceSql?.() ?? "");
+      const first = stmts.map(s => String(s.sourceSql?.() ?? "")).join("\n");
       if (!injected && first.includes("'purged'") && first.includes("system:purge")) {
         injected = true;
         // Between the purge's candidate read and its batch: the user restores, then forgets again.
@@ -182,11 +182,13 @@ describe("nightly cleanup", () => {
     // event): 400 rows cost 3,600, so the 10,000-row share ends the night in the third batch
     // (400 + 400 + 311 rows). The spec's "2,000 on night one" ignores its own budget.
     const first = await runNightlyCleanup(t.env);
-    expect(first.purged).toBe(1111);
+    expect(first.purged).toBe(1000);
     expect(first.rowsWritten).toBeLessThanOrEqual(TRASH_PURGE_NIGHTLY_ROWS);
-    expect(await count(`SELECT COUNT(*) n FROM entries_trash`)).toBe(2050 - 1111);
+    expect(await count(`SELECT COUNT(*) n FROM entries_trash`)).toBe(2050 - 1000);
     const second = await runNightlyCleanup(t.env);
-    expect(second.purged).toBe(939);
+    expect(second.purged).toBe(1000);
+    expect(await count(`SELECT COUNT(*) n FROM entries_trash`)).toBe(50);
+    await runNightlyCleanup(t.env);
     expect(await count(`SELECT COUNT(*) n FROM entries_trash`)).toBe(0);
   });
 
@@ -228,13 +230,13 @@ describe("a night with a bulk purge and a pending removal", () => {
     const P = member.personalWorkspaceId;
     await t.sqlite.db.exec(`
       WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ${entries})
-      INSERT INTO entries (id, content, tags, source, created_at, vector_ids, workspace_id, actor_id)
-      SELECT 'm' || i, 'c', '[]', 'api', 1, '[]', '${P}', '${member.userId}' FROM n`);
+      INSERT INTO entries (id, content, tags, source, created_at, vector_ids, workspace_id, actor_id, write_marker)
+      SELECT 'm' || i, 'c', '[]', 'api', 1, '[]', '${P}', '${member.userId}', '${t.sqlite.fixtureMarker()}' FROM n`);
     if (versionsEach) {
       await t.sqlite.db.exec(`
         WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ${versionsEach})
-        INSERT INTO entry_versions (entry_id, workspace_id, seq, content, prior_length, tags, actor_id, channel, reason, created_at)
-        SELECT 'm1', '${P}', i, 'v', NULL, '[]', '', 'rest', 'update', i FROM n`);
+        INSERT INTO entry_versions (entry_id, workspace_id, seq, content, prior_length, tags, actor_id, channel, reason, created_at, write_marker)
+        SELECT 'm1', '${P}', i, 'v', NULL, '[]', '', 'rest', 'update', i, '${t.sqlite.fixtureMarker()}' FROM n`);
     }
     // Claim the removal without running its cleanup.
     await t.sqlite.db.prepare(`UPDATE users SET removed_at = 5 WHERE id = ?`).bind(member.userId).run();
@@ -290,8 +292,8 @@ describe("adversary (MINOR): the nightly purge must not run at half the spec's p
     t = await makeTrashEnv();
     await seedTrashRows(t, 1000, { prefix: "m", deletedAt: 1, reason: "disconnect" });
     await t.sqlite.db.exec(`
-      INSERT INTO entry_versions (entry_id, workspace_id, seq, content, prior_length, tags, actor_id, channel, reason, created_at)
-      SELECT t.id, '', s.seq, 'v', NULL, '[]', '', 'system:mirror', 'mirror', 1
+      INSERT INTO entry_versions (entry_id, workspace_id, seq, content, prior_length, tags, actor_id, channel, reason, created_at, write_marker)
+      SELECT t.id, '', s.seq, 'v', NULL, '[]', '', 'system:mirror', 'mirror', 1, '${t.sqlite.fixtureMarker()}'
         FROM entries_trash t, (SELECT 1 AS seq UNION ALL SELECT 2 UNION ALL SELECT 3) s`);
 
     const night = await runNightlyCleanup(t.env);
@@ -313,26 +315,17 @@ describe("adversary round 2: the oversized-row trim branch must respect the rete
 
     // Between the candidate read and the trim DELETE: restore, then forget again (a fresh trash row).
     const { getTrashedEntry, restoreEntry } = await import("../../src/memory/trash");
-    const realPrepare = t.env.DB.prepare.bind(t.env.DB);
+    const realBatch = t.env.DB.batch.bind(t.env.DB);
     let injected = false;
-    (t.env.DB as any).prepare = (sql: string) => {
-      const stmt = realPrepare(sql);
+    (t.env.DB as any).batch = async (stmts: D1PreparedStatement[]) => {
+      const sql = stmts.map(s => (s as any).sourceSql?.() ?? "").join("\n");
       if (!injected && /DELETE FROM entry_versions WHERE id IN \(\s*SELECT v\.id/.test(sql)) {
-        const bind = stmt.bind.bind(stmt);
-        (stmt as any).bind = (...args: unknown[]) => {
-          const bound = bind(...args);
-          const run = bound.run.bind(bound);
-          (bound as any).run = async () => {
-            injected = true;
-            const trashed = await getTrashedEntry(t.env, undefined, "big");
-            expect((await restoreEntry(t.env, trashed!, { actorId: "u", channel: "rest" }, c)).status).toBe("restored");
-            expect((await forgetEntry("big", t.env, { actorId: "u", channel: "rest" }, { reason: "forget", config: c, purge: false }, t.roots.ownerPersonalWorkspaceId)).status).toBe("deleted");
-            return run();
-          };
-          return bound;
-        };
+        injected = true;
+        const trashed = await getTrashedEntry(t.env, undefined, "big");
+        expect((await restoreEntry(t.env, trashed!, { actorId: "u", channel: "rest" }, c)).status).toBe("restored");
+        expect((await forgetEntry("big", t.env, { actorId: "u", channel: "rest" }, { reason: "forget", config: c, purge: false }, t.roots.ownerPersonalWorkspaceId)).status).toBe("deleted");
       }
-      return stmt;
+      return realBatch(stmts);
     };
     // rowTarget 20 forces the trim branch: the row costs 7 + 2 x 30 = 67.
     const r = await purgeTrash(t.env, c, { ceiling: 10, rowTarget: 20 });

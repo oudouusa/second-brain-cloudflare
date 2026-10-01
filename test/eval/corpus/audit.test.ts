@@ -1,3 +1,6 @@
+import { vi } from "vitest";
+// 上流の固定corpusは候補窓500件向け。これはfixture自体の整合性試験でありforkの順位評価ではない。
+vi.mock("../../../src/constants", async importOriginal => ({ ...await importOriginal<object>(), KEYWORD_CANDIDATE_LIMIT: 500 }));
 import { describe, expect, it } from "vitest";
 import { auditQueries, haystackVocabulary, keywordRouteModel, staleRouteGaps, type CorpusIntent } from "./audit";
 import { ACTORS, DAY_MS, EVAL_NOW, WORKSPACES, type CorpusEdge, type CorpusEntry } from "./types";

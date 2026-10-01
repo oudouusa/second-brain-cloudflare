@@ -1,9 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { distillToRareTerms } from "../../src/recall/distill";
-import { resetDatabaseInit, initializeDatabase } from "../../src/db/init";
-import { makeSqliteD1, type SqliteD1 } from "../helpers/sqlite-d1";
-import { makeTestEnv, makeMemoryKV } from "../helpers/make-env";
-import type { Env } from "../../src/env";
+import { tokenizeQuery } from "../../src/text/lexical-query";
 
 // A minimal env whose D1 aggregation returns crafted document-frequencies. The columns
 // d0..dN map to the query's unique content tokens in order (as distillToRareTerms builds
@@ -41,6 +38,35 @@ describe("distillToRareTerms", () => {
     expect(sql).toContain("WHERE created_at >= ? AND created_at < ?");
     expect(bindings.slice(-2)).toEqual([100, 200]);
   });
+
+  it("counts raw and NFKC probes as one document-frequency term", async () => {
+    let sql = "";
+    let bindings: unknown[] = [];
+    const env = {
+      DB: {
+        prepare: (value: string) => {
+          sql = value;
+          return {
+            bind: (...values: unknown[]) => {
+              bindings = values;
+              return { first: async () => ({ total: 10, d0: 1, d1: 2 }) };
+            },
+          };
+        },
+      },
+    } as any;
+
+    const out = await distillToRareTerms("Ｃｌｏｕｄｆｌａｒｅ quartz", env);
+
+    expect(sql).toContain("(content LIKE ? ESCAPE '\\' OR content LIKE ? ESCAPE '\\')");
+    expect(bindings.slice(0, 3)).toEqual([
+      "%cloudflare%",
+      "%Ｃｌｏｕｄｆｌａｒｅ%",
+      "%quartz%",
+    ]);
+    expect(out.df?.get("cloudflare")).toBe(1);
+    expect(out.terms?.find(term => term.value === "cloudflare")?.probes).toHaveLength(2);
+  });
   it("drops corpus-saturating terms and keeps the rare, discriminative ones", async () => {
     // "second"/"brain" saturate the corpus (>30%); "dictawiz"/"reddit" are rare.
     const order = ["second", "brain", "dictawiz", "reddit"];
@@ -58,6 +84,74 @@ describe("distillToRareTerms", () => {
     expect(out.query).toBe("quarterly budget finance");
   });
 
+  it("does not spend rare-term slots on tokens absent from the corpus", async () => {
+    // CJK fallback bigrams can cross grammatical boundaries. In this real
+    // query, "じロ" occurs zero times; treating df=0 as maximally rare used a
+    // slot on a term that cannot retrieve anything and dropped the observed
+    // subject word "ダッシュボード".
+    const query = "ダッシュボードとMCPを同じログインのCloudflare Accessにした最終構成は？";
+    const order = tokenizeQuery(query);
+    const env = envWith(44, {
+      "ダッシュボード": 3, "ダッ": 7, "ッシ": 7, mcp: 12, "を同": 6,
+      "同じ": 8, "ログイン": 3, "ログ": 6, "イン": 8, cloudflare: 9,
+      access: 10, "した": 20, "最終": 6, "終構": 0, "構成": 3, "成は": 0,
+    }, order);
+
+    const out = await distillToRareTerms(query, env);
+
+    expect(out.query).toBe("ダッシュボード ログイン 構成");
+    expect(out.query).not.toContain("終構");
+  });
+
+  it("希少な質問語よりも観測済みの識別子を1枠だけ保持する", async () => {
+    const query = "#730 alpha beta gamma";
+    const out = await distillToRareTerms(query,
+      envWith(100, { "#730": 20, alpha: 1, beta: 2, gamma: 3 }, tokenizeQuery(query)));
+    expect(out.query).toBe("#730 alpha beta");
+  });
+
+  it.each([0, 70])("未観測・頻出の識別子を優先しない (df=%i)", async frequency => {
+    const query = "#730 alpha beta gamma";
+    const out = await distillToRareTerms(query,
+      envWith(100, { "#730": frequency, alpha: 1, beta: 2, gamma: 3 }, tokenizeQuery(query)));
+    expect(out.query).toBe("alpha beta gamma");
+  });
+
+  it("全語頻出のfallbackでも識別子に特別な枠を与えない", async () => {
+    const query = "#730 alpha beta gamma";
+    const out = await distillToRareTerms(query,
+      envWith(100, { "#730": 90, alpha: 40, beta: 50, gamma: 60 }, tokenizeQuery(query)));
+    expect(out.query).toBe("alpha beta gamma");
+  });
+
+  it("複数の識別子があっても予約枠は1つにとどめる", async () => {
+    const query = "#730 /runbook.md alpha beta gamma";
+    const out = await distillToRareTerms(query,
+      envWith(100, { "#730": 20, "/runbook.md": 25, alpha: 1, beta: 2, gamma: 3 }, tokenizeQuery(query)));
+    expect(out.query).toBe("#730 alpha beta");
+  });
+
+  it("略語だけでは希少語より優先しない", async () => {
+    const query = "MCP alpha beta gamma";
+    const out = await distillToRareTerms(query,
+      envWith(100, { mcp: 20, alpha: 1, beta: 2, gamma: 3 }, tokenizeQuery(query)));
+    expect(out.query).toBe("alpha beta gamma");
+  });
+
+  it("単語の部分bigramを重複選択せず別の質問語を残す", async () => {
+    const query = "スキル 再開 個人";
+    const out = await distillToRareTerms(query,
+      envWith(100, { "スキル": 1, "スキ": 1, "キル": 1, "再開": 2, "個人": 3 }, tokenizeQuery(query)));
+    expect(out.query).toBe("スキル 再開 個人");
+  });
+
+  it("単語が未観測なら部分bigramの救済を維持する", async () => {
+    const query = "スキル 再開 個人";
+    const out = await distillToRareTerms(query,
+      envWith(100, { "スキル": 0, "スキ": 1, "キル": 1, "再開": 2, "個人": 3 }, tokenizeQuery(query)));
+    expect(out.query).toBe("スキ キル 再開");
+  });
+
   it("strips grammatical stopwords, then drops saturating content words", async () => {
     // "what/on/the/to" are grammatical stopwords (removed first); "happened" is a content
     // word but saturates the corpus (>30%) so it's dropped, leaving the rare subject.
@@ -67,10 +161,12 @@ describe("distillToRareTerms", () => {
     expect(out.query).toBe("trip cleveland");
   });
 
-  it("returns a single content word unchanged without touching the DB", async () => {
-    const env = { DB: { prepare: () => { throw new Error("should not query"); } } } as any;
-    const out = await distillToRareTerms("dictawiz", env);
+  it("returns corpus df and total for a single content word", async () => {
+    const out = await distillToRareTerms("dictawiz", envWith(40, { dictawiz: 1 }, ["dictawiz"]));
     expect(out.query).toBe("dictawiz");
+    expect(out.df?.get("dictawiz")).toBe(1);
+    expect(out.total).toBe(40);
+    expect(out.distillSource).toBe("like");
   });
 
   it("falls back to the content words if the frequency scan fails", async () => {
@@ -101,11 +197,12 @@ describe("distillToRareTerms", () => {
     expect(out.df?.get("brain")).toBe(85);
   });
 
-  it("returns null stats when the query never reaches the DB", async () => {
+  it("returns null stats when the query has no content terms", async () => {
     const env = { DB: { prepare: () => { throw new Error("should not query"); } } } as any;
-    const out = await distillToRareTerms("dictawiz", env);
+    const out = await distillToRareTerms("the", env);
     expect(out.df).toBeNull();
     expect(out.total).toBeNull();
+    expect(out.distillSource).toBe("shortcut");
   });
 
   it("returns null stats when the frequency scan fails", async () => {
@@ -132,8 +229,10 @@ describe("distillToRareTerms", () => {
     const env = envWith(100, { cloudflare: 5, 認証: 20, 方式: 40, 変更: 60, 理由: 3 }, order);
     const out = await distillToRareTerms("Cloudflare 認証方式を変更した理由", env);
     expect([...out.df!.keys()]).toEqual(order);
-    // The surface text is what gets embedded: the CJK run survives whole.
-    expect(out.query).toBe("Cloudflare 認証方式を変更した理由");
+    // The fork embeds the original semantic query by default; this field stays
+    // the bounded rare-term lexical query.
+    expect(out.query).toBe("cloudflare 認証 理由");
+    expect(out.terms?.map(term => term.value)).toEqual(["cloudflare", "認証", "理由"]);
   });
 
   it("scans a single CJK word when it carries more than one term", async () => {
@@ -142,43 +241,6 @@ describe("distillToRareTerms", () => {
     const out = await distillToRareTerms("認証方式を変更した理由", env);
     expect(out.df?.get("方式")).toBe(4);
     expect(out.total).toBe(100);
-    expect(out.query).toBe("認証方式を変更した理由");
-  });
-
-  // ── Final fix round: variant folding must not move keep/rebuilt ────────────
-  //
-  // The df scan now also counts deterministicVariants (plural/stemmed forms)
-  // so keywordSearch's budget check has full coverage. keep/rebuilt still
-  // select from the original content terms alone — the values below are the
-  // rebuilt strings the pre-fix code produced, captured verbatim at 59ee98b.
-  it("keeps rebuilt queries identical once variants join the df scan", async () => {
-    resetDatabaseInit();
-    const sqlite = makeSqliteD1();
-    const env = makeTestEnv(undefined, {
-      DB: sqlite.db as unknown as Env["DB"],
-      OAUTH_KV: makeMemoryKV(),
-    });
-    await initializeDatabase(env);
-    for (let i = 0; i < 2100; i++) sqlite.seed({ id: `row-${i}`, content: "widget gadget ledger", createdAt: i + 1 });
-    for (let i = 0; i < 100; i++) sqlite.seed({ id: `mix-${i}`, content: "widgets gadgets trackers notes", createdAt: 10000 + i });
-    for (let i = 0; i < 50; i++) sqlite.seed({ id: `sota-${i}`, content: "Redwood Grove Terrace dashboard", createdAt: 20000 + i });
-    for (let i = 0; i < 30; i++) sqlite.seed({ id: `hyph-${i}`, content: "foo-bar baz qux", createdAt: 30000 + i });
-    for (let i = 0; i < 40; i++) sqlite.seed({ id: `misc-${i}`, content: "January 15 2024 ledger processing status finished tasks", createdAt: 40000 + i });
-
-    const expected: Record<string, string> = {
-      "widgets gadgets trackers notes": "widgets gadgets trackers",
-      "widgets gadgets": "widgets gadgets",
-      "State of the Art dashboard": "State Art dashboard",
-      "Redwood Grove Terrace ledger": "Redwood Grove Terrace",
-      "foo-bar baz qux": "foo-bar baz qux",
-      "January 15 2024 ledger": "January 15 2024",
-      "processing status finished tasks": "processing status finished",
-      "widget gadget": "widget gadget",
-    };
-    for (const query of Object.keys(expected)) {
-      const out = await distillToRareTerms(query, env);
-      expect(out.query, query).toBe(expected[query]);
-    }
-    sqlite.close();
+    expect(out.query).toBe("認証 方式 変更");
   });
 });

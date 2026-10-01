@@ -124,11 +124,11 @@ async function migrated(): Promise<SqliteD1> {
  * changes between tests.
  */
 function envOf(s: SqliteD1): Env {
-  return makeTestEnv(s.db as any, {
+  return s.admitEnv(makeTestEnv(s.db as any, {
     OAUTH_KV: makeMemoryKV(),
     VECTORIZE: makeVectorizeMock({
       getByIds: vi.fn().mockImplementation(async (ids: string[]) =>
-        ids.map(id => ({ id, values: new Array(384).fill(0.1) }))),
+        ids.map(id => ({ id, values: new Array(128).fill(0.1) }))),
       query: vi.fn().mockResolvedValue({
         matches: [
           { id: "a", score: 0.99, metadata: { parentId: "a" } },
@@ -136,7 +136,7 @@ function envOf(s: SqliteD1): Env {
         ],
       }),
     }),
-  });
+  }));
 }
 
 const DAY = 86400000;
@@ -208,13 +208,13 @@ describe("runInsightAccrual() pair authorship rule", () => {
  * edge between "a" and "b" can.
  */
 function supersedesEnvOf(s: SqliteD1): Env {
-  return makeTestEnv(s.db as any, {
+  return s.admitEnv(makeTestEnv(s.db as any, {
     OAUTH_KV: makeMemoryKV(),
     VECTORIZE: makeVectorizeMock({
       getByIds: vi.fn().mockImplementation(async (ids: string[]) =>
-        ids.map(id => ({ id, values: new Array(384).fill(0.1) }))),
+        ids.map(id => ({ id, values: new Array(128).fill(0.1) }))),
     }),
-  });
+  }));
 }
 
 function seedFiller(s: SqliteD1) {
@@ -226,10 +226,14 @@ function seedFiller(s: SqliteD1) {
 }
 
 async function insertSupersedesEdge(s: SqliteD1, sourceId: string, targetId: string) {
-  await s.db.prepare(
-    `INSERT INTO edges (id, source_id, target_id, type, weight, provenance, metadata, created_at, updated_at)
-     VALUES ('edge-explicit', ?, ?, 'supersedes', 1.0, 'explicit', '{}', ?, ?)`,
-  ).bind(sourceId, targetId, 1000, 1000).run();
+  const env = s.admitEnv(makeTestEnv(s.db as any));
+  await env.DB.prepare(
+    `INSERT INTO edges (id, source_id, target_id, type, weight, provenance, metadata, created_at, updated_at, write_marker)
+     VALUES ('edge-explicit', ?, ?, 'supersedes', 1.0, 'explicit', '{}', ?, ?, ?)`,
+  ).bind(
+    sourceId, targetId, 1000, 1000,
+    `${env.WRITE_ADMISSION_TOKEN}:write:${crypto.randomUUID()}`,
+  ).run();
 }
 
 describe("runInsightAccrual() pair authorship rule — explicit supersedes edges", () => {

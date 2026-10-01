@@ -1,0 +1,31 @@
+{
+  "schema": "sb54-representative-plan.v1",
+  "approvedOn": "2026-09-07",
+  "approval": "ユーザーが代表ケースへ絞る方針を承認。Free維持。対象は次の実測前に固定。",
+  "fixtureIds": [
+    "10000-ordinary-noise-en",
+    "1000-ordinary-noise-ja",
+    "1000-excluded-window-en",
+    "200-equal-authority-overflow-en",
+    "10000-equal-authority-overflow-ja",
+    "200-no-answer-ja"
+  ],
+  "modes": ["healthy", "quota", "embedding-failure", "vector-failure"],
+  "warmupsPerCondition": 1,
+  "measuredRepetitionsPerCondition": 3,
+  "httpCallsBothArms": 384,
+  "additionalLargeSeedFixtures": ["10000-ordinary-noise-en", "10000-equal-authority-overflow-ja"],
+  "preserveExistingSmallFixtures": true,
+  "finalEntriesPerDatabase": 29600,
+  "gates": {
+    "publicWarmP95CpuMs": 10,
+    "doP95Cpu": "candidate <= max(1.25 * baseline, baseline + 20ms)",
+    "endToEndP95": "candidate <= max(1.25 * baseline, baseline + 200ms)",
+    "d1RowsRead": "candidate <= max(1.25 * baseline, baseline + 1000)",
+    "requiredHitsOrEmpty": "すべて成功",
+    "lostBaselineHits": 0,
+    "foreignWorkspaceResults": 0,
+    "exceptionsOrIncompleteTelemetry": 0
+  },
+  "scope": "代表条件での受入。旧24fixture全体の遠隔合格とは呼ばない。既知overflowのmissと旧失敗は保全。"
+}

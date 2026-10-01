@@ -57,7 +57,7 @@ describe("holdStatements emits snapshot, guarded tags UPDATE with vector_ids '[]
       guard,
     });
 
-    expect(stmts).toHaveLength(3);
+    expect(stmts).toHaveLength(4);
     expect(stmts[0]).toMatchObject({ kind: "snapshot" });
     expect(snapshot).toHaveBeenCalledWith(env, {
       entryId: "e-1", reason: "status", change, content: { kind: "unchanged" }, nextTags: heldTags,
@@ -66,12 +66,14 @@ describe("holdStatements emits snapshot, guarded tags UPDATE with vector_ids '[]
       guard,
     });
 
-    expect(prepared).toHaveLength(1);
-    expect(stmts[1]).toBe(prepared[0]);
-    expect(prepared[0].sql).toMatch(/^UPDATE entries SET tags = \?1, vector_ids = '\[\]' WHERE id = \?2 AND \(updated_at = \?3 AND actor_id = \?4\)$/);
-    expect(prepared[0].bindings).toEqual([JSON.stringify(heldTags), "e-1", 123, "u-1"]);
+    expect(prepared).toHaveLength(2);
+    expect(stmts[1]).toBe(prepared[1]);
+    expect(prepared[1].sql).toContain("INSERT INTO vector_cleanup_ops");
+    expect(stmts[2]).toBe(prepared[0]);
+    expect(prepared[0].sql).toMatch(/^UPDATE entries SET write_marker = \?5, tags = \?1, vector_ids = '\[\]' WHERE id = \?2 AND \(updated_at = \?3 AND actor_id = \?4\)$/);
+    expect(prepared[0].bindings).toEqual([JSON.stringify(heldTags), "e-1", 123, "u-1", null]);
 
-    expect(stmts[2]).toEqual({ kind: "prune", id: "e-1", keep: 20 });
+    expect(stmts[3]).toEqual({ kind: "prune", id: "e-1", keep: 20 });
   });
 
   it("reuses a placeholder for a repeated value and omits the guard clause when there is none", () => {
@@ -84,26 +86,26 @@ describe("holdStatements emits snapshot, guarded tags UPDATE with vector_ids '[]
       entryId: "e-3", reasons: ["burst"], score: 1, signals: [], change, heldTags: ["x"], now: 1,
       guard: p => `(id = ${p.add("e-3")} AND tags <> ${p.add("[]")})`,
     });
-    expect(prepared[0].sql).toBe(`UPDATE entries SET tags = ?1, vector_ids = '[]' WHERE id = ?2`);
-    expect(prepared[1].sql).toBe(`UPDATE entries SET tags = ?1, vector_ids = '[]' WHERE id = ?2 AND ((id = ?2 AND tags <> ?3))`);
-    expect(prepared[1].bindings).toEqual([JSON.stringify(["x"]), "e-3", "[]"]);
+    expect(prepared[0].sql).toBe(`UPDATE entries SET write_marker = ?3, tags = ?1, vector_ids = '[]' WHERE id = ?2`);
+    expect(prepared[2].sql).toBe(`UPDATE entries SET write_marker = ?4, tags = ?1, vector_ids = '[]' WHERE id = ?2 AND ((id = ?2 AND tags <> ?3))`);
+    expect(prepared[2].bindings).toEqual([JSON.stringify(["x"]), "e-3", "[]", null]);
   });
 
   it("the UPDATE runs on real SQLite: sets the held tags, clears vector_ids, and respects the guard", async () => {
     const sq = makeSqliteD1();
     try {
       sq.seed({ id: "e-4", content: "text", createdAt: 1, tags: ["work"], vectorIds: ["v1", "v2"] });
-      const env = { DB: sq.db } as unknown as Env;
+      const env = sq.admitEnv({ DB: sq.db } as unknown as Env);
       const noop = () => ({}) as D1PreparedStatement;
       const heldTags = heldTagsFor(["work"], ["instruction"]);
       const deps = { snapshotStatement: noop, pruneStatement: noop, versionKeep: 20 };
       const base = { entryId: "e-4", reasons: ["instruction" as const], score: 1, signals: [], change, heldTags, now: 1 };
 
-      await holdStatements(env, deps, { ...base, guard: p => `created_at = ${p.add(999)}` })[1].run();
+      await holdStatements(env, deps, { ...base, guard: p => `created_at = ${p.add(999)}` })[2].run();
       let row = await sq.db.prepare(`SELECT tags, vector_ids FROM entries WHERE id = 'e-4'`).first() as { tags: string; vector_ids: string };
       expect(JSON.parse(row.tags)).toEqual(["work"]);
 
-      await holdStatements(env, deps, { ...base, guard: p => `created_at = ${p.add(1)}` })[1].run();
+      await holdStatements(env, deps, { ...base, guard: p => `created_at = ${p.add(1)}` })[2].run();
       row = await sq.db.prepare(`SELECT tags, vector_ids FROM entries WHERE id = 'e-4'`).first() as { tags: string; vector_ids: string };
       expect(JSON.parse(row.tags)).toEqual(heldTags);
       expect(row.vector_ids).toBe("[]");

@@ -904,8 +904,10 @@ async function releaseHeld(entry, btn) {
  */
 async function hydrateView(id) {
   try {
-    const res = await fetch(`${WORKER_URL}/entry?id=${encodeURIComponent(id)}`, {
-      headers: { Authorization: `Bearer ${AUTH_TOKEN}` },
+    const res = await fetch(`${WORKER_URL}/entry`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${AUTH_TOKEN}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id }),
     })
     const data = await res.json()
     if (!data.ok || !data.entry) return
@@ -1139,8 +1141,10 @@ function closeView() {
 // ── Related memories (issue #16) ──────────────────────────────────────────
 async function loadRelated(id, el) {
   try {
-    const res = await fetch(`${WORKER_URL}/connections?id=${encodeURIComponent(id)}`, {
-      headers: { Authorization: `Bearer ${AUTH_TOKEN}` },
+    const res = await fetch(`${WORKER_URL}/connections`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${AUTH_TOKEN}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id }),
     })
     const data = await res.json()
     if (!data.ok || !data.connections || !data.connections.length) {

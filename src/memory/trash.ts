@@ -1,3 +1,4 @@
+import { assertMemoryWritesAllowed, memoryWriteMarker } from "../migration/write-lock";
 import type { Env } from "../env";
 import type { ChangeContext } from "../lib/audit";
 import {
@@ -192,6 +193,8 @@ export function trashManyStatements(
      * it keeps the pre-existing by-id-only behavior.
      */
     workspacePairs?: readonly { id: string; workspaceId: string }[];
+    /** 単一lifecycle操作が同batchで作った台帳を送信するためのID。 */
+    cleanupOperations?: readonly { entryId: string; opId: string }[];
   },
 ): D1PreparedStatement[] {
   const all = [...plan.tier1, ...plan.tier2, ...plan.tier3];
@@ -236,15 +239,34 @@ export function trashManyStatements(
       // vector_ids is the live row's own value at deletion time (round 2 adversary): a short
       // append's chunk (id-update-<ts>, store.ts) is not a function of content, so it cannot be
       // rederived later — Delete forever needs the real ids stored, not just guessed at.
-      `INSERT INTO entries_trash (${TRASH_COLUMNS})
+      `INSERT INTO entries_trash (${TRASH_COLUMNS}, write_marker)
        SELECT e.id, e.workspace_id, e.actor_id, e.content, ${rowJsonSql("e")}, ${withEdges ? edgesJsonSql("e") : "'[]'"}, e.vector_ids,
-              ${nowIdx}, ${actorIdx}, ${channelIdx}, ${reasonIdx}, lower(hex(randomblob(16)))
+              ${nowIdx}, ${actorIdx}, ${channelIdx}, ${reasonIdx}, lower(hex(randomblob(16))), ${p.add(memoryWriteMarker(env))}
          FROM entries e WHERE e.id IN (SELECT value FROM json_each(${idList}))${entriesGuardSql(p, "e")}`,
     ).bind(...p.values()));
   };
   if (plan.tier1.length) insert(plan.tier1, true);
   if (plan.tier2.length) insert(plan.tier2, false);
   stmts.push(...(meta.hook ?? []));
+  {
+    const p = new Params();
+    const ids = p.add(JSON.stringify(all));
+    // versioning: exempt: 同batchでtrashへ移す行の削除許可markerのみ。
+    stmts.push(env.DB.prepare(`UPDATE entries SET write_marker = ${p.add(memoryWriteMarker(env, "delete"))}
+      WHERE id IN (SELECT value FROM json_each(${ids}))${entriesGuardSql(p, "entries")}`).bind(...p.values()));
+  }
+
+  const entryDelete = (() => {
+    const p = new Params();
+    const idIdx = p.add(JSON.stringify(all));
+    return env.DB.prepare(
+      // validity: retraction-hooked (forget and the disconnect purge pass meta.hook, D-RET)
+      // versioning: trash
+      // scope-exempt: by-id delete: callers authorize the entries before building the batch
+      `DELETE FROM entries WHERE id IN (SELECT value FROM json_each(${idIdx}))${entriesGuardSql(p, "entries")}`,
+    ).bind(...p.values());
+  })();
+
   if (plan.tier3.length) {
     const p = new Params();
     // Codex review, T-0102, director follow-up MAJOR: keyed on the same workspace guard as the
@@ -257,6 +279,7 @@ export function trashManyStatements(
       // own scope-checked EXISTS below); an oversized entry leaves no history behind. Guarded on the
       // id not already being trashed: a losing tier-3 forget (its stale size read predates a shrink
       // that let a racing forget trash the row normally) must not wipe the winner's trashed history.
+    // write-fence: parent-capability=entries_trash（同batchのsnapshot・認可済み記憶をtriggerで検証）
       `DELETE FROM entry_versions WHERE entry_id IN (SELECT value FROM json_each(${p.add(JSON.stringify(plan.tier3))}))
          AND NOT EXISTS (SELECT 1 FROM entries_trash t WHERE t.id = entry_versions.entry_id)${referencedEntryGuardSql(p, ["entry_versions.entry_id"])}`,
     ).bind(...p.values()));
@@ -283,28 +306,52 @@ export function trashManyStatements(
       ).bind(...tp.values()));
     }
   }
+  {
+    const p = new Params();
+    const ids = p.add(JSON.stringify(all));
+    const opIdSql = meta.cleanupOperations
+      ? `(SELECT json_extract(k.value, '$[1]') FROM json_each(${p.add(JSON.stringify(meta.cleanupOperations.map(o => [o.entryId, o.opId])))}) k WHERE json_extract(k.value, '$[0]') = e.id)`
+      : "lower(hex(randomblob(16)))";
+    // scope-checked: 直前のworkspacePairsから作るentriesGuardSqlで削除対象と同じ行だけ記録する。
+    // validity: any: 同batchで削除する行の索引を台帳へ記録する。
+    stmts.push(env.DB.prepare(`INSERT INTO vector_cleanup_ops
+      (op_id, entry_id, vector_ids, created_at, ready, expires_at, write_marker)
+      SELECT ${opIdSql}, e.id, e.vector_ids, ${p.add(meta.now)}, 1, ${p.add(meta.now)}, ${p.add(memoryWriteMarker(env))}
+      FROM entries e WHERE e.id IN (SELECT value FROM json_each(${ids}))${entriesGuardSql(p, "e")}`).bind(...p.values()));
+  }
   const ids = JSON.stringify(all);
+  {
+    const p = new Params();
+    const list = p.add(ids);
+    const guard = referencedEntryGuardSql(p, ["insight_candidates.a_id", "insight_candidates.b_id"]);
+    const selected = `(a_id IN (SELECT value FROM json_each(${list})) OR b_id IN (SELECT value FROM json_each(${list})))${guard}`;
+    stmts.push(env.DB.prepare(`UPDATE insight_candidates SET write_marker = ${p.add(memoryWriteMarker(env, "delete"))} WHERE ${selected}`).bind(...p.values()));
+    const d = new Params();
+    const dl = d.add(ids);
+    stmts.push(env.DB.prepare(`DELETE FROM insight_candidates WHERE (a_id IN (SELECT value FROM json_each(${dl})) OR b_id IN (SELECT value FROM json_each(${dl})))${referencedEntryGuardSql(d, ["insight_candidates.a_id", "insight_candidates.b_id"])}`).bind(...d.values()));
+  }
+  {
+    const p = new Params();
+    const list = p.add(ids);
+    stmts.push(env.DB.prepare(`DELETE FROM append_receipts WHERE entry_id IN (SELECT value FROM json_each(${list}))${referencedEntryGuardSql(p, ["append_receipts.entry_id"])}`).bind(...p.values()));
+  }
+  {
+    const p = new Params();
+    const list = p.add(ids);
+    stmts.push(env.DB.prepare(`UPDATE edges SET write_marker = ${p.add(memoryWriteMarker(env, "delete"))}
+      WHERE (source_id IN (SELECT value FROM json_each(${list})) OR target_id IN (SELECT value FROM json_each(${list})))${referencedEntryGuardSql(p, ["edges.source_id", "edges.target_id"])}`).bind(...p.values()));
+  }
+
   {
     const p = new Params();
     const list = p.add(ids);
     stmts.push(env.DB.prepare(
       // scope-exempt: by-id cascade: edge endpoints of the rows being trashed
-      // Codex review, T-0102, director follow-up MAJOR: same workspace guard as the rest of this batch,
-      // for the same reason as the version DELETE above -- an unguarded edges DELETE could not half-apply
-      // on its own, but running it while the entries DELETE was refused still orphaned a live row's edges.
+      // entries削除と同じworkspace guardで、競合時に生きた行の辺を消さない。
       `DELETE FROM edges WHERE (source_id IN (SELECT value FROM json_each(${list})) OR target_id IN (SELECT value FROM json_each(${list})))${referencedEntryGuardSql(p, ["edges.source_id", "edges.target_id"])}`,
     ).bind(...p.values()));
   }
-  {
-    const p = new Params();
-    const idIdx = p.add(ids);
-    stmts.push(env.DB.prepare(
-      // validity: retraction-hooked (forget and the disconnect purge pass meta.hook, D-RET)
-      // versioning: trash
-      // scope-exempt: by-id delete: callers authorize the entries before building the batch
-      `DELETE FROM entries WHERE id IN (SELECT value FROM json_each(${idIdx}))${entriesGuardSql(p, "entries")}`,
-    ).bind(...p.values()));
-  }
+  stmts.push(entryDelete);
   return stmts;
 }
 
@@ -423,7 +470,7 @@ const DAY_MS = 86_400_000;
 const MIN_RETENTION_DAYS = 1;
 /** Rows written to purge one trash row: the purged event (6, since idx_entry_events_life_end --
  *  R23 -- also indexes it: it matches its own predicate) and the trash row (3), plus 2 per version. */
-const PURGE_ROW_COST = 9;
+const PURGE_ROW_COST = 10; // 有効な削除markerを付与する1行書込みを含む。
 
 /** A ceiling on the trash rows a purge reads, sized for rows holding VERSION_KEEP versions (the batch is still costed from the real counts). */
 export function purgeLimit(versionKeep: number, ceiling: number, rowTarget: number): number {
@@ -492,22 +539,29 @@ export async function purgeTrash(
   if (!chosen.length) {
     // Even the first row does not fit. If it is the row itself that is oversized, trim its oldest versions.
     const first = candidates[0];
-    const chunk = Math.min(VERSION_DELETE_CHUNK, Math.floor(budget / 2));
+    const chunk = Math.min(VERSION_DELETE_CHUNK, Math.floor((budget - 1) / 2));
     if (chunk < 1) return { ...none, read: candidates.length, budgetCut: true };
     const tp = new Params();
     const trimId = tp.add(first.id);
     const trimCutoff = tp.add(cutoff);
-    const res = await env.DB.prepare(
+    const trimStatement = env.DB.prepare(
       // scope-exempt: retention purge of one trashed entry's versions, oldest first, only while the id is not live
       // and its trash row is still genuinely expired: a restore plus a re-forget between the candidate
       // read and this statement gives the same id a fresh, unexpired trash row (round 2 adversary).
+    // write-fence: parent-capability=entries_trash（同batchのsnapshot・認可済み記憶をtriggerで検証）
       `DELETE FROM entry_versions WHERE id IN (
          SELECT v.id FROM entry_versions v WHERE v.entry_id = ${trimId} AND NOT EXISTS (SELECT 1 FROM entries x WHERE x.id = v.entry_id)
            AND EXISTS (SELECT 1 FROM entries_trash t WHERE t.id = v.entry_id AND t.deleted_at < ${trimCutoff})
           ORDER BY v.seq LIMIT ${tp.add(chunk)})`,
-    ).bind(...tp.values()).run();
+    ).bind(...tp.values());
+    const sp = new Params();
+    const trashStamp = env.DB.prepare(`UPDATE entries_trash SET write_marker = ${sp.add(memoryWriteMarker(env, "delete"))} WHERE id = ${sp.add(first.id)} AND deleted_at < ${sp.add(cutoff)}`).bind(...sp.values());
+    const [stamp, res] = await env.DB.batch([
+      trashStamp,
+      trimStatement,
+    ]);
     const trimmed = changedRows(res);
-    return { read: candidates.length, purged: 0, trimmed, rowsWritten: rowsWrittenOf([res], 2 * trimmed), budgetCut: true };
+    return { read: candidates.length, purged: 0, trimmed, rowsWritten: rowsWrittenOf([stamp, res], 1 + 2 * trimmed), budgetCut: true };
   }
 
   // Each statement gets its own dense Params: D1 rejects a bound value with no matching placeholder.
@@ -525,7 +579,17 @@ export async function purgeTrash(
   const trashP = new Params();
   const trashIds = trashP.add(idsJson);
   const trashCutoff = trashP.add(cutoff);
-  const results3 = await env.DB.batch([
+  const stampP = new Params();
+  const stampIds = stampP.add(idsJson);
+  const stampCutoff = stampP.add(cutoff);
+  const trashStamp = env.DB.prepare(`UPDATE entries_trash SET write_marker = ${stampP.add(memoryWriteMarker(env, "delete"))}
+      WHERE id IN (SELECT value FROM json_each(${stampIds})) AND deleted_at < ${stampCutoff}`).bind(...stampP.values());
+  const trashDelete = env.DB.prepare(
+      // scope-exempt: retention purge: expired trash rows
+      `DELETE FROM entries_trash WHERE id IN (SELECT value FROM json_each(${trashIds})) AND deleted_at < ${trashCutoff}`,
+    ).bind(...trashP.values());
+  const allResults = await env.DB.batch([
+    trashStamp,
     env.DB.prepare(
       // scope-exempt: retention purge: the audit row of each expired trash row, in the batch that removes it
       `INSERT INTO entry_events (id, entry_id, actor_id, event, payload, created_at)
@@ -535,18 +599,17 @@ export async function purgeTrash(
     ).bind(...auditP.values()),
     env.DB.prepare(
       // scope-exempt: retention purge: versions of expired trash rows, never of a live entry, and only while that trash row is still expired
+    // write-fence: parent-capability=entries_trash（同batchのsnapshot・認可済み記憶をtriggerで検証）
       `DELETE FROM entry_versions WHERE entry_id IN (SELECT value FROM json_each(${versionsIds}))
          AND NOT EXISTS (SELECT 1 FROM entries x WHERE x.id = entry_versions.entry_id)
          AND EXISTS (SELECT 1 FROM entries_trash t WHERE t.id = entry_versions.entry_id AND t.deleted_at < ${versionsCutoff})`,
     ).bind(...versionsP.values()),
-    env.DB.prepare(
-      // scope-exempt: retention purge: expired trash rows
-      `DELETE FROM entries_trash WHERE id IN (SELECT value FROM json_each(${trashIds})) AND deleted_at < ${trashCutoff}`,
-    ).bind(...trashP.values()),
+    trashDelete,
   ]);
+  const results3 = allResults.slice(1);
   const purged = changedRows(results3[2]);
   // 6 per purged event (R23: idx_entry_events_life_end also indexes it), 2 per version, 3 per trash row.
-  const estimate = 6 * changedRows(results3[0]) + 2 * changedRows(results3[1]) + 3 * purged;
+  const estimate = changedRows(allResults[0]) + 6 * changedRows(results3[0]) + 2 * changedRows(results3[1]) + 3 * purged;
   // Codex review, T-0102 F1: the DELETE above only ever removed entries_trash's own row -- the
   // vectors a forgotten note still carried (Vectorize keeps its own copy independent of D1) were
   // never told the row was gone, so a purge orphaned them permanently. Only the rows that
@@ -568,7 +631,7 @@ export async function purgeTrash(
     }
   }
   return {
-    read: candidates.length, purged, trimmed: 0, rowsWritten: rowsWrittenOf(results3, estimate),
+    read: candidates.length, purged, trimmed: 0, rowsWritten: rowsWrittenOf(allResults, estimate),
     budgetCut: chosen.length < candidates.length,
   };
 }
@@ -730,20 +793,21 @@ export async function restoreEntry(
         // versioning: exempt: restore (P8): no version is written coming back from the trash;
         // the trash row and any surviving versions already are its history
         // scope-exempt: by-id: the caller authorized the trash row before building this batch
-        `INSERT INTO entries (id, ${names}, content, vector_ids)
-         SELECT t.id, ${exprs}, t.content, ${vecJson} FROM entries_trash t
+        `INSERT INTO entries (id, ${names}, content, vector_ids, write_marker)
+         SELECT t.id, ${exprs}, t.content, ${vecJson}, ${insertP.add(memoryWriteMarker(env))} FROM entries_trash t
           WHERE t.id = ${insertId} AND t.nonce = ${insertNonce}`,
       ).bind(...insertP.values()),
       env.DB.prepare(
         // scope-exempt: by-id: edges of the trash row the caller authorized, restored only where both endpoints are live in its workspace
-        `INSERT OR IGNORE INTO edges (id, source_id, target_id, type, weight, provenance, metadata, created_at, updated_at, workspace_id)
-         SELECT ${edgeCols}
+        `INSERT OR IGNORE INTO edges (id, source_id, target_id, type, weight, provenance, metadata, created_at, updated_at, workspace_id, write_marker)
+         SELECT ${edgeCols}, ${edgeP.add(memoryWriteMarker(env))}
            FROM entries_trash t, json_each(t.edges_json) j
           WHERE t.id = ${edgeId} AND t.nonce = ${edgeNonce}
-            AND ${edgeEndpointsReadableSql("json_extract(j.value, '$.source_id')", "json_extract(j.value, '$.target_id')", "json_array(t.workspace_id)")}`,
+            AND ${edgeEndpointsReadableSql("json_extract(j.value, '$.source_id')", "json_extract(j.value, '$.target_id')", "json_array(t.workspace_id)")} RETURNING id`,
       ).bind(...edgeP.values()),
       // scope-exempt: by-id: the trash row the caller authorized before building this batch
       env.DB.prepare(
+    // write-fence: parent-capability=entries（同batchで復元済みの行をtriggerで検証）
         `DELETE FROM entries_trash WHERE id = ${deleteId} AND nonce = ${deleteNonce}`,
       ).bind(...deleteP.values()),
       ...hook.statements,
@@ -786,7 +850,7 @@ export async function restoreEntry(
   if (ctx && tags.includes("standing:active")) standingTouched(env, ctx, cfg, [trashed.workspace_id]);
   return {
     status: "restored",
-    edgesRestored: changedRows(results[1]),
+    edgesRestored: results[1].results.length,
     trashedReason: trashed.reason,
     vectorCount: vectorIds.length,
     validity: outcomeOf(done),
@@ -846,7 +910,12 @@ export async function deleteForever(
     return env.DB.prepare(sql(bid, p)).bind(...p.values());
   };
 
-  const results = await env.DB.batch([
+  const trashStamp = byId((bid, p) => `UPDATE entries_trash SET write_marker = ${p.add(memoryWriteMarker(env, "delete"))} WHERE id = ${bid} AND workspace_id = ${p.add(authorizedWorkspaceId)} AND nonce = ${p.add(nonce)}`);
+  const trashDelete = byId((bid, p) => `DELETE FROM entries_trash WHERE id = ${bid} AND workspace_id = ${p.add(authorizedWorkspaceId)} AND nonce = ${p.add(nonce)}
+       RETURNING content, json_extract(row_json, '$.source') AS source, vector_ids, ${noLiveRow(bid)} AS vectors_free`);
+  const results = (await env.DB.batch([
+    trashStamp,
+    byId((bid, p) => `UPDATE edges SET write_marker = ${p.add(memoryWriteMarker(env, "delete"))} WHERE (source_id = ${bid} OR target_id = ${bid}) AND ${trashRow(p, bid)} AND ${noLiveRow(bid)}`),
     // scope-exempt: by-id, pinned to the authorized trash row's nonce
     byId((bid, p) => `INSERT INTO entry_events (id, entry_id, actor_id, event, payload, created_at)
        SELECT lower(hex(randomblob(16))), ${bid}, ${p.add(change.actorId)}, 'purged',
@@ -855,13 +924,13 @@ export async function deleteForever(
     // scope-exempt: by-id, pinned to the authorized trash row's nonce
     byId((bid, p) => `DELETE FROM edges WHERE (source_id = ${bid} OR target_id = ${bid}) AND ${trashRow(p, bid)} AND ${noLiveRow(bid)}`),
     // scope-exempt: by-id, pinned to the authorized trash row's nonce
+    // write-fence: parent-capability=entries_trash（同batchのsnapshot・認可済み記憶をtriggerで検証）
     byId((bid, p) => `DELETE FROM entry_versions WHERE entry_id = ${bid} AND ${trashRow(p, bid)} AND ${noLiveRow(bid)}`),
     // RETURNING the stored vector ids (they cover a short append's id-update-<ts> chunk) plus content
     // and source to rederive the rest for a row stored before that column existed.
     // scope-exempt: by-id, pinned to the authorized trash row's nonce
-    byId((bid, p) => `DELETE FROM entries_trash WHERE id = ${bid} AND workspace_id = ${p.add(authorizedWorkspaceId)} AND nonce = ${p.add(nonce)}
-       RETURNING content, json_extract(row_json, '$.source') AS source, vector_ids, ${noLiveRow(bid)} AS vectors_free`),
-  ]);
+    trashDelete,
+  ])).slice(2);
   if (changedRows(results[3]) === 0) return { status: "not_found" };
 
   const row = results[3].results?.[0] as { content?: string; source?: string; vector_ids?: string; vectors_free?: number } | undefined;

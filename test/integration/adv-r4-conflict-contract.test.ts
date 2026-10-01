@@ -24,7 +24,7 @@ const MOVE_SELECT = /^SELECT id, workspace_id, actor_id, vector_ids, tags FROM e
 beforeEach(async () => {
   resetDatabaseInit();
   sqlite = makeSqliteD1();
-  env = makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV() });
+  env = sqlite.admitEnv(makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV() }));
   await initializeDatabase(env);
   const roots = await ensureTenantBootstrap(env);
   companyWs = roots.companyWorkspaceId;
@@ -170,7 +170,7 @@ describe("R4-C3 (MINOR): the move route's D1 budget undercounts a conflicting it
       exec: (sql: string) => raw.exec(sql),
       batch: (stmts: any[]) => { if (counting) tally.d1++; return raw.batch(stmts.map((s: any) => s.__inner ?? s)); },
     };
-    const e = { ...env, DB, VECTORIZE: vectorize } as unknown as Env;
+    const e = { ...env, WRITE_ADMISSION_TOKEN: env.WRITE_ADMISSION_TOKEN, DB, VECTORIZE: vectorize } as unknown as Env;
     const itemMap: Record<string, { entryId: string; version: string }> = {};
     for (let i = 0; i < 10; i++) {
       const vids = Array.from({ length: 100 }, (_, k) => `e${i}-v${k}`); // 5 getByIds chunks each

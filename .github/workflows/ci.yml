@@ -1,12 +1,9 @@
-name: CI
+name: Worker CI
+
 on:
   push:
     branches: [main, "v*"]
-  # No branch filter: every pull request is checked regardless of its base.
-  # A filter here silently skips CI for PRs targeting a release branch, which
-  # is exactly when the checks matter most.
   pull_request:
-  # The full eval (golden-set replays, the workerd lock) is manual only; see eval-full below.
   workflow_dispatch:
 
 permissions:
@@ -14,19 +11,47 @@ permissions:
   pull-requests: write
 
 jobs:
-  test:
+  worker:
     runs-on: ubuntu-latest
-    # The default suite runs in about 2 minutes locally on two workers (the long golden-set eval replays are opt-in, see
-    # eval-full below); with them it took 9 minutes and the old 10-minute limit cancelled a run. 15 leaves headroom for a
-    # slower runner plus install, coverage, typecheck and the two bundle checks.
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v6
-      - uses: actions/setup-node@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+      - uses: actions/setup-node@v7
         with:
           node-version: "22"
           cache: npm
+      - name: upstream remote を読み取り専用で設定
+        run: |
+          git remote add upstream https://github.com/rahilp/second-brain-cloudflare.git
+          git config remote.upstream.pushurl DISABLED
+      - name: 依存install前にfork境界とlifecycle scriptを監査
+        # Feature PRではfork境界をhard gateにし、upstreamの新着・merge競合は
+        # reportに留める。最新追従そのものは定期Upstream Auditがhard gateする。
+        run: npm run upstream:audit:boundary
+      - name: 公開用treeの検査
+        run: node scripts/check-publication.mjs
+      - name: 依存監査の回帰試験（外部通信なし）
+        run: node --test experiments/dependency-audit/*.test.mjs
       - run: npm ci --legacy-peer-deps
+      - name: Prompt Capsule / cache experiment contract
+        run: |
+          node --test experiments/prompt-cache/*.test.mjs
+          node experiments/prompt-cache/session-example.mjs --api responses > /tmp/capsule-session-responses.json
+          node experiments/prompt-cache/session-example.mjs --api messages > /tmp/capsule-session-messages.json
+          node experiments/prompt-cache/mcp-authorize.mjs --help > /tmp/prompt-cache-mcp-authorize-help.txt
+          node experiments/prompt-cache/source-revalidate.mjs --help > /tmp/prompt-capsule-revalidate-help.txt
+          node experiments/prompt-cache/qualify.mjs --help > /tmp/prompt-cache-qualify-help.txt
+          node experiments/prompt-cache/dev-effect.mjs --help > /tmp/second-brain-dev-effect-help.txt
+          node experiments/prompt-cache/ab.mjs --dry-run --arm both --runs 2 --delay-ms 0 > /tmp/prompt-cache-ab.jsonl
+          test "$(wc -l < /tmp/prompt-cache-ab.jsonl)" -eq 6
+          node experiments/prompt-cache/verify.mjs --input /tmp/prompt-cache-ab.jsonl --gate structure > /tmp/prompt-cache-evidence.json
+          node -e 'const m=JSON.parse(require("node:fs").readFileSync("/tmp/prompt-cache-evidence.json","utf8")); if (m.schema !== "prompt-cache-evidence.v1" || m.verified !== true) process.exit(1)'
+      - name: 回答品質の検出器（外部通信なし）
+        run: python3 -B -m unittest discover -s experiments/answer-quality -p 'test_*.py'
       - run: npm run typecheck
       # The "no unscoped corpus query" rule from src/lib/scope.ts, machine-checked.
       # There is no ESLint in this repo; this is a plain Node script.
@@ -36,101 +61,66 @@ jobs:
       # run is noise); on here, so the log keeps a diffable record and a reason
       # drifting away from its SQL shows up in the diff.
       - run: npm run check:scope -- --inventory
-      - run: npm run test:coverage
+      # Vitestの既定値はCPU数−1。2 CPU runnerでも両CPUを使い、既存15分枠で後続gateまで実行する。
+      - run: npm run test:coverage -- --maxWorkers=100%
       # The CPU-budget tests above skip their timing assertions under coverage
       # instrumentation (v8 coverage adds per-call overhead the budgets were
       # never meant to absorb); this re-run, without --coverage, is what
       # actually enforces those budgets on CI.
-      - name: CPU budget tests (no coverage)
+      - name: CPU予算の計測（coverageなし）
         run: npx vitest run test/unit/quarantine-cold-cpu.test.ts test/unit/quarantine-score.test.ts test/unit/versions-chain.test.ts
-      # Bundles the Worker without deploying (no auth/network). Catches build
-      # or config errors that typecheck and tests miss. A fresh checkout has no
-      # .wrangler/ redirect, so this reads wrangler.jsonc directly.
-      - name: Build check (wrangler dry-run)
-        run: npx wrangler deploy --dry-run
-      # The desktop app bundles the Worker with its own esbuild script, which
-      # otherwise only runs on a release tag. It reads the Worker source
-      # directly, so a source move can break the desktop build while the tests
-      # and the wrangler dry-run above stay green. Catch that here instead of at
-      # tag time.
-      - name: Build check (desktop worker bundle)
-        working-directory: installer
-        run: npm ci && npm run bundle-worker
-      - name: Post coverage comment on PR
-        if: github.event_name == 'pull_request'
+      - name: 夜間SQLの隔離診断（外部通信なし）
+        env:
+          NIGHTLY_PROBE_OUTPUT: ${{ runner.temp }}/nightly-perf
+        run: npx --no-install vitest run --config experiments/nightly-perf/vitest.config.ts
+      - run: npm run benchmark:validate
+      - name: 最新 Wrangler 4.x で型定義を再生成して差分確認
+        run: |
+          npx --yes wrangler@4.146.0 types
+          npx tsc --noEmit
+          git diff --exit-code -- worker-configuration.d.ts
+      - name: Worker のビルド確認
+        run: npx --yes wrangler@4.146.0 deploy --dry-run
+      - name: Worker startup を確認
+        run: npx --yes wrangler@4.146.0 check startup --outfile /tmp/worker-startup.cpuprofile
+      - name: PR にカバレッジを投稿
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
         uses: davelosert/vitest-coverage-report-action@v2
 
-  # The full eval replays the golden set (1,751 queries on core-1k) in sqlite and on workerd (wrangler's local miniflare, the
-  # only source of a real rows_read), and takes well over an hour on a runner. It does not run on pull requests: the default
-  # suite above carries only a fast synthetic smoke check of the harness (test/eval/smoke.test.ts). Run it here by hand
-  # (Actions > CI > Run workflow), or locally with `npm run test:eval:full`, before merging any ranking change.
-  # Everything is local: getPlatformProxy boots a workerd in the runner, with no Cloudflare account, no secrets, and no remote
-  # binding. The public-corpora download test (about 1 GB and dataset licenses) is deliberately NOT part of it.
+  dependency-audit:
+    name: Dependency audit (report only)
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+      # No install, lifecycle scripts, package updates, secrets, or new scheduled job.
+      # Findings stay visible as "findings"; operational failures still fail this job.
+      - name: 本番・全依存の読み取り専用監査
+        run: node scripts/audit-dependencies.mjs --report-only --output "$RUNNER_TEMP/dependency-audit"
+      - name: 監査結果をJob Summaryへ保存
+        if: always()
+        run: |
+          if test -f "$RUNNER_TEMP/dependency-audit/audit.md"; then
+            cat "$RUNNER_TEMP/dependency-audit/audit.md" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  # 上流の全evalは手動実行。通常のWorker試験にはsmokeを含む。
   eval-full:
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 150
     steps:
       - uses: actions/checkout@v6
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: "22"
           cache: npm
       - run: npm ci --legacy-peer-deps
       - run: npm run test:eval:full
-
-  # The desktop app is Rust, and nothing above compiles it — the suite, the
-  # wrangler dry-run and the worker bundle are all JavaScript. Without this job
-  # a PR can turn the Tauri app into something that does not build and still go
-  # green, with the failure surfacing only when an `installer-v*` tag kicks off
-  # installer-release.yml. That is the most expensive place to find it.
-  #
-  # Runs on the two platforms the app ships on, matching installer-release.yml.
-  # That is deliberate rather than a cost decision: `detect_obsidian`
-  # (commands.rs) selects its body with `cfg(target_os)`, so a Linux runner
-  # would compile a fallback branch that never ships while never compiling the
-  # Windows branch at all — under-reporting real breakage and able to fail on
-  # code no user runs. macOS and Windows also need no system packages (WebKit
-  # and WebView2 are provided by the OS and the runner image), so there is no
-  # apt list here to drift out of step with a runner upgrade.
-  desktop:
-    strategy:
-      # Report both platforms. Without this a macOS failure cancels the Windows
-      # job and hides whatever it would have found.
-      fail-fast: false
-      matrix:
-        platform: [macos-latest, windows-latest]
-    runs-on: ${{ matrix.platform }}
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "22"
-          cache: npm
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: swatinem/rust-cache@v2
-        with:
-          workspaces: installer/src-tauri -> target
-      # Root deps first: the esbuild bundle resolves the Worker's own
-      # dependencies from the repository root, not from installer/.
-      - run: npm ci --legacy-peer-deps
-      - run: npm ci
-        working-directory: installer
-      # build.rs panics unless worker-dist/ exists, so the bundle has to run
-      # before cargo touches the crate.
-      - name: Bundle Worker (required by build.rs)
-        working-directory: installer
-        run: npm run bundle-worker
-      # installer/src is excluded from the root tsconfig, and `tsc --noEmit`
-      # otherwise runs only inside `npm run build` on an installer-v* tag. The
-      # i18n catalogs are typed against a closed interface; this is what makes
-      # a missing key a failure on the PR rather than at release time.
-      - name: Typecheck desktop UI
-        working-directory: installer
-        run: npx tsc --noEmit
-      # `cargo check` proved the crate compiles; the Rust tests pin index
-      # naming, storage estimates, and binding preservation, and ran only on
-      # release tags before this.
-      - name: Test desktop app
-        run: cargo test --manifest-path installer/src-tauri/Cargo.toml

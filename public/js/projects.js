@@ -595,9 +595,9 @@ async function runProjectDigest() {
   out.innerHTML = ''
   let data = null
   try {
-    const params = new URLSearchParams({ project: detail.slug })
-    if (projectWorkspace()) params.set('workspace', projectWorkspace())
-    const res = await fetch(`${WORKER_URL}/digest?${params}`, { headers: { Authorization: `Bearer ${AUTH_TOKEN}` } })
+    const body = { project: detail.slug }
+    if (projectWorkspace()) body.workspace = projectWorkspace()
+    const res = await fetch(`${WORKER_URL}/digest`, { method: 'POST', headers: { Authorization: `Bearer ${AUTH_TOKEN}`, 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
     data = await res.json()
   } catch {}
   projectDigesting = false

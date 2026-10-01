@@ -28,7 +28,7 @@ const ctx = { waitUntil: (_: Promise<unknown>) => {} } as unknown as ExecutionCo
 beforeEach(async () => {
   resetDatabaseInit();
   sqlite = makeSqliteD1();
-  env = makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV() });
+  env = sqlite.admitEnv(makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV() }));
   await initializeDatabase(env);
   const roots = await ensureTenantBootstrap(env);
   companyWs = roots.companyWorkspaceId;
@@ -65,7 +65,7 @@ async function bobs37Digest(id: string, bob: Identity) {
 const timelineOf = async (id: string, token?: string) => {
   const worker = (await import("../../src/index")).default;
   const { req } = await import("../helpers/make-request");
-  const res = await worker.fetch(req("GET", `/entry?id=${id}`, token ? { token } : {}), env, ctx);
+  const res = await worker.fetch(req("POST", `/entry?id=${id}`, token ? { token } : {}), env, ctx);
   expect(res.status).toBe(200);
   const body = await res.json() as any;
   return ((body.entry ?? body).timeline as any[]).map(e => e.event);

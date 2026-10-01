@@ -1,4 +1,6 @@
 import type { Env } from "../env";
+import { hasD1Budget, reserveD1Sql } from "../runtime/d1-budget";
+import { memoryWriteMarker } from "../migration/write-lock";
 import { initializeDatabase } from "../db/init";
 import { resolveConfig } from "../config";
 import { getStatus } from "../memory/status";
@@ -88,8 +90,8 @@ function casWrite(env: Env, snap: Snapshot, now: number): { stmt: D1PreparedStat
   const flags = !wasFlagged && hasStaleAsOf(nextTagsArr);
   // versioning: exempt: hygiene, compare-and-set on the tags read; a miss is skipped, not overwritten
   const stmt = env.DB.prepare(
-    `UPDATE entries SET tags = ?, staleness_checked_at = ? WHERE id = ? AND tags = ? AND content = ?`,
-  ).bind(JSON.stringify(nextTagsArr), now, snap.id, snap.tags, snap.content);
+    `UPDATE entries SET tags = ?, staleness_checked_at = ?, updated_at = ?, write_marker = ? WHERE id = ? AND tags = ? AND content = ?`,
+  ).bind(JSON.stringify(nextTagsArr), now, now, memoryWriteMarker(env), snap.id, snap.tags, snap.content);
   return { stmt, flags };
 }
 
@@ -97,8 +99,8 @@ function casWrite(env: Env, snap: Snapshot, now: number): { stmt: D1PreparedStat
 // sorts first on every future pass and camps one of the 25 slots indefinitely. Any row the
 // pass inspects must have its cursor moved, verdict or no verdict.
 function cursorWrite(env: Env, id: string, now: number): D1PreparedStatement {
-  // versioning: exempt: hygiene bookkeeping (moves the nightly pass's own cursor, not content)
-  return env.DB.prepare(`UPDATE entries SET staleness_checked_at = ? WHERE id = ?`).bind(now, id);
+  // versioning: exempt: hygiene bookkeeping
+  return env.DB.prepare(`UPDATE entries SET staleness_checked_at = ?, write_marker = ? WHERE id = ?`).bind(now, memoryWriteMarker(env), id);
 }
 
 function planWrite(env: Env, snap: Snapshot, now: number): Write {
@@ -119,7 +121,8 @@ function planWrite(env: Env, snap: Snapshot, now: number): Write {
 }
 
 /**
- * One round of writes as a single subrequest, keeping the per-row path as a fallback.
+ * One round of writes as a single subrequest, keeping the per-row path for manual callers.
+ * A budgeted nightly invocation does not amplify a rejected batch into per-row retries.
  *
  * All four nightly jobs fire from one scheduled() invocation and share its budget (#278),
  * and at one UPDATE per candidate, plus retries, plus cursor advances, this pass was the
@@ -135,8 +138,7 @@ function planWrite(env: Env, snap: Snapshot, now: number): Write {
  * That fallback is deliberately not free. If every batch is rejected AND every per-row
  * replay also fails, the pass degenerates to about 107 subrequests, 1 candidate query,
  * then a rejected batch plus 25 replays on each of three attempts and again on the cursor
- * advance. That is well over this codebase's self-imposed ~50-call D1 budget (still nowhere
- * near the platform's real 1,000-call ceiling), but it only happens when D1 is refusing
+ * advance. That is well over the free plan's 50, but it only happens when D1 is refusing
  * writes outright, and a pass that spends the budget failing is strictly better than one
  * that abandons 25 rows with NULL cursors for every later run to trip over.
  */
@@ -146,6 +148,7 @@ async function runWrites(env: Env, writes: Write[]): Promise<number[]> {
     const results = await env.DB.batch(writes.map(w => w.stmt));
     return results.map(r => r.meta.changes ?? 0);
   } catch (e) {
+    if (hasD1Budget(env)) throw e; // no per-row storm after a database/budget refusal
     console.error("Batched staleness writes failed; retrying per row (non-fatal):", e);
     const changes: number[] = [];
     for (const w of writes) {
@@ -193,7 +196,11 @@ export async function runStalenessPass(
   env: Env,
   _ctx: ExecutionContext,
   workspaceId?: string | null,
-): Promise<{ flagged: number }> {
+  limit = STALENESS_PASS_LIMIT,
+): Promise<{ flagged: number; complete?: false }> {
+  if (!Number.isInteger(limit) || limit < 1 || limit > STALENESS_PASS_LIMIT) {
+    throw new RangeError("Invalid staleness limit");
+  }
   await initializeDatabase(env);
 
   const cfg = await resolveConfig(env);
@@ -221,7 +228,7 @@ export async function runStalenessPass(
          )
          AND ${currentValidityAt("", "?")}${sliceSql}
        ORDER BY COALESCE(staleness_checked_at, 0) ASC
-       LIMIT ${STALENESS_PASS_LIMIT}`,
+       LIMIT ${limit}`,
     ).bind(...(workspaceId != null
       ? [volatileCutoff, now, stateCutoff, now, workspaceId]
       : [volatileCutoff, now, stateCutoff, now]))
@@ -229,7 +236,7 @@ export async function runStalenessPass(
     candidates = results.map(r => ({ id: r.id, tags: r.tags ?? "[]", content: r.content }));
   } catch (e) {
     console.error("Staleness pass query failed (non-fatal):", e);
-    return { flagged: 0 };
+    return { flagged: 0, complete: false };
   }
 
   // Rows still owed a write. A row leaves this list only by landing its CAS, by being
@@ -242,31 +249,39 @@ export async function runStalenessPass(
   // Rows that landed a CAS which newly added stale:as-of. Read by the caller to
   // report "claims flagged" for GET /stats/night.
   let flagged = 0;
+  let complete = true;
 
   for (let attempt = 0; attempt < STALENESS_CAS_ATTEMPTS && unsettled.length; attempt++) {
-    if (attempt > 0) {
-      // A lost CAS means someone else wrote the row, so the retry re-classifies from the
-      // fresh tags and content rather than from the snapshot that just lost. Ids that do
-      // not come back were deleted mid-pass: no verdict and no cursor to write.
-      const fresh = await rereadSnapshots(env, unsettled.map(r => r.id));
-      if (!fresh) break; // read failed, stop retrying, but still advance the cursors below
-      unsettled = fresh;
-    }
-
-    const writes = unsettled.map(snap => planWrite(env, snap, now));
-    const changes = await runWrites(env, writes);
-    const lost = new Set<string>();
-    writes.forEach((w, i) => {
-      if (changes[i] !== 0) {
-        if (w.flags) flagged++;
-        return;
+    // Reserve the re-read and its complete write round together before any await.
+    // Parallel capture/graph work cannot consume that credit between the two.
+    const retry = attempt > 0 ? reserveD1Sql(env, 1 + unsettled.length) : null;
+    if (attempt > 0 && !retry) return { flagged, complete: false };
+    const roundEnv = retry?.env ?? env;
+    try {
+      if (attempt > 0) {
+        // A lost CAS means someone else wrote the row, so the retry re-classifies from the
+        // fresh tags and content rather than from the snapshot that just lost. Ids that do
+        // not come back were deleted mid-pass: no verdict and no cursor to write.
+        const fresh = await rereadSnapshots(roundEnv, unsettled.map(r => r.id));
+        if (!fresh) { complete = false; break; } // read failed, stop retrying, but still advance the cursors below
+        unsettled = fresh;
       }
-      // A CAS reporting no change usually lost a race and is worth re-reading. A cursor
-      // write reporting none only ever means the write failed, the row is not a candidate
-      // for reclassification, it just still needs its cursor moved.
-      if (w.retryable) lost.add(w.id); else cursorFailed.push(w.id);
-    });
-    unsettled = unsettled.filter(snap => lost.has(snap.id));
+
+      const writes = unsettled.map(snap => planWrite(roundEnv, snap, now));
+      const changes = await runWrites(roundEnv, writes);
+      const lost = new Set<string>();
+      writes.forEach((w, i) => {
+        if (changes[i] !== 0) {
+          if (w.flags) flagged++;
+          return;
+        }
+        // A CAS reporting no change usually lost a race and is worth re-reading. A cursor
+        // write reporting none only ever means the write failed, the row is not a candidate
+        // for reclassification, it just still needs its cursor moved.
+        if (w.retryable) lost.add(w.id); else cursorFailed.push(w.id);
+      });
+      unsettled = unsettled.filter(snap => lost.has(snap.id));
+    } finally { retry?.release(); }
   }
 
   // Everything still owed a cursor: rows whose every CAS attempt lost, and rows whose
@@ -274,8 +289,12 @@ export async function runStalenessPass(
   // UPDATE on a row deleted meanwhile is a harmless no-op, so nothing needs excluding.
   const owed = [...unsettled.map(snap => snap.id), ...cursorFailed];
   if (owed.length) {
+    complete = false;
+    // A budgeted cron must not move the cursor on unprocessed work to pretend
+    // completion. Manual callers retain their established retry/cursor behavior.
+    if (hasD1Budget(env)) return { flagged, complete: false };
     await runWrites(env, owed.map(id => ({ id, stmt: cursorWrite(env, id, now), retryable: false, flags: false })));
   }
 
-  return { flagged };
+  return complete ? { flagged } : { flagged, complete: false };
 }

@@ -76,7 +76,10 @@ describe("POST /import stamps the caller's WriteContext", () => {
     expect(res.status).toBe(200);
     const summary = await jsonOf(res);
     expect(summary.imported).toBe(2);
-    expect(summary.edges_imported).toBe(1);
+    expect(summary.edges_imported).toBe(0);
+    const edgeRes = await call("POST", `/import?offset=${summary.next_offset}`, bobToken, PAYLOAD);
+    expect(edgeRes.status).toBe(200);
+    expect((await jsonOf(edgeRes)).edges_imported).toBe(1);
 
     const { results: entryRows } = await sqlite.db
       .prepare(`SELECT id, workspace_id, actor_id FROM entries WHERE id IN ('imp-a', 'imp-b')`)

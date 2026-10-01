@@ -3,8 +3,8 @@
  * accepts them, plus id-based routes verified against multi-team rows.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { Client } from "@modelcontextprotocol/client";
+import { InMemoryTransport } from "@modelcontextprotocol/client";
 import worker from "../../src/index";
 import { buildMcpServer } from "../../src/mcp/server";
 import { makeSqliteD1, type SqliteD1 } from "../helpers/sqlite-d1";
@@ -13,6 +13,7 @@ import { resetDatabaseInit, initializeDatabase } from "../../src/db/init";
 import { ensureTenantBootstrap } from "../../src/lib/tenancy";
 import { createMember } from "../../src/lib/team-admin";
 import { resolveIdentityFromToken } from "../../src/lib/identity";
+import { beginMemoryWriteAdmission } from "../../src/migration/write-lock";
 import type { Env } from "../../src/env";
 
 const ctx = { waitUntil: (_: Promise<unknown>) => { void 0; } } as ExecutionContext;
@@ -77,11 +78,19 @@ function seedEdge(sourceId: string, targetId: string, workspaceId: string) {
 
 async function mcpClient(token: string) {
   const identity = await resolveIdentityFromToken(token, env);
-  const server = buildMcpServer(env, ctx, identity ?? undefined);
+  const admission = await beginMemoryWriteAdmission(env, ctx);
+  const server = buildMcpServer(admission.env, admission.ctx, identity ?? undefined);
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   const client = new Client({ name: "perm-test", version: "1.0.0" });
   await Promise.all([client.connect(clientTransport), server.connect(serverTransport)]);
-  return { client, identity, close: () => client.close() };
+  return {
+    client,
+    identity,
+    close: async () => {
+      await client.close();
+      await admission.finish();
+    },
+  };
 }
 
 const textOf = (res: { content: { text: string }[] }) => res.content[0]?.text ?? "";
@@ -108,7 +117,7 @@ beforeEach(async () => {
     }),
     AI: {
       run: vi.fn().mockImplementation(async (model: string, opts?: { stream?: boolean }) => {
-        if (model === "@cf/baai/bge-small-en-v1.5") return { data: [new Array(384).fill(0.1)] };
+        if (model === "@cf/google/embeddinggemma-300m") return { data: [new Array(768).fill(0.1)] };
         if (opts?.stream) {
           const sse = (text: string) => new ReadableStream({
             start(c) {
@@ -191,8 +200,15 @@ describe("REST read routes — workspace/team permutations", () => {
   }
 
   for (const c of recallCases()) {
-    it(`GET /recall ${c.label}`, async () => {
-      const res = await call("GET", `/recall${c.qs()}`, dana.token);
+    it(`POST /recall ${c.label}`, async () => {
+      const params = new URLSearchParams(c.qs().replace(/^\?/, ""));
+      const res = await call("POST", "/recall", dana.token, {
+        query: params.get("query"),
+        topK: Number(params.get("topK") ?? 5),
+        synthesize: params.get("synthesize") === "true",
+        workspace: params.get("workspace") ?? undefined,
+        team: params.get("team") ?? undefined,
+      });
       expect(res.status).toBe(200);
       const body = await jsonOf(res);
       const got = idsOf(body.results ?? []);
@@ -239,7 +255,16 @@ describe("REST read routes — workspace/team permutations", () => {
 
   for (const c of invalidCases) {
     it(`rejects ${c.label}`, async () => {
-      const res = await call("GET", c.route, dana.token);
+      const url = new URL(`http://localhost${c.route}`);
+      const privateRoute = url.pathname === "/recall" || url.pathname === "/digest";
+      const res = privateRoute
+        ? await call("POST", url.pathname, dana.token, {
+            query: url.pathname === "/recall" ? url.searchParams.get("query") : undefined,
+            tag: url.pathname === "/digest" ? url.searchParams.get("tag") : undefined,
+            workspace: url.searchParams.get("workspace") ?? undefined,
+            team: url.searchParams.get("team") ?? undefined,
+          })
+        : await call("GET", c.route, dana.token);
       expect(res.status).toBe(400);
     });
   }
@@ -332,8 +357,8 @@ describe("REST id-based routes on a Platform-team row", () => {
     seedEdge("plat-a", "plat-b", TEAM_B);
   });
 
-  it("GET /entry", async () => {
-    const body = await jsonOf(await call("GET", "/entry?id=plat-a", dana.token));
+  it("POST /entry", async () => {
+    const body = await jsonOf(await call("POST", "/entry", dana.token, { id: "plat-a" }));
     expect(body.ok).toBe(true);
     expect(body.entry.id).toBe("plat-a");
     expect(body.entry.workspace).toBe("company");
@@ -362,8 +387,8 @@ describe("REST id-based routes on a Platform-team row", () => {
     expect(JSON.parse(row.tags)).toContain("status:canonical");
   });
 
-  it("GET /connections", async () => {
-    const body = await jsonOf(await call("GET", "/connections?id=plat-a", dana.token));
+  it("POST /connections", async () => {
+    const body = await jsonOf(await call("POST", "/connections", dana.token, { id: "plat-a" }));
     expect(body.ok).toBe(true);
     expect(body.connections.some((r: { id: string }) => r.id === "plat-b")).toBe(true);
   });
@@ -581,7 +606,7 @@ describe("MCP id-based tools on a Platform-team row", () => {
   });
 });
 
-describe("GET /digest — team scoping", () => {
+describe("POST /digest — team scoping", () => {
   const old = Date.now() - 200 * 24 * 3600 * 1000;
   const prompts: string[] = [];
 
@@ -589,7 +614,7 @@ describe("GET /digest — team scoping", () => {
     prompts.length = 0;
     env.AI = {
       run: vi.fn().mockImplementation(async (model: string, opts?: { stream?: boolean; messages?: { content: string }[] }) => {
-        if (model === "@cf/baai/bge-small-en-v1.5") return { data: [new Array(384).fill(0.1)] };
+        if (model === "@cf/google/embeddinggemma-300m") return { data: [new Array(768).fill(0.1)] };
         if (opts?.stream) {
           prompts.push(String(opts?.messages?.[0]?.content ?? ""));
           const sse = (text: string) => new ReadableStream({
@@ -611,7 +636,11 @@ describe("GET /digest — team scoping", () => {
   });
 
   it("workspace=company&team scopes rollup to one team", async () => {
-    const res = await call("GET", `/digest?tag=${TAG}&workspace=company&team=${TEAM_B}`, dana.token);
+    const res = await call("POST", "/digest", dana.token, {
+      tag: TAG,
+      workspace: "company",
+      team: TEAM_B,
+    });
     expect(res.status).toBe(200);
     const body = await jsonOf(res);
     expect(body.entry_id).toBeTruthy();

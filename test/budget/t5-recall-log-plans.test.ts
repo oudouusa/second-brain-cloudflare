@@ -23,7 +23,7 @@ describe.runIf(HAS_LOG)("recall log statements use indexes", () => {
     const { maybeLogRecall, maybeMarkFollowed } = await import("../../src/recall/log") as any;
     resetDatabaseInit();
     s = makeSqliteD1();
-    await initializeDatabase(makeTestEnv(undefined, { DB: s.db as any, OAUTH_KV: makeMemoryKV() }));
+    await initializeDatabase(s.admitEnv(makeTestEnv(undefined, { DB: s.db as any, OAUTH_KV: makeMemoryKV() })));
     const captured: { sql: string; args: unknown[] }[] = [];
     const db = s.db as any;
     const prepare = db.prepare.bind(db);

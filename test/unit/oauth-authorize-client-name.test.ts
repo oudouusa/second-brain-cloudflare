@@ -19,10 +19,10 @@ function envWithProvider(overrides: { lookupClient?: any } = {}): Env {
 }
 
 function postAuthorize(password: string) {
-  const form = new URLSearchParams({ password });
+  const form = new URLSearchParams({ password, csrf_token: "client-name-test" });
   return new Request("http://localhost/oauth/authorize", {
     method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    headers: { "Content-Type": "application/x-www-form-urlencoded", Cookie: "sb_oauth_csrf=client-name-test" },
     body: form.toString(),
   });
 }

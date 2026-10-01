@@ -1,3 +1,4 @@
+import { assertMemoryWritesAllowed, memoryWriteMarker } from "../migration/write-lock";
 // Pure builders for the statements that hold a row (16-t3-t4-trust-spec.md 5.4).
 //
 // A hold is its own version, written in the same D1 batch as the write it
@@ -118,8 +119,15 @@ export function holdStatements<C>(env: Env, deps: HoldDeps<C>, input: HoldInput<
   const update = env.DB.prepare(
     // versioning: snapshot — the snapshot above rides in the same batch, under the same guard
     // scope-exempt: by-id: appended to the batch of a write that already resolved and authorized this row; the write's own guard is repeated here
-    `UPDATE entries SET tags = ${tagsParam}, vector_ids = '[]' WHERE id = ${idParam}${guard}`,
+    `UPDATE entries SET write_marker = ${p.add(memoryWriteMarker(env))}, tags = ${tagsParam}, vector_ids = '[]' WHERE id = ${idParam}${guard}`,
   ).bind(...p.values());
 
-  return [snapshot, update, deps.pruneStatement(env, input.entryId, deps.versionKeep)];
+  const q = new Placeholders();
+  const cleanupGuard = input.guard ? ` AND (${input.guard(q)})` : "";
+  // scope-exempt: 呼出元が認可済みのentryIdと同じCAS guardでvector削除を記録する。
+  // validity: any: holdと同batchで対象行の旧索引を削除台帳へ記録する。
+  const cleanup = env.DB.prepare(`INSERT INTO vector_cleanup_ops (op_id, entry_id, vector_ids, created_at, ready, expires_at, write_marker)
+    SELECT lower(hex(randomblob(16))), id, vector_ids, ${q.add(input.now)}, 1, ${q.add(input.now)}, ${q.add(memoryWriteMarker(env))}
+    FROM entries WHERE id = ${q.add(input.entryId)}${cleanupGuard}`).bind(...q.values());
+  return [snapshot, cleanup, update, deps.pruneStatement(env, input.entryId, deps.versionKeep)];
 }

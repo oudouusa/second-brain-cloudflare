@@ -28,19 +28,45 @@ afterEach(() => { sq?.close(); sq = null; setDbReady(false); });
 const ctx = { waitUntil: (_: Promise<unknown>) => {} } as any;
 
 function dbOf(s: SqliteD1) {
+  const issuedAt = new WeakMap<object, number>();
+  const wrap = (statement: any, index: number): any => {
+    const wrapped = {
+      bind(...args: unknown[]) { return wrap(statement.bind(...args), index); },
+      all() { return statement.all(); },
+      first() { return statement.first(); },
+      run() { return statement.run(); },
+    };
+    issuedAt.set(wrapped, index);
+    return wrapped;
+  };
   return {
-    prepare: (sql: string) => s.db.prepare(sql),
+    prepare: (sql: string) => {
+      const statement = s.db.prepare(sql);
+      return wrap(statement, s.issued.length - 1);
+    },
     exec: (sql: string) => s.db.exec(sql),
     async batch(stmts: { run(): Promise<any> }[]) {
       const out: any[] = [];
-      for (const st of stmts) out.push(await st.run());
-      s.issued.splice(s.issued.length - stmts.length, stmts.length, `BATCH(${stmts.length})`);
-      // Each statement's rows are kept, not discarded: a batch carries reads as
-      // well as writes now — identity resolution pairs its SELECT with the
-      // throttled last_used_at stamp so the pair costs one subrequest — and D1
-      // returns a result per statement. `changes: 1` is preserved for the write
-      // paths that read it.
-      return out.map((r: any) => ({ ...r, meta: { changes: 1, ...r?.meta } }));
+      try {
+        for (const st of stmts) out.push(await st.run());
+        // Each statement's rows are kept, not discarded: a batch carries reads as
+        // well as writes now — identity resolution pairs its SELECT with the
+        // throttled last_used_at stamp so the pair costs one subrequest — and D1
+        // returns a result per statement. `changes: 1` is preserved for the write
+        // paths that read it.
+        return out.map((r: any) => ({ ...r, meta: { changes: 1, ...r?.meta } }));
+      } finally {
+        // A rejected remote D1 batch is still one subrequest. Compact it on the
+        // error path too or the write-fence retry is misreported as N queries.
+        // Prepared writes can be interleaved with awaited reads while the batch
+        // is assembled, so remove their exact slots instead of assuming they are
+        // the final N issued statements.
+        const indexes = [...new Set(stmts.map(st => issuedAt.get(st as object)))]
+          .filter((index): index is number => index !== undefined)
+          .sort((a, b) => b - a);
+        for (const index of indexes) s.issued.splice(index, 1);
+        s.issued.push(`BATCH(${stmts.length})`);
+      }
     },
   };
 }
@@ -85,32 +111,19 @@ describe("GET /brief", () => {
     const res = await worker.fetch(req("GET", "/brief"), envOf(sq), ctx);
     expect(res.status).toBe(200);
 
-    // Eight reads — seven run concurrently (sources, patterns, activity,
-    // topics, the attention+loops aggregate, the loops preview, the changes
-    // query), the resurface pick runs after (it needs the topics query's own
-    // result) — plus v3's fixed identity cost on this first request against a
-    // fresh database: one token→identity join, and the one-time tenant
-    // bootstrap (two lookups + one provisioning batch — memoised per
-    // database, so later app opens pay only the join). 8 + 1 + 3 = 12.
-    //
-    // The seventh concurrent read is the open-loops preview added in Task A
-    // (brief v2): the count is free (folded into the attention aggregate),
-    // but its three preview rows cost their own SELECT. The eighth is the S2
-    // "what AI tools changed" query (T-0089.4.3, 5.8's own Budget note: 11 →
-    // 12 cold, deliberate). The resurface pick itself is exactly one query
-    // here because this fixture has no topic tags, so Task B's
-    // topic-preference probe never runs (see src/routes/brief.ts's
-    // pickResurface) — a brain with topics pays one query more on the days it
-    // picks fresh. If any of this goes up further, the endpoint got more
-    // expensive for every user on every app open — that is the decision this
-    // assertion asks you to make deliberately.
+    // Six brief reads plus Team Edition's first-use identity/bootstrap cost.
+    // A legacy brain already contains fenced entry rows, so its first bootstrap
+    // intentionally retries once under a write admission: initial bootstrap 3,
+    // admission 1, admitted bootstrap 4 (including the personal-workspace
+    // invariant check), release 1, identity 1, brief 6 = 16.
+    // Bootstrap is memoised per database; subsequent app opens pay only 7.
     //
     // This is the COLD path: `users.last_used_at` is NULL on a brain nobody has
-    // authenticated against, so this request does owe the stamp. It is still 12,
-    // because the stamp is batched with the identity read rather than issued on
-    // its own — a D1 batch is one subrequest whatever it carries. The write
+    // authenticated against, so this request also owes the stamp. It rides in
+    // the identity batch rather than becoming another subrequest. The write
     // really happens; the assertion below proves it landed.
-    expect(sq.issued).toHaveLength(12);
+    // 4.0のchanges追加1 SELECT。cold bootstrap保護を含め計18 SQL。
+    expect(sq.issued).toHaveLength(18);
     const stamped = await sq.db
       .prepare(`SELECT last_used_at FROM users WHERE last_used_at IS NOT NULL`)
       .first() as { last_used_at: number } | null;

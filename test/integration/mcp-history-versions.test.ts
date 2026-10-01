@@ -4,8 +4,8 @@
  * SQLite: versions are written through the actual MCP `update`/`share` tools.
  */
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { Client } from "@modelcontextprotocol/client";
+import { InMemoryTransport } from "@modelcontextprotocol/client";
 import { buildMcpServer } from "../../src/mcp/server";
 import worker from "../../src/index";
 import { req } from "../helpers/make-request";
@@ -45,8 +45,9 @@ async function member(name: string, role: "admin" | "member" = "member"): Promis
 beforeEach(async () => {
   resetDatabaseInit();
   sqlite = makeSqliteD1();
-  env = makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV() });
+  env = sqlite.admitEnv(makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV() }));
   await initializeDatabase(env);
+  env = sqlite.admitEnv(env);
   const roots = await ensureTenantBootstrap(env);
   owner = (await resolveIdentityFromToken("test-token", env))!;
   void roots;
@@ -124,7 +125,7 @@ describe("history() lists versions", () => {
     expect(mcpText).toContain("Earlier history belongs to Bob.");
     expect(mcpText).not.toContain('before: "state0"');
 
-    const res = await worker.fetch(req("GET", "/entry?id=e6", { token: teammateToken }), env, ctx);
+    const res = await worker.fetch(req("POST", "/entry?id=e6", { token: teammateToken }), env, ctx);
     const data = await res.json() as any;
     expect(data.entry.history.footer.shared_cut_by).toBe("Bob");
   });

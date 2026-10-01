@@ -8,9 +8,12 @@
  * is exactly why a green mock test proves nothing about isolation.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { assertExportWithinMemoryLimit } from "../../src/entries/export";
 import { expandGraph, buildGraph } from "../../src/graph/traverse";
 import { getTagVocabulary } from "../../src/tags/vocabulary";
+import { inferQueryTags } from "../../src/recall/distill";
 import { compressTag } from "../../src/compression/digest";
+import { runNightlyCompression } from "../../src/compression/nightly";
 import { resetDatabaseInit, initializeDatabase } from "../../src/db/init";
 import { makeSqliteD1, type SqliteD1 } from "../helpers/sqlite-d1";
 import { makeTestEnv, makeMemoryKV } from "../helpers/make-env";
@@ -57,8 +60,8 @@ describe("expandGraph with an Identity", () => {
   beforeEach(() => {
     resetDatabaseInit();
     sqlite = makeSqliteD1();
-    sqlite.db.prepare(`ALTER TABLE entries ADD COLUMN valid_until INTEGER`).run();
-    sqlite.db.prepare(`ALTER TABLE entries ADD COLUMN valid_from INTEGER`).run();
+    expect(sqlite.columns()).toContain("valid_until");
+    expect(sqlite.columns()).toContain("valid_from");
     // The seed lives in the caller's personal workspace; one neighbour is shared via
     // the company workspace (legitimate — must stay reachable), one belongs to a
     // stranger's personal workspace (must never be returned).
@@ -100,8 +103,8 @@ describe("buildGraph with an Identity", () => {
   beforeEach(() => {
     resetDatabaseInit();
     sqlite = makeSqliteD1();
-    sqlite.db.prepare(`ALTER TABLE entries ADD COLUMN valid_until INTEGER`).run();
-    sqlite.db.prepare(`ALTER TABLE entries ADD COLUMN valid_from INTEGER`).run();
+    expect(sqlite.columns()).toContain("valid_until");
+    expect(sqlite.columns()).toContain("valid_from");
   });
 
   afterEach(() => sqlite.close());
@@ -109,10 +112,10 @@ describe("buildGraph with an Identity", () => {
   it("selects no seeded nodes from edges outside the readable pair", async () => {
     seedEntry(sqlite, "mine", "ws-me");
     seedEntry(sqlite, "theirs", "ws-other");
-    seedEdge(sqlite, "mine", "mine2", "ws-me");
     seedEntry(sqlite, "mine2", "ws-me");
-    seedEdge(sqlite, "theirs", "theirs2", "ws-other");
     seedEntry(sqlite, "theirs2", "ws-other");
+    seedEdge(sqlite, "mine", "mine2", "ws-me");
+    seedEdge(sqlite, "theirs", "theirs2", "ws-other");
 
     const env = makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"] });
     const view = await buildGraph({}, env, undefined, identity("ws-me"));
@@ -127,8 +130,8 @@ describe("tag vocabulary scoping", () => {
   beforeEach(() => {
     resetDatabaseInit();
     sqlite = makeSqliteD1();
-    sqlite.db.prepare(`ALTER TABLE entries ADD COLUMN valid_until INTEGER`).run();
-    sqlite.db.prepare(`ALTER TABLE entries ADD COLUMN valid_from INTEGER`).run();
+    expect(sqlite.columns()).toContain("valid_until");
+    expect(sqlite.columns()).toContain("valid_from");
     seedEntry(sqlite, "a1", "ws-a", ["alpha-only", "common"]);
     seedEntry(sqlite, "b1", "ws-b", ["beta-only"]);
     seedEntry(sqlite, "c1", "ws-co", ["company", "common"]);
@@ -154,6 +157,19 @@ describe("tag vocabulary scoping", () => {
     const tags = await getTagVocabulary(env());
     expect(tags).toEqual(["alpha-only", "beta-only", "common", "company"]);
   });
+
+  it("上流の7引数で指定したチームだけのタグを返す", async () => {
+    seedEntry(sqlite, "second", "ws-second", ["delta"]);
+    const reader = { ...identity("ws-a"), companyWorkspaceIds: ["ws-co", "ws-second"] };
+    const scopedEnv = env();
+    const query = "company delta alpha-only beta-only";
+
+    expect(await inferQueryTags(query, scopedEnv, undefined, reader, "company", "ws-second"))
+      .toEqual(["delta"]);
+    // 温まった語彙cacheでも、別のチームやpersonalへ対象が広がらない。
+    expect(await inferQueryTags(query, scopedEnv, undefined, reader, "company", "ws-second"))
+      .toEqual(["delta"]);
+  });
 });
 
 describe("digest rollup partitioning", () => {
@@ -171,8 +187,8 @@ describe("digest rollup partitioning", () => {
     resetDatabaseInit();
     vi.spyOn(Date, "now").mockReturnValue(NOW);
     sqlite = makeSqliteD1();
-    sqlite.db.prepare(`ALTER TABLE entries ADD COLUMN valid_until INTEGER`).run();
-    sqlite.db.prepare(`ALTER TABLE entries ADD COLUMN valid_from INTEGER`).run();
+    expect(sqlite.columns()).toContain("valid_until");
+    expect(sqlite.columns()).toContain("valid_from");
   });
 
   afterEach(() => {
@@ -184,7 +200,7 @@ describe("digest rollup partitioning", () => {
   function makeDigestAI() {
     const prompts: string[] = [];
     const run = vi.fn().mockImplementation(async (_model: string, opts: any) => {
-      if (_model === "@cf/baai/bge-small-en-v1.5") return { data: [new Array(384).fill(0.1)] };
+      if (_model === "@cf/google/embeddinggemma-300m") return { data: [new Array(768).fill(0.1)] };
       if (opts?.stream) {
         prompts.push(opts.messages[0].content as string);
         const body = new ReadableStream({
@@ -209,6 +225,46 @@ describe("digest rollup partitioning", () => {
     };
   }
 
+  it.each(["ws-1", ""])("夜間のobject形式でも指定workspaceだけを要約する（%s）", async workspaceId => {
+    for (let i = 0; i < 12; i++) {
+      seedEntry(sqlite, `selected-${i}`, workspaceId, ["proj"], `SELECTED progress ${i}`);
+      seedEntry(sqlite, `other-${i}`, "ws-other", ["proj"], `OTHER progress ${i}`);
+    }
+    const { ai, prompts } = makeDigestAI();
+    const env = makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], AI: ai, OAUTH_KV: makeMemoryKV() });
+    await initializeDatabase(env);
+    const admitted = sqlite.admitEnv(env);
+    const { ctx, drain } = makeCtx();
+
+    const result = await runNightlyCompression(admitted, ctx, workspaceId);
+    await drain();
+
+    expect(result).toEqual({ digestsWritten: 1 });
+    expect(prompts.some(p => p.includes("SELECTED"))).toBe(true);
+    expect(prompts.some(p => p.includes("OTHER"))).toBe(false);
+    const digests = await env.DB.prepare(`SELECT workspace_id FROM entries WHERE tags LIKE '%"synthesized"%'`).all();
+    expect(digests.results).toEqual([{ workspace_id: workspaceId }]);
+    const other = await env.DB.prepare(`SELECT COUNT(*) AS n FROM entries WHERE workspace_id = 'ws-other' AND tags LIKE '%"rolled-up"%'`).first<{ n: number }>();
+    expect(other?.n).toBe(0);
+  });
+
+  it("明示的な空workspace配列は全体探索に戻さず生成も保存もしない", async () => {
+    seedTagPerWorkspace("proj");
+    const { ai } = makeDigestAI();
+    const env = makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], AI: ai, OAUTH_KV: makeMemoryKV() });
+    await initializeDatabase(env);
+    const admitted = sqlite.admitEnv(env);
+    const { ctx, drain } = makeCtx();
+    const before = await env.DB.prepare("SELECT * FROM entries ORDER BY id").all();
+
+    const result = await compressTag("proj", admitted, ctx, { workspaceIds: [] });
+    await drain();
+
+    expect(result).toEqual({ synthesizedId: null, entriesUsed: 0, text: "" });
+    expect(ai.run).not.toHaveBeenCalled();
+    expect(await env.DB.prepare("SELECT * FROM entries ORDER BY id").all()).toEqual(before);
+  });
+
   it("never pools two workspaces' rows into one rollup", async () => {
     seedTagPerWorkspace("proj");
     const { ai, prompts } = makeDigestAI();
@@ -222,8 +278,9 @@ describe("digest rollup partitioning", () => {
     // nightly cron normally guarantees must actually exist here.
     await initializeDatabase(env);
     const { ctx, drain } = makeCtx();
+    const admitted = sqlite.admitEnv(env);
 
-    await compressTag("proj", env, ctx);
+    await compressTag("proj", admitted, ctx);
     await drain();
 
     // Every prompt the model saw drew from exactly one side's rows — no mixed rollup.
@@ -246,6 +303,47 @@ describe("digest rollup partitioning", () => {
       expect(d.content).toContain(`entries tagged "proj"`);
       expect(["ws-1", "ws-2"]).toContain(d.workspace_id);
       if (d.workspace_id === "ws-1") expect(d.content.length).toBeGreaterThan(0);
+    }
+  });
+});
+
+
+describe("完全exportの見積りscope", () => {
+  it.each(["あ".repeat(40_000), "\u0000".repeat(90_000)])(
+    "他workspaceの大型本文を除外し、共有workspaceのUTF-8 byte数は制限する %#",
+    async (content) => {
+      const sqlite = makeSqliteD1();
+      try {
+        seedEntry(sqlite, "mine", "ws-me");
+        seedEntry(sqlite, "large", "ws-other", [], content);
+        const env = makeTestEnv(undefined, { DB: sqlite.db as unknown as D1Database });
+        await expect(assertExportWithinMemoryLimit(env, identity("ws-me"))).resolves.toBeUndefined();
+        await expect(assertExportWithinMemoryLimit(env, {
+          ...identity("ws-me"), companyWorkspaceIds: ["ws-other"],
+        })).rejects.toMatchObject({ name: "ExportError", status: 413 });
+        await expect(assertExportWithinMemoryLimit(env)).rejects.toMatchObject({ status: 413 });
+      } finally {
+        sqlite.close();
+      }
+    },
+  );
+
+  it("他workspaceの大型edge metadataは除外し、共有されたedgeは413で拒否する", async () => {
+    const sqlite = makeSqliteD1();
+    try {
+      seedEntry(sqlite, "mine", "ws-me");
+      seedEntry(sqlite, "a", "ws-other");
+      seedEntry(sqlite, "b", "ws-other");
+      seedEdge(sqlite, "a", "b", "ws-other");
+      await sqlite.db.prepare("UPDATE edges SET metadata = ? WHERE id = ?")
+        .bind(JSON.stringify({ note: "あ".repeat(40_000) }), "a-b").run();
+      const env = makeTestEnv(undefined, { DB: sqlite.db as unknown as D1Database });
+      await expect(assertExportWithinMemoryLimit(env, identity("ws-me"))).resolves.toBeUndefined();
+      await expect(assertExportWithinMemoryLimit(env, {
+        ...identity("ws-me"), companyWorkspaceIds: ["ws-other"],
+      })).rejects.toMatchObject({ name: "ExportError", status: 413 });
+    } finally {
+      sqlite.close();
     }
   });
 });

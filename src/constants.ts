@@ -43,15 +43,21 @@ export const LIKE_ESCAPE = `ESCAPE '\\'`;
  *
  * ~7% more neurons for a model with roughly seven times the parameters. The
  * weekly pass reasons over at most WEEKLY_CANDIDATE_LIMIT (10) candidates —
- * see src/insight/weekly.ts — so a full week costs ~311 neurons, about 0.44%
- * of the 10,000-neuron/day free allocation. Re-derive rather than trust this
- * if either model's price or `ENTRY_EXCERPT_CHARS` / `INSIGHT_PASS_MAX_TOKENS`
- * below change.
+ * see src/insight/weekly.ts — so a full run costs ~311 neurons: about 3.11%
+ * of the 10,000-neuron allocation on the day it runs, or 0.44% averaged across
+ * seven daily allocations. Re-derive rather than trust this if either model's
+ * price or `ENTRY_EXCERPT_CHARS` / `INSIGHT_PASS_MAX_TOKENS` below change.
  */
 export const INSIGHT_LLM_MODEL = "@cf/openai/gpt-oss-120b";
 
-export const DUPLICATE_BLOCK_THRESHOLD = 0.95;
-export const DUPLICATE_FLAG_THRESHOLD = 0.85;
+// Calibrated on benchmarks/recall-v1/threshold-corpus.json with
+// embeddinggemma-mrl128-v1. Exact copies scored 1.0, curated near-duplicates
+// 0.8265–0.9590, and related-but-distinct pairs at most 0.5945.
+export const DUPLICATE_BLOCK_THRESHOLD = 0.98;
+export const DUPLICATE_FLAG_THRESHOLD = 0.80;
+// Relevant query/document top scores were 0.5197–0.8532. Widen only the weak
+// tail (3/60 cases) instead of almost every query under the BGE-era 0.85 floor.
+export const RECALL_WIDEN_THRESHOLD = 0.60;
 export const CANDIDATE_SCORE_THRESHOLD = 0.45;
 export const TAG_BOOST_STEP = 0.15;
 export const TAG_BOOST_MAX = 1.5;
@@ -59,7 +65,7 @@ export const TAG_BOOST_MAX = 1.5;
 // log1p(|net|) * this step, clamped to the [1,5] importance band. Tunable.
 export const CONTRADICTION_IMPORTANCE_STEP = 1.0;
 
-export const EMBEDDING_MODEL = "@cf/baai/bge-small-en-v1.5";
+export const EMBEDDING_MODEL = "@cf/google/embeddinggemma-300m";
 
 export const CHUNK_MAX_CHARS = 1600;
 // Vectorize's per-call ceiling for a Worker upsert.
@@ -106,8 +112,12 @@ export const TRANSCRIPT_SOURCES: ReadonlySet<string> = new Set(["claude-code", "
 // per chunk, all concurrently: 25 single-chunk entries is already ~75 binding
 // calls, and a handful of long memories in one batch would be far more. The
 // entry cap is a second ceiling so a page of tiny entries cannot balloon either.
-export const MIGRATION_CHUNK_BUDGET = 20;
-export const MIGRATION_MAX_ENTRIES_PER_BATCH = 25;
+export const MIGRATION_CHUNK_BUDGET = 15;
+// Each locked-delta entry renews its lease and performs the durable Vectorize
+// cleanup outbox's record/update/clear sequence. Four entries leave the whole
+// request below D1 Free's 50-query ceiling even on the completion page and when
+// every entry has stale vectors to settle.
+export const MIGRATION_MAX_ENTRIES_PER_BATCH = 4;
 
 export const CHUNK_OVERLAP_CHARS = 200;
 
@@ -132,7 +142,7 @@ export const WHEN_PASS_MAX_TOKENS = 1200;
 export const DIGEST_MAX_TOKENS = 400;
 
 export const VECTORIZE_FIX_HINT =
-  "run `npx wrangler vectorize create second-brain-vectors --dimensions=384 --metric=cosine`, or grant the build token Vectorize Edit and redeploy";
+  "run `npx wrangler vectorize create second-brain-cf-eg128-v1 --dimensions=128 --metric=cosine`, or grant the build token Vectorize Edit and redeploy";
 
 // Shared by REST and MCP recall so the two never diverge in what they claim:
 // a failed Vectorize call does not establish WHY it failed, so the assertion
@@ -147,6 +157,8 @@ export const SEMANTIC_UNAVAILABLE_DETAIL =
 export const VECTORIZE_WORKSPACE_FILTER_UNSUPPORTED_KV_KEY = "vectorize:workspace-filter-unsupported";
 
 export const VECTORIZE_TOP_K_MULTIPLIER = 3;
+/** Bound response deserialization and MMR work on the Free Worker CPU budget. */
+export const VECTORIZE_WIDEN_MAX_CANDIDATES = 20;
 // Dense candidate pool for every recall, whatever topK is asked for, so a larger
 // topK only extends the ranked list and never reorders its head. It is what a
 // default topK 5 call always used (3 x 5). A weak best match still widens the
@@ -165,13 +177,23 @@ export const RECALL_MAX_TOP_K = 20;
 export const VECTORIZE_GET_BY_IDS_BATCH = 20;
 // D1 allows at most 100 bound parameters per query
 export const D1_MAX_BOUND_PARAMS = 100;
+// D1 rejects LIKE/GLOB patterns longer than 50 UTF-8 bytes. This includes the
+// two `%` bytes added by likeContainsPattern and any backslashes inserted while
+// escaping LIKE metacharacters.
+export const D1_MAX_LIKE_PATTERN_BYTES = 50;
 
 export const RRF_K = 60;
-// Candidate fetch window for the keyword arm. The query is still newest-first
-// (LIKE has no relevance ordering), so this bounds how far back a keyword match
-// can be found at all — 100 proved able to bury a genuine old match under
-// fresher substring noise once a term crossed 100 occurrences.
-export const KEYWORD_CANDIDATE_LIMIT = 500;
+// Candidate fetch window for the keyword arm. The LIKE arm orders by the number
+// of non-bigram probe matches, then newest-first; the bound still limits which
+// lower-scoring keyword matches can be found. Keep 128: the regression corpus
+// proves that 100 can bury a genuine match at rank 120. Production CPU probes
+// show that scanning the old 500-row window cannot fit the Workers Free budget.
+export const KEYWORD_CANDIDATE_LIMIT = 128;
+// Exact repeat recalls reuse their private, derived embedding/tag signals for a
+// week. The cache never stores query text or memory content; see
+// recall/query-signal-cache.ts. Seven days captures ordinary repeated project
+// questions while bounding stale tag-ranking hints and KV storage.
+export const QUERY_SIGNAL_CACHE_TTL_SECONDS = 7 * 24 * 60 * 60;
 // IDF fraction granted to a token that matches only as a substring of a longer
 // word ("cat" inside "concatenate"). Re-weighting rather than filtering: plural
 // and hyphenated near-matches stay retrievable, they just stop outranking
@@ -184,13 +206,13 @@ export const KEYWORD_MIN_TOKEN_LEN = 2;
 // normally hands it MAX_QUERY_TERMS but two of its exits return the query
 // whole, and one of those needs nothing worse than an empty corpus to fire — so
 // a fresh install's first long query built a clause D1 rejected outright
-// (#276). Both of D1's limits bind at 99 terms: one parameter per term plus the
-// row limit against a budget of D1_MAX_BOUND_PARAMS, and an OR chain one
-// expression node deep per term against a tree-depth ceiling of 100 (measured:
-// 99 terms accepted, 100 rejected on depth first). 16 leaves 6x margin for a
-// future predicate, and keeps the two call sites agreeing by construction — the
-// widest set the scan ranks is the widest set the clause can carry, so no query
-// distillation can rank is ever truncated by the backstop.
+// (#276). Both of D1's limits bind at 99 simple terms: one parameter per term
+// plus the row limit against a budget of D1_MAX_BOUND_PARAMS, and an OR chain
+// one expression node deep per term against a tree-depth ceiling of 100
+// (measured: 99 terms accepted, 100 rejected on depth first). 16 leaves room
+// for bounded raw compatibility probes and scope predicates. The SQL builders
+// apply the exact remaining parameter budget, so optional probes cannot
+// overrun it and both call sites keep the same primary-token ceiling.
 export const KEYWORD_MAX_TOKENS = 16;
 export const QUERY_SATURATION_FRACTION = 0.3;
 export const MAX_QUERY_TERMS = 3;
@@ -352,7 +374,8 @@ export const VECTORIZE_DELETE_MAX_IDS_PER_CALL = 600;
  * many inline (AI + Vectorize, one call each) — at VERSION_KEEP's ceiling that could otherwise be
  * hundreds of merges in one request, over the platform's per-invocation service subrequest limit.
  * The rest are written with vector_ids = '[]' for POST /vectorize-pending to backfill. */
-export const UNDO_MERGE_REEMBED_INLINE = 25;
+// fork: upload journal・admission・所有確認の費用を含め、同一要求での索引生成を3件に抑える。
+export const UNDO_MERGE_REEMBED_INLINE = 3;
 
 // ── Standing memory (4.0, Track 7, T-0089.7.1) ──
 // Fixed caps (never user tunables — see src/config.ts for STANDING_THRESHOLD and STANDING_MAX,
@@ -367,3 +390,6 @@ export const STANDING_CACHE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 export const STANDING_KV_PREFIX = "standing:v1:";
 /** Isolate-level read memo and rebuild-scheduling throttle, both windowed the same (Design 2.5). */
 export const STANDING_ISOLATE_MEMO_MS = 60_000;
+
+/** 静的SQLでも循環importの初期化順に依存しないDB時刻。 */
+export const SQL_NOW_MS = `CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)`;

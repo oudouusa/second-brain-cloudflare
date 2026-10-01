@@ -7,7 +7,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import worker from "../../src/index";
 import {
-  newPushBudget, pushDueItems, pushDueItemsAllWorkspaces, sendTestNotification, PUSH_CURSOR_KV_KEY,
+  newPushBudget, pushDueItems, pushDueItemsAllWorkspaces, sendTestNotification, PUSH_CURSOR_KV_KEY, MAX_PUSH_WORKSPACES_PER_RUN,
 } from "../../src/push/send";
 import { makeSqliteD1, type SqliteD1 } from "../helpers/sqlite-d1";
 import { makeMemoryKV, makeTestEnv } from "../helpers/make-env";
@@ -71,7 +71,7 @@ function seedSub(s: SqliteD1, id: string, workspaceId = "", failCount = 0) {
 const endpoints = (spy: { mock: { calls: unknown[][] } }) => spy.mock.calls.map(([url]) => url as string);
 
 describe("starvation freedom across runs", () => {
-  it("reaches every one of 45 workspaces x 3 subscriptions exactly once within ceil(135 / 40) = 4 runs", async () => {
+  it("45 workspaceを4件ずつ巡回し、全135端末へ重複なく配達する", async () => {
     sq = await migrated();
     const all: string[] = [];
     for (let w = 0; w < 45; w++) {
@@ -82,7 +82,7 @@ describe("starvation freedom across runs", () => {
     const env = makeTestEnv(dbOf(sq) as any, { OAUTH_KV: makeMemoryKV() });
     const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(null, { status: 201 }));
 
-    for (let run = 0; run < 4; run++) {
+    for (let run = 0; run < Math.ceil(45 / MAX_PUSH_WORKSPACES_PER_RUN); run++) {
       const before = fetchSpy.mock.calls.length;
       await pushDueItemsAllWorkspaces(env, cfg);
       expect(fetchSpy.mock.calls.length - before).toBeLessThanOrEqual(40);
@@ -292,7 +292,7 @@ describe("pinned worst case for one cron invocation", () => {
     await pushDueItemsAllWorkspaces(env, cfg);
 
     expect(d1).toBeLessThanOrEqual(102);
-    expect(fetchSpy.mock.calls.length).toBe(40);
+    expect(fetchSpy.mock.calls.length).toBe(MAX_PUSH_WORKSPACES_PER_RUN);
     expect(get.mock.calls.length).toBeLessThanOrEqual(105);
     expect(put.mock.calls.length).toBeLessThanOrEqual(43);
     expect(del.mock.calls.length).toBeLessThanOrEqual(1);

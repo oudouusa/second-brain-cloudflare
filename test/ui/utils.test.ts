@@ -299,7 +299,7 @@ describe("toDateStr", () => {
 
 describe("vectorizeHealthBanner", () => {
   it("returns null when vectorize is healthy", () => {
-    expect(vectorizeHealthBanner({ ok: true, vectorize: { ok: true, indexName: "second-brain-vectors" } })).toBeNull();
+    expect(vectorizeHealthBanner({ ok: true, vectorize: { ok: true, indexName: "second-brain-cf-eg128-v1" } })).toBeNull();
   });
 
   it("returns null when health is null or undefined (no false alarm)", () => {
@@ -308,16 +308,16 @@ describe("vectorizeHealthBanner", () => {
   });
 
   it("returns a title and fix command naming the index when it is missing", () => {
-    const b = vectorizeHealthBanner({ ok: false, vectorize: { ok: false, indexName: "second-brain-vectors", error: "index not found" } });
+    const b = vectorizeHealthBanner({ ok: false, vectorize: { ok: false, indexName: "second-brain-cf-eg128-v1", error: "index not found" } });
     expect(b).not.toBeNull();
-    expect(b.title).toContain("second-brain-vectors");
-    expect(b.command).toBe("npx wrangler vectorize create second-brain-vectors --dimensions=384 --metric=cosine");
+    expect(b.title).toContain("second-brain-cf-eg128-v1");
+    expect(b.command).toBe("npx wrangler vectorize create second-brain-cf-eg128-v1 --dimensions=128 --metric=cosine");
     expect(b.gui).toContain("Vectorize Edit");
   });
 
   it("falls back to the default index name when indexName is absent", () => {
     const b = vectorizeHealthBanner({ ok: false, vectorize: { ok: false } });
-    expect(b.command).toContain("second-brain-vectors");
+    expect(b.command).toContain("second-brain-cf-eg128-v1");
   });
 });
 
@@ -347,11 +347,11 @@ describe("vectorizeBannerHtml", () => {
 describe("syncVectorizeBanner", () => {
   it("mounts the banner and offsets the body when a banner is given", () => {
     const doc = makeFakeDoc();
-    const banner = vectorizeHealthBanner({ ok: false, vectorize: { ok: false, indexName: "second-brain-vectors" } });
+    const banner = vectorizeHealthBanner({ ok: false, vectorize: { ok: false, indexName: "second-brain-cf-eg128-v1" } });
     const el = syncVectorizeBanner(doc, banner);
     expect(el).not.toBeNull();
     expect(doc.getElementById("vectorize-banner")).toBe(el);
-    expect(el.innerHTML).toContain("second-brain-vectors");
+    expect(el.innerHTML).toContain("second-brain-cf-eg128-v1");
     expect(doc.body.style.paddingTop).toBe("24px");
   });
 
@@ -589,6 +589,13 @@ describe("layerChipHtml", () => {
   });
 });
 
+ it("AI枯渇は索引の再作成を指示せず、縮退運転を示す", () => {
+   const banner = vectorizeHealthBanner({ vectorize: { ok: true }, ai: { status: "quota_exhausted" } });
+   const html = vectorizeBannerHtml(banner);
+   expect(html).toContain("keyword search remain available");
+   expect(html).not.toContain("wrangler");
+   expect(vectorizeHealthBanner({ vectorize: { ok: true }, ai: { status: "no_recent_quota_error" } })).toBeNull();
+ });
 /**
  * providerName() is the {provider} in a sentence ("by the Notion sync"), a
  * different job from sourceBadge's lowercase chip label - the two must not

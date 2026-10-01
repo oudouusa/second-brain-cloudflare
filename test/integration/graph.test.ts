@@ -90,7 +90,7 @@ describe("GET /graph", () => {
     pushEdge(db, "seed", "n1");
     pushEdge(db, "n1", "n2");
 
-    const res = await worker.fetch(req("GET", "/graph?seed=seed"), env, ctx);
+    const res = await worker.fetch(req("POST", "/graph?seed=seed"), env, ctx);
     const data = await res.json() as any;
     expect(data.nodes.map((n: any) => n.id).sort()).toEqual(["n1", "n2", "seed"]);
     expect(data.nodes.map((n: any) => n.id)).not.toContain("far");

@@ -12,18 +12,25 @@
  * because the assertion is about what actually lands in Vectorize metadata and
  * D1, not about which function was called.
  */
-import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
+import { describe, expect, expectTypeOf, it, vi, beforeEach, afterEach } from "vitest";
 import { makeSqliteD1, type SqliteD1 } from "../helpers/sqlite-d1";
 import { makeKVMock, makeMemoryKV, makeTestEnv, makeVectorizeMock } from "../helpers/make-env";
 import type { Env } from "../../src/env";
 import { DEFAULTS } from "../../src/config";
 import { initializeDatabase, resetDatabaseInit } from "../../src/db/init";
 import { captureEntry } from "../../src/capture/entry";
-import { updateEntryContent, appendToEntry } from "../../src/capture/store";
+import { storeEntry, reembedOrThrow, reembedOrDegrade, updateEntryContent, appendToEntry } from "../../src/capture/store";
 import { runBatch, clearMigration } from "../../src/migration/embedding";
 import worker from "../../src/index";
 import { ensureTenantBootstrap } from "../../src/lib/tenancy";
 import { createMember } from "../../src/lib/team-admin";
+import type { WriteContext } from "../../src/lib/scope";
+
+it("保存系のworkspace引数を上流と同じ位置に保つ", () => {
+  expectTypeOf<Parameters<typeof storeEntry>[7]>().toEqualTypeOf<WriteContext | undefined>();
+  expectTypeOf<Parameters<typeof reembedOrThrow>[6]>().toEqualTypeOf<WriteContext | undefined>();
+  expectTypeOf<Parameters<typeof reembedOrDegrade>[6]>().toEqualTypeOf<WriteContext | undefined>();
+});
 
 function makeCtx(): ExecutionContext {
   return { waitUntil: () => {} } as unknown as ExecutionContext;
@@ -50,7 +57,7 @@ describe("Merge re-embed carries the writer's workspace (src/capture/entry.ts)",
 
   it("re-embeds the merge target's vector with the writer's workspace, not ''", async () => {
     const upsert = vi.fn().mockResolvedValue({ mutationId: "m" });
-    const env = {
+    let env = {
       DB: d1.db as unknown as Env["DB"],
       VECTORIZE: makeVectorizeMock({
         query: vi.fn().mockResolvedValue({
@@ -60,7 +67,7 @@ describe("Merge re-embed carries the writer's workspace (src/capture/entry.ts)",
       }),
       AI: {
         run: vi.fn().mockImplementation(async (model: string, opts: any) => {
-          if (model === "@cf/baai/bge-small-en-v1.5") return { data: [new Array(384).fill(0.1)] };
+          if (model === "@cf/google/embeddinggemma-300m") return { data: [new Array(768).fill(0.1)] };
           const prompt: string = (opts?.messages ?? []).map((m: any) => m.content).join("\n");
           if (prompt.includes("Choose exactly one action")) {
             return makeSseStream('{"action":"merge","target_id":"existing-id","merged_content":"Combined memory"}');
@@ -80,6 +87,7 @@ describe("Merge re-embed carries the writer's workspace (src/capture/entry.ts)",
       `INSERT INTO entries (id, content, tags, source, created_at, updated_at, vector_ids, recall_count, importance_score, workspace_id, actor_id)
        VALUES ('existing-id', 'I prefer dark mode', '[]', 'api', ?, ?, '["existing-id"]', 0, 2, 'ws-a', 'user-a')`,
     ).bind(Date.now() - 1000, Date.now() - 1000).run();
+    env = d1.admitEnv(env);
 
     const result = await captureEntry(
       "I like dark mode at night",
@@ -92,11 +100,20 @@ describe("Merge re-embed carries the writer's workspace (src/capture/entry.ts)",
     );
 
     expect(result.status).toBe("merged");
+    if (result.status !== "merged") throw new Error("expected merged");
     expect(upsert).toHaveBeenCalledTimes(1);
     const upsertedVectors = upsert.mock.calls[0][0] as { metadata: Record<string, unknown> }[];
     expect(upsertedVectors).toHaveLength(1);
     expect(upsertedVectors[0].metadata.workspace_id).toBe("ws-a");
     expect(upsertedVectors[0].metadata.workspace_id).not.toBe("");
+    const beforeImage = await env.DB.prepare(
+      `SELECT content, tags, workspace_id FROM entry_versions WHERE entry_id = ? ORDER BY seq DESC LIMIT 1`,
+    ).bind(result.id).first<Record<string, unknown>>();
+    expect(beforeImage).toMatchObject({
+      content: "I prefer dark mode",
+      workspace_id: "ws-a",
+    });
+    expect(JSON.parse(String(beforeImage?.tags))).not.toContain("status:deprecated");
   });
 });
 
@@ -111,11 +128,11 @@ describe("Migration re-embed carries the row's workspace (src/migration/embeddin
 
   it("stamps ws-b on the migrated row's vector, taken from the row not the caller", async () => {
     const upsert = vi.fn().mockResolvedValue({ mutationId: "m" });
-    const env = {
+    let env = {
       DB: d1.db as unknown as Env["DB"],
       VECTORIZE: makeVectorizeMock({ upsert }),
       AI: {
-        run: vi.fn().mockResolvedValue({ data: [new Array(384).fill(0.1)] }),
+        run: vi.fn().mockResolvedValue({ data: [new Array(768).fill(0.1)] }),
       } as unknown as Ai,
       OAUTH_KV: makeMemoryKV(),
       AUTH_TOKEN: "test-token",
@@ -127,6 +144,9 @@ describe("Migration re-embed carries the row's workspace (src/migration/embeddin
       `INSERT INTO entries (id, content, tags, source, created_at, updated_at, vector_ids, workspace_id, actor_id)
        VALUES ('row-b', 'a memory in ws-b', '[]', 'api', ?, ?, '["row-b"]', 'ws-b', 'user-b')`,
     ).bind(Date.now() - 1000, Date.now() - 1000).run();
+    // runBatch is invoked directly here; the real migration route supplies the
+    // same ordinary-write admission around the unlocked full scan.
+    env = d1.admitEnv(env);
 
     const result = await runBatch(env, DEFAULTS);
 
@@ -149,10 +169,10 @@ describe("update/append re-embed carries the row workspace, not the caller defau
 
   it("update on a company row stamps vectors with the row workspace when writeCtx is personal", async () => {
     const upsert = vi.fn().mockResolvedValue({ mutationId: "m" });
-    const env = {
+    let env = {
       DB: d1.db as unknown as Env["DB"],
       VECTORIZE: makeVectorizeMock({ upsert }),
-      AI: { run: vi.fn().mockResolvedValue({ data: [new Array(384).fill(0.1)] }) } as unknown as Ai,
+      AI: { run: vi.fn().mockResolvedValue({ data: [new Array(768).fill(0.1)] }) } as unknown as Ai,
       OAUTH_KV: makeMemoryKV(),
       AUTH_TOKEN: "test-token",
     } as Env;
@@ -162,6 +182,7 @@ describe("update/append re-embed carries the row workspace, not the caller defau
       `INSERT INTO entries (id, content, tags, source, created_at, updated_at, vector_ids, workspace_id, actor_id)
        VALUES ('shared-row', 'Company fact', '[]', 'api', ?, ?, '["shared-row"]', 'ws-company', 'user-a')`,
     ).bind(now, now).run();
+    env = d1.admitEnv(env);
 
     const result = await updateEntryContent(
       env,
@@ -173,6 +194,7 @@ describe("update/append re-embed carries the row workspace, not the caller defau
       { workspaceId: "ws-personal", actorId: "user-a" },
       { actorId: "user-a", channel: "rest" },
       "ws-company",
+      makeCtx(),
     );
     expect(result.status).toBe("updated");
     expect(upsert).toHaveBeenCalledTimes(1);
@@ -182,15 +204,15 @@ describe("update/append re-embed carries the row workspace, not the caller defau
   });
 
   it("large append on a company row stamps vectors with the row workspace", async () => {
-    const upsert = vi.fn().mockResolvedValue({ mutationId: "m" });
-    const env = {
+    const insert = vi.fn().mockResolvedValue({ mutationId: "m" });
+    let env = {
       DB: d1.db as unknown as Env["DB"],
-      VECTORIZE: makeVectorizeMock({ upsert }),
+      VECTORIZE: makeVectorizeMock({ insert }),
       // R20's batchEmbeds sends every chunk in one call: this must answer with one vector per
       // requested text, not a fixed single vector, or embedMany's own count check throws.
       AI: { run: vi.fn().mockImplementation(async (_model: string, opts: any) => {
         const texts = Array.isArray(opts?.text) ? opts.text : [opts?.text];
-        return { data: texts.map(() => new Array(384).fill(0.1)) };
+        return { data: texts.map(() => new Array(768).fill(0.1)) };
       }) } as unknown as Ai,
       OAUTH_KV: makeMemoryKV(),
       AUTH_TOKEN: "test-token",
@@ -202,6 +224,7 @@ describe("update/append re-embed carries the row workspace, not the caller defau
       `INSERT INTO entries (id, content, tags, source, created_at, updated_at, vector_ids, workspace_id, actor_id)
        VALUES ('shared-long', ?, '[]', 'api', ?, ?, '["shared-long"]', 'ws-company', 'user-a')`,
     ).bind(longBody, now, now).run();
+    env = d1.admitEnv(env);
 
     await appendToEntry(
       env,
@@ -216,10 +239,11 @@ describe("update/append re-embed carries the row workspace, not the caller defau
       { actorId: "user-a", channel: "rest" },
       undefined,
       "ws-company",
+      makeCtx(),
     );
 
-    expect(upsert).toHaveBeenCalledTimes(1);
-    const meta = (upsert.mock.calls[0][0] as { metadata: Record<string, unknown> }[])[0].metadata;
+    expect(insert).toHaveBeenCalledTimes(1);
+    const meta = (insert.mock.calls[0][0] as { metadata: Record<string, unknown> }[])[0].metadata;
     expect(meta.workspace_id).toBe("ws-company");
   });
 });
@@ -242,7 +266,7 @@ describe("/vectorize-pending carries the target row's workspace, not the admin's
       OAUTH_KV: makeMemoryKV(),
       VECTORIZE: makeVectorizeMock({ upsert }),
       AI: {
-        run: vi.fn().mockResolvedValue({ data: [new Array(384).fill(0.1)] }),
+        run: vi.fn().mockResolvedValue({ data: [new Array(768).fill(0.1)] }),
       } as unknown as Ai,
     });
     await initializeDatabase(env);

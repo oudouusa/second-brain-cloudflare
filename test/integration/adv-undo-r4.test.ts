@@ -38,17 +38,18 @@ function statefulVectorize(matchId?: string) {
     deleteByIds: vi.fn(async (ids: string[]): Promise<any> => { for (const i of ids) store.delete(i); return { mutationId: "m" }; }),
     getByIds: vi.fn(async (ids: string[]): Promise<any> => ids.map(i => store.get(i)).filter(Boolean)),
   };
-  if (matchId) overrides.query = vi.fn().mockResolvedValue({ matches: [{ id: matchId, score: 0.9, metadata: { parentId: matchId } }] });
+  if (matchId) overrides.query = vi.fn().mockResolvedValue({ matches: [{ id: matchId, score: 0.93, metadata: { parentId: matchId } }] });
   return makeVectorizeMock(overrides as any);
 }
 const decisionAI = (decision: string) =>
-  ({ run: vi.fn(async (model: string) => model.startsWith("@cf/baai/bge") ? { data: [new Array(384).fill(0.1)] } : stream(decision)) }) as any;
+  ({ run: vi.fn(async (model: string) => model === "@cf/google/embeddinggemma-300m" ? { data: [new Array(768).fill(0.1)] } : stream(decision)) }) as any;
 
 beforeEach(async () => {
   resetDatabaseInit();
   sqlite = makeSqliteD1();
-  env = makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV(), VECTORIZE: statefulVectorize(), AI: makeAIMock() });
+  env = sqlite.admitEnv(makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV(), VECTORIZE: statefulVectorize(), AI: makeAIMock() }));
   await initializeDatabase(env);
+  env = sqlite.admitEnv(env);
   const roots = await ensureTenantBootstrap(env);
   owner = (await resolveIdentityByUserId(env, roots.ownerUserId))!;
 });
@@ -80,7 +81,7 @@ function beforeRevertBatch(base: Env, race: () => Promise<void>): Env {
       return raw.batch(stmts);
     },
   };
-  return { ...base, DB: db } as unknown as Env;
+  return { ...base, WRITE_ADMISSION_TOKEN: base.WRITE_ADMISSION_TOKEN, DB: db } as unknown as Env;
 }
 
 
@@ -88,10 +89,11 @@ function beforeRevertBatch(base: Env, race: () => Promise<void>): Env {
 /** A merge decider whose merged text is the target's current text plus the incoming capture, like a real merge. */
 function mergingEnv(target: string) {
   const ai = { run: vi.fn(async (model: string, input: any) => {
-    if (model.startsWith("@cf/baai/bge")) return { data: (Array.isArray(input?.text) ? input.text : [input?.text]).map(() => new Array(384).fill(0.1)) };
+    if (model === "@cf/google/embeddinggemma-300m") return { data: (Array.isArray(input?.text) ? input.text : [input?.text]).map(() => new Array(768).fill(0.1)) };
+    if (!String(input?.messages?.[0]?.content ?? "").includes("Choose exactly one action")) return stream("3");
     return stream(JSON.stringify({ action: "merge", target_id: target, merged_content: `${currentContent(target)} ${pending.shift() ?? ""}` }));
   }) } as any;
-  return makeTestEnv(undefined, { DB: sqlite.db as any, OAUTH_KV: makeMemoryKV(), VECTORIZE: statefulVectorize(target), AI: ai }) as Env;
+  return sqlite.admitEnv(makeTestEnv(undefined, { DB: sqlite.db as any, OAUTH_KV: makeMemoryKV(), VECTORIZE: statefulVectorize(target), AI: ai })) as Env;
 }
 const pending: string[] = [];
 const currentContent = (id: string) => row(id)?.content ?? "";
@@ -113,7 +115,7 @@ function counting(base: Env) {
     all: () => { executed.push(sql); return s.all(); },
   });
   const db = { ...raw, prepare: (sql: string) => wrap(raw.prepare(sql), sql), batch: (stmts: any[]) => { executed.push(`BATCH(${stmts.length})`); return raw.batch(stmts.map((s: any) => s.raw())); } };
-  return { env: { ...base, DB: db } as unknown as Env, executed };
+  return { env: { ...base, WRITE_ADMISSION_TOKEN: base.WRITE_ADMISSION_TOKEN, DB: db } as unknown as Env, executed };
 }
 
 
@@ -145,21 +147,16 @@ describe("ADV-U18 (MINOR): the re-creation insert can no longer fail separately 
 describe("ADV-U19 (MINOR): the oversize fallback drops the record, so 'at most once' no longer holds", () => {
   it("rolling back past a merge twice on a ~1.85 MB row leaves one copy of the incoming fact", async () => {
     const e = mergingEnv("big");
-    await seed("big", { content: "Old text", tags: ["work"] });
-    const incoming = "i".repeat(900_000);
-    // Codex recheck (T-0089.4.2): a person's own 900 KB capture (channel mcp/rest) would score
-    // `partial` and hold too_long, which now refuses to merge at all (finding #1) -- the exact
-    // protection this test's own scenario would otherwise defeat. This omits channel purely to
-    // reach the same oversized-merge shape ADV-U19 is about, unrelated to what this finding
-    // fixed -- commitPerson still runs, since systemWrite is still unset. `capture()`'s own
-    // `pending.push` is replicated here since this bypasses that helper.
-    pending.push(incoming);
-    expect((await captureEntry(incoming, [], "api", e, ctx, undefined, { workspaceId: owner.personalWorkspaceId, actorId: owner.userId })).status).toBe("merged");
-    const mergeSeq = (await versions("big"))[0].seq;
-    // The row keeps growing after the merge (still well inside D1's 2 MB row). The result is
-    // well over the scorer's 32 KB budget, so class D (T-0089.4.2) holds it too_long and
-    // skips the embed rather than index a row nobody has fully read yet.
-    expect((await appendToEntry(e, "big", "", "g".repeat(950_000), [], "api", DEFAULTS, undefined, { workspaceId: owner.personalWorkspaceId, actorId: owner.userId }, change(), undefined, owner.personalWorkspaceId)).indexed).toBe(false);
+    const incoming = "i".repeat(900_000), merged = "Old text " + incoming;
+    // 過去の大容量brainをseedし、現行入力の12,000文字上限を迂回した公開経路は作らない。
+    await seed("big", { content: merged + "g".repeat(950_000), tags: ["work", "quarantine:too_long", "status:draft"] });
+    await env.DB.prepare(`INSERT INTO entry_versions (entry_id, workspace_id, seq, content, tags, state, actor_id, channel, reason, meta, valid_from, created_at)
+      VALUES ('big', ?, 1, 'Old text', '["work"]', '{}', ?, 'rest', 'merge', ?, 1000, 2000)`)
+      .bind(owner.personalWorkspaceId, owner.userId, JSON.stringify({ incoming, incomingTags: [], incomingSource: "api" })).run();
+    await env.DB.prepare(`INSERT INTO entry_versions (entry_id, workspace_id, seq, content, prior_length, tags, state, actor_id, channel, reason, meta, valid_from, created_at)
+      VALUES ('big', ?, 2, NULL, ?, '["work"]', '{}', ?, 'rest', 'append', '{}', 2000, 3000)`)
+      .bind(owner.personalWorkspaceId, merged.length, owner.userId).run();
+    const mergeSeq = 1;
     // First rollback: the version row needs a full 1.85 MB copy, so recreated_incoming is dropped.
     // The row is currently held (too_long, from the append above) and the merge-time target
     // was not, so per 5.6 this rollback is a release, not a plain revert (class D, T-0089.4.2).

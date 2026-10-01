@@ -8,7 +8,7 @@ import type { Env } from "../../src/env";
 async function liveColumns() {
   resetDatabaseInit();
   const sqlite = makeSqliteD1();
-  const env = makeTestEnv(undefined, { DB: sqlite.db as unknown as D1Database }) as Env;
+  const env = sqlite.admitEnv(makeTestEnv(undefined, { DB: sqlite.db as unknown as D1Database })) as Env;
   await initializeDatabase(env);
   const info = await env.DB.prepare(`PRAGMA table_info(entries)`).all() as any;
   sqlite.close();
@@ -16,8 +16,8 @@ async function liveColumns() {
 }
 
 describe("ENTRY_ROW_COLUMNS", () => {
-  it("is every entries column except id, content and vector_ids", async () => {
-    const live = (await liveColumns()).map((c) => c.name).filter((n) => !["id", "content", "vector_ids"].includes(n));
+  it("本文・索引・一時capabilityを除く全列を保存する", async () => {
+    const live = (await liveColumns()).map((c) => c.name).filter((n) => !["id", "content", "vector_ids", "write_marker", "restore_lease_owner", "migration_lease_owner"].includes(n));
     expect(ENTRY_ROW_COLUMNS.map((c) => c.name).sort()).toEqual(live.sort());
   });
 

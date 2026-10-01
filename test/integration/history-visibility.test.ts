@@ -18,7 +18,7 @@ let company: string;
 beforeEach(async () => {
   resetDatabaseInit();
   d1 = makeSqliteD1();
-  env = makeTestEnv(undefined, { DB: d1.db as unknown as D1Database, OAUTH_KV: makeMemoryKV() });
+  env = d1.admitEnv(makeTestEnv(undefined, { DB: d1.db as unknown as D1Database, OAUTH_KV: makeMemoryKV() }));
   await initializeDatabase(env);
   const roots = await ensureTenantBootstrap(env);
   company = roots.companyWorkspaceId;

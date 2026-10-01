@@ -86,7 +86,7 @@ describe("renderRecallText why line", () => {
   it("adds one plain why line after the ID line", () => {
     const out = renderRecallText([m({ why: why() })], "");
     expect(out).toBe(
-      `1. [Sep 20, 2026 · claude [status:canonical]] (100% match)\nID: e1\nwhy: meaning #2 · keywords "gatewright" (rare) · canonical · recent (Sep 20) · reranked up\nBody text`,
+      `1. [Sep 20, 2026 · claude [status:canonical]] (relative score: 1.00)\nID: e1\nwhy: meaning #2 · keywords "gatewright" (rare) · canonical · recent (Sep 20) · reranked up\nBody text`,
     );
   });
 
@@ -116,7 +116,7 @@ describe("renderRecallText why line", () => {
 
   it("is byte-identical to the pre-explain rendering when no match carries a why", () => {
     const out = renderRecallText([m({ tags: ["work"] })], "");
-    expect(out).toBe(`1. [Sep 20, 2026 · claude [work]] (100% match)\nID: e1\nBody text`);
+    expect(out).toBe(`1. [Sep 20, 2026 · claude [work]] (relative score: 1.00)\nID: e1\nBody text`);
   });
 });
 

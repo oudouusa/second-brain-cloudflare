@@ -41,21 +41,21 @@ async function cost(withHistory: boolean, extraTags = "[]", run: () => Promise<u
   t.seed("y", { created_at: 1000, tags: extraTags, source: extraTags === "[]" ? "api" : "system", actor_id: extraTags === "[]" ? t.roots.ownerUserId : "" });
   t.seed("x", { created_at: 2000, tags: extraTags, source: extraTags === "[]" ? "api" : "system", actor_id: extraTags === "[]" ? t.roots.ownerUserId : "" });
   if (withHistory) await supersede("y", "x");
-  t.sqlite.issued.length = 0;
+  t.sqlite.executions.length = 0;
   await run();
-  return t.sqlite.issued.length;
+  return t.sqlite.executions.length;
 }
 
 describe("Track 2 execution pins", () => {
   it("undo into 'wrong' and back: the hooks ride the revert batch and its own audit batch, 0 extra", async () => {
     const plain = await cost(false, "[]", async () => {
       await applyStatus("x", "deprecated", t.env, change(), DEFAULTS, ws());
-      t.sqlite.issued.length = 0;
+      t.sqlite.executions.length = 0;
       await revertEntry(t.env, owner(), "x", change(), DEFAULTS, undefined, ws());
     });
     const hooked = await cost(true, "[]", async () => {
       await applyStatus("x", "deprecated", t.env, change(), DEFAULTS, ws());
-      t.sqlite.issued.length = 0;
+      t.sqlite.executions.length = 0;
       const r = await revertEntry(t.env, owner(), "x", change(), DEFAULTS, undefined, ws());
       expect(r).toMatchObject({ validity: { reclosed: [{ id: "y" }] } });
     });
@@ -65,7 +65,7 @@ describe("Track 2 execution pins", () => {
   it("insight dismiss: one audit batch more only when a hook changed something", async () => {
     const dismiss = async () => {
       const found = await t.all<any>(`SELECT id, tags, vector_ids, workspace_id FROM entries WHERE id = 'x'`);
-      t.sqlite.issued.length = 0;
+      t.sqlite.executions.length = 0;
       await applyInsightResolution(t.env, ctx, change(), found, 1, "dismiss");
     };
     const plain = await cost(false, '["auto-insight"]', dismiss);
@@ -83,10 +83,10 @@ describe("Track 2 execution pins", () => {
       ids.push(`m${i}`);
     }
     for (let i = 0; i < 200; i++) await supersede(`old${i}`, `m${i}`);
-    t.sqlite.issued.length = 0;
+    t.sqlite.executions.length = 0;
     const r = await trashMirroredEntries(t.env, owner(), ids, { provider: "notion" });
     expect(r.purged).toBe(200);
-    expect(t.sqlite.issued.length).toBeLessThanOrEqual(50);
+    expect(t.sqlite.executions.length).toBeLessThanOrEqual(50);
     expect((await t.one<any>(`SELECT COUNT(*) AS n FROM entries WHERE id LIKE 'old%' AND valid_until IS NULL`))!.n).toBe(200);
   });
 });

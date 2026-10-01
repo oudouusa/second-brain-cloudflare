@@ -360,6 +360,7 @@ describe("withFtsWriteGuard", () => {
       // running the creation batch.
       await s.db.exec("DROP TRIGGER entries_fts_insert");
       await s.db.exec("CREATE TRIGGER entries_fts_insert AFTER INSERT ON entries BEGIN SELECT RAISE(ABORT, 'fts5: corrupt'); END");
+      await s.db.prepare("UPDATE schema_meta SET version = 7 WHERE id = 'current'").run();
 
       // A cold start's own probe snapshot, taken BEFORE the hot path's
       // repair drops the triggers, paused right after so the guarded write
@@ -371,7 +372,7 @@ describe("withFtsWriteGuard", () => {
       const coldDb = {
         prepare(sql: string) {
           const raw = s.db.prepare(sql);
-          if (!sql.startsWith("SELECT type AS kind, name")) return raw;
+          if (!sql.startsWith("WITH schema_groups")) return raw;
           return { all: async () => { const result = await raw.all(); snapshotTaken(); await gate; return result; } };
         },
         exec: s.db.exec.bind(s.db),
@@ -423,6 +424,7 @@ describe("withFtsWriteGuard", () => {
         "DROP TRIGGER entries_fts_insert; DROP TRIGGER entries_fts_update;" +
         "DROP TRIGGER entries_fts_delete; DROP TABLE entries_fts;",
       );
+      await s.db.prepare("UPDATE schema_meta SET version = 7 WHERE id = 'current'").run();
 
       // A cold start's own probe snapshot, taken while the table is
       // genuinely missing, paused right after so the events below can play
@@ -434,7 +436,7 @@ describe("withFtsWriteGuard", () => {
       const coldDb = {
         prepare(sql: string) {
           const raw = s.db.prepare(sql);
-          if (!sql.startsWith("SELECT type AS kind, name")) return raw;
+          if (!sql.startsWith("WITH schema_groups")) return raw;
           return { all: async () => { const result = await raw.all(); snapshotTaken(); await gate; return result; } };
         },
         exec: s.db.exec.bind(s.db),

@@ -82,6 +82,14 @@ describe("memory-bearing files", () => {
     git("check-ignore", "--no-index", "-q", "--", path).status === 0;
 
   for (const path of [
+    ".env.production",
+    ".env.local",
+    ".dev.vars.production",
+    "oauth/pending.json",
+    "oauth/registration.json",
+    "credentials.json",
+    "private-settings.json",
+    "owner.cred",
     "brain.sql",                       // a d1 export in the repo root
     "test/__nope__/export.sql",        // …or anywhere else
     "dump.sqlite",

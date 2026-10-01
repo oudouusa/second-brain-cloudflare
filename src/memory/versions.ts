@@ -1,3 +1,4 @@
+import { assertMemoryWritesAllowed, memoryWriteMarker } from "../migration/write-lock";
 import type { Env } from "../env";
 import type { ChangeContext } from "../lib/audit";
 import type { Identity } from "../lib/identity";
@@ -41,6 +42,7 @@ export class Params {
 }
 
 export interface SnapshotInput {
+  writeMarker?: string | null;
   entryId: string;
   reason: VersionReason;
   change: ChangeContext;
@@ -72,7 +74,7 @@ const SORTED_TAGS = `(SELECT json_group_array(value) FROM (SELECT value FROM jso
 // buildSnapshotMany) restricts to an already-authorized id before this fragment runs
 const NEWEST_SEQ = `COALESCE((SELECT MAX(v.seq) FROM entry_versions v WHERE v.entry_id = e.id), 0)`;
 
-const INSERT_COLUMNS = `INSERT INTO entry_versions (entry_id, workspace_id, seq, content, prior_length, prior_length_utf16, tags, state, actor_id, channel, reason, meta, valid_from, created_at)`;
+const INSERT_COLUMNS = `INSERT INTO entry_versions (entry_id, workspace_id, seq, content, prior_length, prior_length_utf16, tags, state, actor_id, channel, reason, meta, valid_from, created_at, write_marker)`;
 
 /**
  * SELECT list shared by the one-row and many-row snapshots. `delta` is a SQL boolean over e.content.
@@ -87,7 +89,7 @@ const INSERT_COLUMNS = `INSERT INTO entry_versions (entry_id, workspace_id, seq,
  */
 function selectList(
   p: Params, delta: string,
-  s: { reason: VersionReason; change: ChangeContext; meta?: Record<string, unknown>; metaSql?: string; now: number; priorLengthUtf16?: number },
+  s: { writeMarker?: string | null; reason: VersionReason; change: ChangeContext; meta?: Record<string, unknown>; metaSql?: string; now: number; priorLengthUtf16?: number },
 ): string {
   // Every version's own meta carries the calling client, the same way its entry_events row
   // already does -- history-view.ts's changeItems and every reader of it (mcp/server.ts's
@@ -110,6 +112,7 @@ function selectList(
                 COALESCE(e.updated_at, e.created_at)),
        MAX(${p.add(s.now)}, COALESCE((SELECT v.created_at FROM entry_versions v WHERE v.entry_id = e.id AND v.seq = (SELECT MAX(x.seq) FROM entry_versions x WHERE x.entry_id = e.id)),
                 COALESCE(e.updated_at, e.created_at)))
+       , ${p.add(s.writeMarker ?? null)}
   FROM entries e`;
 }
 
@@ -147,11 +150,12 @@ export function buildSnapshot(s: SnapshotInput): BuiltStatement {
 }
 
 export function snapshotStatement(env: Env, s: SnapshotInput): D1PreparedStatement {
-  const b = buildSnapshot(s);
+  const b = buildSnapshot({ ...s, writeMarker: memoryWriteMarker(env) });
   return env.DB.prepare(b.sql).bind(...b.bindings);
 }
 
 export interface SnapshotManyInput {
+  writeMarker?: string | null;
   entryIds: string[];
   reason: VersionReason;
   change: ChangeContext;
@@ -171,6 +175,7 @@ export function buildSnapshotMany(s: SnapshotManyInput): BuiltStatement {
 }
 
 export interface DerivedSnapshotInput {
+  writeMarker?: string | null;
   reason: VersionReason;
   change: ChangeContext;
   now: number;
@@ -188,16 +193,17 @@ export interface DerivedSnapshotInput {
 export function buildDerivedSnapshot(s: DerivedSnapshotInput): BuiltStatement {
   const p = new Params();
   const metaSql = s.meta(p);
-  const list = selectList(p, `instr(e.content, char(0)) = 0`, { reason: s.reason, change: s.change, now: s.now, metaSql });
+  const list = selectList(p, `instr(e.content, char(0)) = 0`, { reason: s.reason, change: s.change, now: s.now, metaSql, writeMarker: s.writeMarker });
   return { sql: `${INSERT_COLUMNS}\n${list}\n ${s.where(p)}`, bindings: p.values() };
 }
 
 export function snapshotManyStatement(env: Env, s: SnapshotManyInput): D1PreparedStatement {
-  const b = buildSnapshotMany(s);
+  const b = buildSnapshotMany({ ...s, writeMarker: memoryWriteMarker(env) });
   return env.DB.prepare(b.sql).bind(...b.bindings);
 }
 
 export interface GuardedSnapshotManyInput {
+  writeMarker?: string | null;
   /**
    * Per-row identity check: matches only if the live row's own values still equal these.
    * `rowVersion` is the caller's COALESCE(updated_at, created_at) at read time — entries.updated_at
@@ -241,7 +247,7 @@ export function buildGuardedSnapshotMany(s: GuardedSnapshotManyInput): BuiltStat
 }
 
 export function guardedSnapshotManyStatement(env: Env, s: GuardedSnapshotManyInput): D1PreparedStatement {
-  const b = buildGuardedSnapshotMany(s);
+  const b = buildGuardedSnapshotMany({ ...s, writeMarker: memoryWriteMarker(env) });
   return env.DB.prepare(b.sql).bind(...b.bindings);
 }
 
@@ -251,6 +257,7 @@ export function buildPrune(entryId: string, keep: number): BuiltStatement {
   const id = p.add(entryId);
   return {
     // scope-exempt: by-id: pruneStatement's caller prunes only the entry it just snapshotted, already authorized
+    // write-fence: parent-capability=entry_versions（同batchのsnapshot・認可済み記憶をtriggerで検証）
     sql: `DELETE FROM entry_versions WHERE entry_id = ${id}
      AND seq <= (SELECT MAX(v.seq) FROM entry_versions v WHERE v.entry_id = ${id}) - ${p.add(keep)}`,
     bindings: p.values(),
@@ -266,6 +273,7 @@ export function buildPruneMany(entryIds: string[], keep: number): BuiltStatement
   const p = new Params();
   return {
     // scope-exempt: by-id: pruneManyStatement's caller prunes only the ids it just snapshotted together, already authorized
+    // write-fence: parent-capability=entry_versions（同batchのsnapshot・認可済み記憶をtriggerで検証）
     sql: `DELETE FROM entry_versions WHERE entry_id IN (SELECT value FROM json_each(${p.add(JSON.stringify(entryIds))}))
      AND seq <= (SELECT MAX(v.seq) FROM entry_versions v WHERE v.entry_id = entry_versions.entry_id) - ${p.add(keep)}`,
     bindings: p.values(),
@@ -283,6 +291,7 @@ export function buildMirrorPrune(entryId: string, keep: number): BuiltStatement 
   const id = p.add(entryId);
   return {
     // scope-exempt: by-id: mirrorPruneStatement's caller prunes only the entry it just snapshotted, already authorized
+    // write-fence: parent-capability=entry_versions（同batchのsnapshot・認可済み記憶をtriggerで検証）
     sql: `DELETE FROM entry_versions WHERE entry_id = ${id}
      AND seq <= (SELECT MAX(v.seq) FROM entry_versions v WHERE v.entry_id = ${id}) - ${p.add(keep)}
      AND seq < COALESCE((SELECT MIN(v.seq) FROM entry_versions v WHERE v.entry_id = ${id} AND v.reason <> 'mirror'), 9e18)`,

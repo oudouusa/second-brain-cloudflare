@@ -48,7 +48,7 @@ let roots: Awaited<ReturnType<typeof ensureTenantBootstrap>>;
 let bob: Awaited<ReturnType<typeof createMember>>;
 
 /** A controlled clock, so "newest first" is a fact and not a coin toss. */
-let clock = 1_760_000_000_000;
+let clock = 1_800_000_000_000;
 const tick = (ms = 1000) => { clock += ms; };
 
 const ctx = {
@@ -128,7 +128,7 @@ async function entry(id: string, content: string, workspaceId: string, actorId: 
 beforeEach(async () => {
   resetDatabaseInit();
   pending = [];
-  clock = 1_760_000_000_000;
+  clock = 1_800_000_000_000;
   vi.spyOn(Date, "now").mockImplementation(() => clock);
   sqlite = makeSqliteD1();
   env = makeTestEnv(undefined, {
@@ -821,9 +821,10 @@ describe("GET /team/activity — the bound-parameter ceiling", () => {
 /**
  * THE RULING ON FAILURE, asserted rather than only written down.
  *
- * This route is deliberately uncaught — see the note above the handler. The
- * property that makes that the right call is the one below: a feed that cannot
- * be read must not answer as a feed with nothing in it. `{ ok: true, events: [] }`
+ * This route deliberately does not degrade — see the note above the handler.
+ * The Worker boundary converts the failure to its privacy-safe generic 500,
+ * but a feed that cannot be read must not answer as a feed with nothing in it.
+ * `{ ok: true, events: [] }`
  * is the single most dangerous response this endpoint could give, because it is
  * the same response a clean brain gives and an auditor cannot tell them apart.
  *
@@ -843,7 +844,9 @@ describe("GET /team/activity — an unreadable feed is not an empty one", () => 
     (env.DB as any).prepare = (sql: string) =>
       sql.includes("FROM admin_events") ? failing : real(sql);
 
-    await expect(call("GET", "/team/activity", ALICE)).rejects.toThrow(/D1_ERROR/);
+    const response = await call("GET", "/team/activity", ALICE);
+    expect(response.status).toBe(500);
+    expect(await jsonOf(response)).toEqual({ ok: false, error: "Internal server error" });
     await settle();
   });
 
@@ -874,7 +877,9 @@ describe("GET /team/activity — an unreadable feed is not an empty one", () => 
     (env.DB as any).prepare = (sql: string) =>
       /SELECT id, name\s+FROM users WHERE id IN/.test(sql) ? failing : real(sql);
 
-    await expect(call("GET", "/team/activity", ALICE)).rejects.toThrow(/D1_ERROR/);
+    const response = await call("GET", "/team/activity", ALICE);
+    expect(response.status).toBe(500);
+    expect(await jsonOf(response)).toEqual({ ok: false, error: "Internal server error" });
     await settle();
   });
 });

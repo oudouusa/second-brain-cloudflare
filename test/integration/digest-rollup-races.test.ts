@@ -26,7 +26,7 @@ const seed = (id: string, over: Record<string, unknown> = {}, workspaceId: strin
 async function makeDigestEnv() {
   resetDatabaseInit();
   sqlite = makeSqliteD1();
-  const env = makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV() }) as Env;
+  const env = sqlite.admitEnv(makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV() })) as Env;
   await initializeDatabase(env);
   const roots = await ensureTenantBootstrap(env);
   return { env, roots };
@@ -34,7 +34,7 @@ async function makeDigestEnv() {
 
 function mockAi() {
   return {
-    run: vi.fn(async (model: string) => model.startsWith("@cf/baai/bge") ? { data: [new Array(384).fill(0.1)] }
+    run: vi.fn(async (model: string) => model === "@cf/google/embeddinggemma-300m" ? { data: [new Array(768).fill(0.1)] }
       : new ReadableStream({ start(c) {
         c.enqueue(new TextEncoder().encode(`data: {"response":"Synthesized text"}\n\n`));
         c.enqueue(new TextEncoder().encode("data: [DONE]\n\n")); c.close();
@@ -49,9 +49,9 @@ const ctx = { waitUntil: (_: Promise<unknown>) => {} } as unknown as ExecutionCo
 describe("ADV-3: digest rollup writes no version for a source it did not change", () => {
   it("a source moved out of the digest's workspace mid-run gets no rollup version", async () => {
     const { env, roots } = await makeDigestEnv();
-    const digestEnv = makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV(), AI: mockAi() }) as Env;
+    const digestEnv = sqlite.admitEnv(makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV(), AI: mockAi() })) as Env;
     for (let i = 0; i < 12; i++) {
-      await seed(`s${i}`, { content: `Work memory number ${i} with enough detail to be eligible`, tags: ["work"], createdAt: 1000 + i }, roots.ownerPersonalWorkspaceId, roots.ownerUserId);
+      await seed(`s${i}`, { content: `Work memory number ${i} with enough detail to be eligible`, tags: ["rocket-project"], createdAt: 1000 + i }, roots.ownerPersonalWorkspaceId, roots.ownerUserId);
     }
     const db = digestEnv.DB as any;
     const prepare = db.prepare.bind(db);
@@ -65,7 +65,7 @@ describe("ADV-3: digest rollup writes no version for a source it did not change"
       }
       return prepare(sql);
     };
-    await compressTag("work", digestEnv, ctx);
+    await compressTag("rocket-project", digestEnv, ctx);
     const s0 = await live(env, "s0");
     expect(s0.content).not.toContain("[Digest:"); // the mark missed, correctly: it moved before the mark ran
     expect(await versions(env, "s0")).toEqual([]); // no phantom rollup version stamped with the wrong workspace
@@ -75,9 +75,9 @@ describe("ADV-3: digest rollup writes no version for a source it did not change"
 describe("ADV-9: a rollup does not mark text the digest never saw", () => {
   it("the user's new text is not marked rolled-up by a digest that summarised the old text", async () => {
     const { env, roots } = await makeDigestEnv();
-    const digestEnv = makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV(), AI: mockAi() }) as Env;
+    const digestEnv = sqlite.admitEnv(makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV(), AI: mockAi() })) as Env;
     for (let i = 0; i < 12; i++) {
-      await seed(`s${i}`, { content: `Work memory number ${i} with enough detail to be eligible`, tags: ["work"], createdAt: 1000 + i }, roots.ownerPersonalWorkspaceId, roots.ownerUserId);
+      await seed(`s${i}`, { content: `Work memory number ${i} with enough detail to be eligible`, tags: ["rocket-project"], createdAt: 1000 + i }, roots.ownerPersonalWorkspaceId, roots.ownerUserId);
     }
     const db = digestEnv.DB as any;
     const prepare = db.prepare.bind(db);
@@ -89,7 +89,7 @@ describe("ADV-9: a rollup does not mark text the digest never saw", () => {
       }
       return prepare(sql);
     };
-    await compressTag("work", digestEnv, ctx);
+    await compressTag("rocket-project", digestEnv, ctx);
     const s0 = await live(env, "s0");
     expect(s0.content.startsWith("Corrected: the launch moved to October")).toBe(true);
     expect(JSON.parse(s0.tags)).not.toContain("rolled-up");
@@ -100,14 +100,14 @@ describe("ADV-9: a rollup does not mark text the digest never saw", () => {
 describe("round 2: the rollup mark bumps updated_at like every other content writer", () => {
   it("a marked source's updated_at moves off NULL, so its rowVersion (COALESCE(updated_at, created_at)) tracks the write", async () => {
     const { env, roots } = await makeDigestEnv();
-    const digestEnv = makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV(), AI: mockAi() }) as Env;
+    const digestEnv = sqlite.admitEnv(makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV(), AI: mockAi() })) as Env;
     for (let i = 0; i < 12; i++) {
-      await seed(`s${i}`, { content: `Work memory number ${i} with enough detail to be eligible`, tags: ["work"], createdAt: 1000 + i }, roots.ownerPersonalWorkspaceId, roots.ownerUserId);
+      await seed(`s${i}`, { content: `Work memory number ${i} with enough detail to be eligible`, tags: ["rocket-project"], createdAt: 1000 + i }, roots.ownerPersonalWorkspaceId, roots.ownerUserId);
     }
     const before = await live(env, "s0");
     expect(before.updated_at).toBeNull(); // never edited: the exact state the guard's rowVersion falls back to created_at for
 
-    await compressTag("work", digestEnv, ctx);
+    await compressTag("rocket-project", digestEnv, ctx);
 
     const after = await live(env, "s0");
     expect(JSON.parse(after.tags)).toContain("rolled-up");

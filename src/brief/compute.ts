@@ -122,6 +122,7 @@ export async function computeBrief(env: Env, auth: Identity, preview = false, pr
     // What arrived, and from where. Grouped rather than listed: the point is
     // "your brain grew, from these places", not another feed of rows.
     env.DB.prepare(
+      // validity: any: ダッシュボードの捕捉件数・活動・話題は過去の記憶も集計する。
       `SELECT source, COUNT(*) AS n FROM entries
        WHERE created_at >= ? AND ${scope.clause} GROUP BY source ORDER BY n DESC`,
     ).bind(since, ...scope.bindings).all(),
@@ -130,6 +131,7 @@ export async function computeBrief(env: Env, auth: Identity, preview = false, pr
     // excluded from recall until confirmed, so leaving them unseen in a menu
     // is the same as throwing them away.
     env.DB.prepare(
+      // validity: current: 既存のPENDING_INSIGHT_SQL・STALE_REVIEW_SQL・compressionEligibilitySqlで現在の適格性を検査する。
       `SELECT id, content FROM entries
        WHERE ${PENDING_INSIGHT_SQL} AND ${scope.clause}
        ORDER BY created_at DESC LIMIT 3`,
@@ -139,6 +141,7 @@ export async function computeBrief(env: Env, auth: Identity, preview = false, pr
     // grouping in the client, because the row count is the whole point and
     // there is no reason to send two weeks of rows to count them.
     env.DB.prepare(
+      // validity: any: ダッシュボードの捕捉件数・活動・話題は過去の記憶も集計する。
       `SELECT CAST(created_at / 86400000 AS INTEGER) AS day, COUNT(*) AS n
        FROM entries WHERE created_at >= ? AND ${scope.clause}
        GROUP BY day ORDER BY day`,
@@ -154,6 +157,7 @@ export async function computeBrief(env: Env, auth: Identity, preview = false, pr
     // "confidential" alongside their own — while the counts beside them came
     // from correctly scoped queries and said something different.
     env.DB.prepare(
+      // validity: any: ダッシュボードの捕捉件数・活動・話題は過去の記憶も集計する。
       `SELECT value AS tag, COUNT(*) AS n FROM entries, json_each(entries.tags)
        WHERE entries.created_at >= ?
          AND ${isTopicTagSql()}
@@ -480,9 +484,11 @@ export async function readAgentBrief(
     return { loops: toSection(0, totalsRow?.loops_total ?? 0), owed_to_you: toSection(1, totalsRow?.owed_to_you_total ?? 0) };
   };
 
+  // validity: current: 既存のPENDING_INSIGHT_SQL・STALE_REVIEW_SQL・compressionEligibilitySqlで現在の適格性を検査する。
   const stalePart = async (): Promise<BriefSection> => run(`SELECT id, content, COUNT(*) OVER() AS total FROM entries
       WHERE ${STALE_INDEXED} AND ${STALE_REVIEW_SQL} AND ${scope.clause} AND ${mine.clause} AND ${NOT_HELD_SQL}
       ORDER BY COALESCE(updated_at, created_at) ASC, id ASC LIMIT 2`, 2);
+  // validity: current: 既存のPENDING_INSIGHT_SQL・STALE_REVIEW_SQL・compressionEligibilitySqlで現在の適格性を検査する。
   const insightsPart = async (): Promise<BriefSection> => run(`SELECT id, content, COUNT(*) OVER() AS total FROM entries
       WHERE ${INSIGHT_INDEXED} AND ${PENDING_INSIGHT_SQL} AND ${scope.clause} AND ${NOT_HELD_SQL}
       ORDER BY created_at DESC, id DESC LIMIT 1`, 1, [], false);

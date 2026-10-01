@@ -1,3 +1,4 @@
+import { pricingInsight, PRICING_INSIGHTS } from "../helpers/insight-fixture";
 /**
  * GET /insights/dry-run — a preview of the weekly pass that writes nothing.
  *
@@ -17,11 +18,14 @@ import { handleAdminRoutes } from "../../src/routes/admin";
 import { CONFIG_KEY } from "../../src/config";
 
 const DAY = 86400000;
-const NOW = 400 * DAY;
+// Keep the deterministic clock aligned with SQLite's real wall clock. The
+// write-admission fence evaluates expiry through strftime(), so an epoch-near
+// fake time would make a freshly issued JS admission look expired to SQLite.
+const NOW = Date.now();
 const ctx = { waitUntil: () => {} } as unknown as ExecutionContext;
 
-const GOOD_TEXT = "You priced the first tier at nine dollars flat, then moved it to usage-based pricing instead.";
-const GOOD = `{"insight": true, "shape": "contradiction", "text": "${GOOD_TEXT}"}`;
+const GOOD_TEXT = PRICING_INSIGHTS["0"];
+const GOOD = pricingInsight(GOOD_TEXT);
 
 function makeAI(payload: string) {
   return {
@@ -67,12 +71,10 @@ function makeTieredAI(declineTier: number) {
     },
   });
   const perTier: Record<number, string> = {
-    0: "The predictable morning subscription rate finally gave way to something that adjusts instead.",
-    1: "Nine separate invoices later, the whole scheme moved toward per-use pricing.",
-    2: "Those dollars used to arrive on a fixed schedule until the team decided to move away from it.",
-    3: "Every month brought the identical bill until usage-based math replaced it entirely.",
-    4: "The price never budged no matter how little you used it, instead of scaling with demand.",
-    5: "A predictable sum landed every cycle before pricing tied to real consumption took its place.",
+    0: PRICING_INSIGHTS["0"], 1: PRICING_INSIGHTS["1"], 2: PRICING_INSIGHTS["2"],
+    3: PRICING_INSIGHTS["2"],
+    4: "契約時の毎月の支払額を一定に保つ方式を廃止し、サービスを使った実績に合わせて対価を受け取る仕組みへ改めています。",
+    5: "小規模チーム向けに請求額の見通しを優先していましたが、実際の消費を売上につなげる従量課金へ変更しています。",
   };
   return {
     run: vi.fn().mockImplementation(async (_model: string, opts: any) => {
@@ -80,7 +82,7 @@ function makeTieredAI(declineTier: number) {
       const tier = Number(prompt.match(/tier (\d+)/)?.[1] ?? -1);
       if (tier === declineTier) return sse(`{"insight": false}`);
       return sse(
-        `{"insight": true, "shape": "contradiction", "text": "${perTier[tier] ?? perTier[0]}"}`,
+        pricingInsight(perTier[tier] ?? perTier[0]),
       );
     }),
   } as unknown as Ai;
@@ -110,7 +112,7 @@ describe("GET /insights/dry-run", () => {
   beforeEach(() => {
     vi.spyOn(Date, "now").mockReturnValue(NOW);
     sqlite = makeSqliteD1();
-    sqlite.db.prepare(`ALTER TABLE entries ADD COLUMN valid_until INTEGER`).run();
+    expect(sqlite.columns()).toContain("valid_until");
     sqlite.seed({
       id: "a-1", createdAt: NOW - 120 * DAY, tags: ["pricing"],
       content: "Decision: price the first tier flat at nine dollars a month for predictability.",
@@ -248,7 +250,7 @@ describe("GET /insights/dry-run — mirrors what the weekly pass actually enforc
   beforeEach(() => {
     vi.spyOn(Date, "now").mockReturnValue(NOW);
     sqlite = makeSqliteD1();
-    sqlite.db.prepare(`ALTER TABLE entries ADD COLUMN valid_until INTEGER`).run();
+    expect(sqlite.columns()).toContain("valid_until");
   });
 
   afterEach(() => sqlite.close());
@@ -391,7 +393,7 @@ describe("GET /insights/dry-run — ordering and the write cap across many candi
   beforeEach(() => {
     vi.spyOn(Date, "now").mockReturnValue(NOW);
     sqlite = makeSqliteD1();
-    sqlite.db.prepare(`ALTER TABLE entries ADD COLUMN valid_until INTEGER`).run();
+    expect(sqlite.columns()).toContain("valid_until");
     // Seeded out of score order on purpose: inserting tier 0 first would let
     // an ORDER BY bug hide behind insertion order happening to already match.
     const tiersInInsertionOrder: [tier: number, score: number][] = [

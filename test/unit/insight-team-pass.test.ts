@@ -1,3 +1,4 @@
+import { pricingInsight, PRICING_INSIGHTS } from "../helpers/insight-fixture";
 /**
  * The company-scoped weekly pass (spec 4.5).
  *
@@ -40,17 +41,7 @@ const WS_CO2 = "ws-co2";
  * every one of them names something from A alone ("nine"/"dollars"/
  * "predictable") and something from B alone ("usage-based"/"pricing").
  */
-const PER_TIER: Record<string, string> = {
-  "0": "You priced this tier at nine dollars flat, then moved it entirely to usage-based billing.",
-  "1": "This tier's predictable monthly amount got swapped for pricing tied to actual usage instead.",
-  "2": "That flat monthly price got left behind once usage-based charges took over instead.",
-  "3": "The predictable dollars per seat gave way to usage-based pricing on the shared plan.",
-  // Tiers 4 and 5 reason to the SAME sentence on purpose, so a run can hold two
-  // candidates in two different companies whose answers collide. Nothing else
-  // in this file seeds them together with tiers 0-3.
-  "4": "Nine dollars a month was predictable, then you chose to move it to usage-based charging instead.",
-  "5": "Nine dollars a month was predictable, then you chose to move it to usage-based charging instead.",
-};
+const PER_TIER: Record<string, string> = PRICING_INSIGHTS;
 
 function makeAI() {
   const sse = (text: string) => new ReadableStream({
@@ -62,10 +53,10 @@ function makeAI() {
   });
   return {
     run: vi.fn().mockImplementation(async (model: string, opts: any) => {
-      if (model === "@cf/baai/bge-small-en-v1.5") return { data: [new Array(384).fill(0.1)] };
+      if (model === "@cf/google/embeddinggemma-300m") return { data: [new Array(768).fill(0.1)] };
       const prompt = String(opts?.messages?.[0]?.content ?? "");
       const tier = prompt.match(/tier (\d+)/)?.[1] ?? "0";
-      const payload = `{"insight": true, "shape": "contradiction", "text": "${PER_TIER[tier] ?? PER_TIER["0"]}"}`;
+      const payload = pricingInsight(PER_TIER[tier] ?? PER_TIER["0"]);
       // "Memory A:" is the one string only the reasoning prompt contains; the
       // classifier inside captureEntry gets the plain importance digit.
       return sse(prompt.includes("Memory A:") ? payload : "3");
@@ -125,6 +116,7 @@ function withBoundParamLimit(inner: SqliteD1["db"], executed: { sql: string; par
   };
   const wrap = (sql: string, stmt: any, params: unknown[]): any => ({
     bind: (...args: unknown[]) => wrap(sql, stmt.bind(...args), args),
+    isRead: () => stmt.isRead(),
     all: async () => { check(sql, params); return stmt.all(); },
     first: async () => { check(sql, params); return stmt.first(); },
     run: async () => { check(sql, params); return stmt.run(); },
@@ -136,9 +128,9 @@ function withBoundParamLimit(inner: SqliteD1["db"], executed: { sql: string; par
   } as unknown as SqliteD1["db"];
 }
 
-const envOf = (sqlite: SqliteD1): Env => makeTestEnv(undefined, {
+const envOf = (sqlite: SqliteD1): Env => sqlite.admitEnv(makeTestEnv(undefined, {
   DB: sqlite.db as any, AI: makeAI(), OAUTH_KV: makeMemoryKV(), VECTORIZE: makeVectorizeMock(),
-}) as Env;
+})) as Env;
 
 const insights = async (sqlite: SqliteD1) =>
   ((await sqlite.db.prepare(
@@ -165,7 +157,7 @@ describe("runWeeklyInsights — the workspace slice", () => {
     // here gets a brand-new :memory: database.
     resetDatabaseInit();
     sqlite = makeSqliteD1();
-    sqlite.db.prepare(`ALTER TABLE entries ADD COLUMN valid_until INTEGER`).run();
+    expect(sqlite.columns()).toContain("valid_until");
   });
 
   afterEach(() => sqlite.close());
@@ -400,7 +392,7 @@ describe("runWeeklyInsights — the workspace slice", () => {
     const runB = async (withOtherCompany: boolean) => {
       resetDatabaseInit();
       const db = makeSqliteD1();
-      db.db.prepare(`ALTER TABLE entries ADD COLUMN valid_until INTEGER`).run();
+      expect(db.columns()).toContain("valid_until");
       const seedWritten = (id: string, ws: string, text: string) => {
         db.seed({
           id, createdAt: NOW - DAY, tags: ["auto-insight"],
@@ -541,10 +533,10 @@ describe("runWeeklyInsights — the workspace slice", () => {
     const slice = Array.from({ length: 60 }, (_, i) => `ws-co-${i}`);
     seedPair(sqlite, 0, slice[59], slice[59], 10);
     const executed: { sql: string; params: number }[] = [];
-    const env = makeTestEnv(undefined, {
+    const env = sqlite.admitEnv(makeTestEnv(undefined, {
       DB: withBoundParamLimit(sqlite.db, executed) as any,
       AI: makeAI(), OAUTH_KV: makeMemoryKV(), VECTORIZE: makeVectorizeMock(),
-    }) as Env;
+    })) as Env;
 
     await runWeeklyInsights(env, ctx, { onlyWorkspaceIds: slice });
 
@@ -563,10 +555,10 @@ describe("runWeeklyInsights — the workspace slice", () => {
     // parameters) must still be ONE statement; 50 is where a second is owed.
     const draws = async (n: number) => {
       const executed: { sql: string; params: number }[] = [];
-      const env = makeTestEnv(undefined, {
+      const env = sqlite.admitEnv(makeTestEnv(undefined, {
         DB: withBoundParamLimit(sqlite.db, executed) as any,
         AI: makeAI(), OAUTH_KV: makeMemoryKV(), VECTORIZE: makeVectorizeMock(),
-      }) as Env;
+      })) as Env;
       await runWeeklyInsights(env, ctx, {
         onlyWorkspaceIds: Array.from({ length: n }, (_, i) => `ws-co-${i}`),
       });
@@ -592,10 +584,10 @@ describe("runWeeklyInsights — the workspace slice", () => {
     const slice = Array.from({ length: 60 }, (_, i) => `ws-co-${i}`);
     seedPair(sqlite, 0, slice[0], slice[0], 10);
     const executed: { sql: string; params: number }[] = [];
-    const env = makeTestEnv(undefined, {
+    const env = sqlite.admitEnv(makeTestEnv(undefined, {
       DB: withBoundParamLimit(sqlite.db, executed) as any,
       AI: makeAI(), OAUTH_KV: makeMemoryKV(), VECTORIZE: makeVectorizeMock(),
-    }) as Env;
+    })) as Env;
 
     await runWeeklyInsights(env, ctx, { onlyWorkspaceIds: slice });
 
@@ -609,10 +601,10 @@ describe("runWeeklyInsights — the workspace slice", () => {
     // Nothing to compare against nothing. The subrequest is not spent, which
     // is the same reasoning lookupAuditNames applies to an empty id list.
     const executed: { sql: string; params: number }[] = [];
-    const env = makeTestEnv(undefined, {
+    const env = sqlite.admitEnv(makeTestEnv(undefined, {
       DB: withBoundParamLimit(sqlite.db, executed) as any,
       AI: makeAI(), OAUTH_KV: makeMemoryKV(), VECTORIZE: makeVectorizeMock(),
-    }) as Env;
+    })) as Env;
 
     await runWeeklyInsights(env, ctx, { onlyWorkspaceIds: ["ws-nope"] });
 
@@ -631,10 +623,10 @@ describe("runWeeklyInsights — the workspace slice", () => {
     seedPair(sqlite, 2, slice[50], slice[50], 10);
     seedPair(sqlite, 3, slice[51], slice[51], 9);
     const executed: { sql: string; params: number }[] = [];
-    const env = makeTestEnv(undefined, {
+    const env = sqlite.admitEnv(makeTestEnv(undefined, {
       DB: withBoundParamLimit(sqlite.db, executed) as any,
       AI: makeAI(), OAUTH_KV: makeMemoryKV(), VECTORIZE: makeVectorizeMock(),
-    }) as Env;
+    })) as Env;
 
     await runWeeklyInsights(env, ctx, { onlyWorkspaceIds: slice });
 
@@ -662,10 +654,10 @@ describe("runWeeklyInsights — the workspace slice", () => {
     const errors: unknown[][] = [];
     const spy = vi.spyOn(console, "error").mockImplementation((...args: unknown[]) => { errors.push(args); });
     const executed: { sql: string; params: number }[] = [];
-    const env = makeTestEnv(undefined, {
+    const env = sqlite.admitEnv(makeTestEnv(undefined, {
       DB: withBoundParamLimit(sqlite.db, executed) as any,
       AI: makeAI(), OAUTH_KV: makeMemoryKV(), VECTORIZE: makeVectorizeMock(),
-    }) as Env;
+    })) as Env;
 
     await runWeeklyInsights(env, ctx, { onlyWorkspaceIds: slice });
 
@@ -698,7 +690,7 @@ describe("runWeeklyInsights — the workspace slice", () => {
 describe("companyWorkspaceIds()", () => {
   let sqlite: SqliteD1;
 
-  beforeEach(() => { resetDatabaseInit(); sqlite = makeSqliteD1(); sqlite.db.prepare(`ALTER TABLE entries ADD COLUMN valid_until INTEGER`).run(); });
+  beforeEach(() => { resetDatabaseInit(); sqlite = makeSqliteD1(); expect(sqlite.columns()).toContain("valid_until"); });
   afterEach(() => sqlite.close());
 
   const seedWorkspace = (id: string, kind: string) =>

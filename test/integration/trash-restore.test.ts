@@ -30,7 +30,7 @@ function statefulVectorize() {
       deleteByIds: vi.fn(async (ids: string[]) => { for (const id of ids) store.delete(id); return { mutationId: "m" }; }),
       getByIds: vi.fn(async (ids: string[]) => ids.filter((id) => store.has(id)).map((id) => ({ id, metadata: store.get(id) }))),
       describe: vi.fn().mockResolvedValue({}),
-    } as unknown as VectorizeIndex,
+    } as unknown as Vectorize,
   };
 }
 const post = (path: string, body: unknown) =>
@@ -136,8 +136,9 @@ describe("restore", () => {
     await restore("a");
     expect((await t.all(`SELECT id FROM edges`)).map((r) => r.id)).toEqual(["e1"]);
 
-    t.seed("c"); t.edge("e2", "c", "gone");
+    t.seed("c"); t.seed("gone"); t.edge("e2", "c", "gone");
     await forget("c");
+    await forget("gone");
     const res = await restore("c");
     expect(res.status).toBe("restored");
     expect((res as any).edgesRestored).toBe(0);
@@ -230,6 +231,7 @@ describe("restore", () => {
     t.seed("a");
     await forget("a");
     const trashed = await getTrashedEntry(t.env, undefined, "a");
+    await t.sqlite.db.prepare(`UPDATE entries_trash SET write_marker = ? WHERE id = 'a'`).bind(t.sqlite.fixtureMarker("delete")).run();
     await t.sqlite.db.prepare(`DELETE FROM entries_trash WHERE id = 'a'`).run(); // a racing purge won
     const res = await restoreEntry(t.env, trashed!, { actorId: "u", channel: "rest" }, await resolveConfig(t.env));
     expect(res.status).toBe("not_found");
@@ -352,7 +354,7 @@ describe("Class 1 audit (R3-1): restoreEntry does not need an authorizedWorkspac
     const fs = await import("node:fs");
     const path = await import("node:path");
     const src = fs.readFileSync(path.join(process.cwd(), "src/memory/trash.ts"), "utf8");
-    expect(src).not.toMatch(/UPDATE\s+entries_trash\b/i);
+    expect(src).not.toMatch(/UPDATE\s+entries_trash\s+SET(?:(?!WHERE)[\s\S])*\bworkspace_id\s*=/i);
   });
 
   it("restoring reads workspace_id from the trash row's own row_json snapshot, not its (never-updated) column: forcing the column after authorization does not redirect the restore", async () => {

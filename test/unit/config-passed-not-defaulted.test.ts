@@ -92,7 +92,7 @@ describe("config is passed, never left to the default", () => {
     // A rename that broke the detector would otherwise make this whole file
     // pass by testing nothing.
     expect(functions.size).toBeGreaterThanOrEqual(5);
-    for (const expected of ["storeEntry", "embed", "classifyEntry"]) {
+    for (const expected of ["storeEntry", "embedDocument", "embedQuery", "classifyEntry"]) {
       expect([...functions.keys()], `${expected} should be detected`).toContain(expected);
     }
   });

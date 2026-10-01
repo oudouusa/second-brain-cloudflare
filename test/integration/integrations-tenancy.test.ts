@@ -15,13 +15,21 @@
  * and these are the cases that should change with them.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { disconnectAllPages } from "../helpers/disconnect-pages";
 import worker from "../../src/index";
 import { makeSqliteD1, type SqliteD1 } from "../helpers/sqlite-d1";
 import { makeTestEnv, makeMemoryKV } from "../helpers/make-env";
 import { resetDatabaseInit, initializeDatabase } from "../../src/db/init";
 import { ensureTenantBootstrap } from "../../src/lib/tenancy";
 import { createMember } from "../../src/lib/team-admin";
-import { loadIntegration } from "../../src/integrations";
+import {
+  acquireIntegrationOperation,
+  loadIntegration,
+  releaseIntegrationOperation,
+  saveIntegration,
+  withIntegrationOperation,
+  type IntegrationRecord,
+} from "../../src/integrations";
 import { mirrorWriteContext } from "../../src/integrations/mirror";
 import type { Env } from "../../src/env";
 
@@ -65,6 +73,20 @@ function call(method: string, path: string, token: string, body?: unknown): Prom
     env,
     ctx,
   );
+}
+
+async function replaceIntegration(record: IntegrationRecord): Promise<void> {
+  const directEnv = sqlite.admitEnv(env);
+  const operation = await acquireIntegrationOperation(directEnv, record.provider, "connect");
+  try {
+    await saveIntegration(withIntegrationOperation(directEnv, operation), {
+      ...record,
+      stateGeneration: operation.stateGeneration,
+      providerGeneration: operation.providerGeneration,
+    });
+  } finally {
+    await releaseIntegrationOperation(directEnv, operation);
+  }
 }
 
 beforeEach(async () => {
@@ -140,9 +162,9 @@ describe("one connection per provider, administered by an admin", () => {
       a: { entryId: "admin-page", version: "v1" } as any,
       d: { entryId: "dana-page", version: "v1" } as any,
     };
-    await env.OAUTH_KV.put("integrations:notion", JSON.stringify(record));
+    await replaceIntegration(record);
 
-    const body = await (await call("POST", "/integrations/notion/disconnect", ADMIN, { purge: true })).json() as any;
+    const body = await disconnectAllPages(body => call("POST", "/integrations/notion/disconnect", ADMIN, body));
     expect(body.purged).toBe(1);
     expect(body.kept).toBe(1);
 

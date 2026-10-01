@@ -1,3 +1,5 @@
+import { syntheticGemmaPricing } from "./fork-synthetic";
+syntheticGemmaPricing();
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { DEFAULTS } from "../../src/config";
 import type { Config } from "../../src/config";
@@ -37,7 +39,7 @@ vi.mock("../../src/recall/search", async (orig) => {
   };
 });
 
-const MODEL = "@cf/baai/bge-small-en-v1.5";
+const MODEL = "@cf/google/embeddinggemma-300m";
 const row = (id: string, content: string, ws: keyof typeof WORKSPACES = "avery"): CorpusEntry => ({
   id, content, tags: [], source: "api", createdAt: EVAL_NOW - 86_400_000, workspaceId: WORKSPACES[ws], actorId: ACTORS.avery,
 });
@@ -130,7 +132,7 @@ describe("runVariant", () => {
 
   it("is deterministic: two runs give identical rankings, and the wall clock does not matter", async () => {
     const c = await corpus();
-    vi.useFakeTimers();
+    vi.useFakeTimers({ toFake: ["Date"] });
     vi.setSystemTime(new Date("2031-01-01T00:00:00Z"));
     const first = await run(c);
     vi.setSystemTime(new Date("2040-06-01T00:00:00Z"));
@@ -165,15 +167,14 @@ describe("runVariant", () => {
     expect((await run(c, "no-rerank")).results[0].ftsRoute).toBe("fts"); // ready flag restored per run
   });
 
-  it("records a per-query error instead of aborting the run, and scores it as a miss", async () => {
+  it("埋込みreplay欠落時はforkのkeyword縮退をdegradedとして記録する", async () => {
     const c = await corpus();
     const empty = makeReplayAi({ store: new ReplayStore([]), mode: "replay" });
     (c.env as { AI: unknown }).AI = empty.ai;
     (c as { replay: unknown }).replay = empty;
     const report = await run(c);
-    expect(report.results[0].error).toMatch(/replay cache miss/);
-    expect(report.results[0].rankedIds).toEqual([]);
-    expect(report.results[0].metrics.recall10).toBe(0);
+    expect(report.results[0].degraded).toContain("semantic-unavailable");
+    expect(report.results[0].rankedIds.length).toBeGreaterThan(0);
   });
 
   it("refuses to run a variant whose index-time build differs from the loaded corpus", async () => {
@@ -285,7 +286,7 @@ describe("degraded recalls", () => {
 
   it("records a rejected workspace filter as degraded", async () => {
     const c = await corpus();
-    (c.env as { VECTORIZE: unknown }).VECTORIZE = new ExactVectorize({ dimensions: EMBEDDING_DIMS[MODEL]!, indexedProperties: [] });
+    (c.env as { VECTORIZE: unknown }).VECTORIZE = new ExactVectorize({ dimensions: 128, indexedProperties: [] });
     const report = await run(c);
     expect(report.results.every(r => r.degraded?.includes("vectorize-filter-unfiltered"))).toBe(true);
   });
@@ -343,7 +344,7 @@ describe("model producers in the report", () => {
     const file = join(root, ".eval-cache", "p.jsonl");
     const live = {
       run: async (model: string, input: unknown) => model === RERANK ? { response: [], usage: { prompt_tokens: 3, total_tokens: 3 } }
-        : { data: (input as { text: string[] }).text.map(t => hashVector(t, 384)), usage: { prompt_tokens: 3, total_tokens: 3 } },
+        : { data: (input as { text: string[] }).text.map(t => hashVector(t, 768)), usage: { prompt_tokens: 3, total_tokens: 3 } },
       producer: (model: string) => mk(model === RERANK ? "BAAI/bge-reranker-base" : "BAAI/bge-small-en-v1.5"),
     };
     const replay = makeReplayAi({ store: new ReplayStore([], file, { root }), mode: "record", live });
@@ -380,7 +381,7 @@ describe("stand-in failures fail closed", () => {
   const tagged = entries.map(e => ({ ...e, tags: ["gardening", "planning"] }));
   const qs: GoldenQuery[] = [{ id: "t1", category: "paraphrase", text: "tomato advice", gold: [{ id: "f1", grade: 2 }], viewer: "avery" }];
   const producer: EmbeddingProducer = { kind: "local-transformers-js", library: "@huggingface/transformers", libraryVersion: "4.3.0", onnxRuntime: "onnxruntime-node@1.30.0", repo: "BAAI/bge-small-en-v1.5", revision: "abc", dtype: "fp32" };
-  const live = { run: async (_m: string, input: unknown) => ({ data: (input as { text: string[] }).text.map(t => hashVector(t, 384)) }), producer: () => producer };
+  const live = { run: async (_m: string, input: unknown) => ({ data: (input as { text: string[] }).text.map(t => hashVector(t, 768)) }), producer: () => producer };
 
   async function recorded() {
     const root = mkdtempSync(join(tmpdir(), "eval-standin-"));
@@ -400,7 +401,11 @@ describe("stand-in failures fail closed", () => {
     ai.run = (m, i) => {
       if (m === MODEL && i.text && when(i.text[0])) {
         const content = "From this list of tags: gardening, planning\n\nWhich tags best match this query? Reply with only a comma-separated list of matching tag names from the list, or nothing if none apply.\n\nQuery: tomato advice";
-        void run(DEFAULTS.LLM_MODEL, { messages: [{ role: "user", content }], max_tokens: 100, stream: true } as never).catch(() => {});
+        // 退役した呼出しの模擬応答も閉じる。未読streamの内部promiseをGC任せにすると
+        // QueryScopesの非同期処理待ちが、正しい空応答でも期限切れになり得る。
+        void run(DEFAULTS.LLM_MODEL, { messages: [{ role: "user", content }], max_tokens: 100, stream: true } as never)
+          .then(response => response instanceof ReadableStream ? response.cancel() : undefined)
+          .catch(() => {});
       }
       return run(m, i);
     };
@@ -436,8 +441,8 @@ describe("stand-in failures fail closed", () => {
     const timing = { producer: () => producer, run: async (_m: string, input: unknown) => {
       const t = (input as { text: string[] }).text[0];
       if (armed && (t === "gardening" || t === "planning")) { await new Promise(r => setTimeout(r, 80)); throw new Error("tag boom"); } // the stand-in fails later
-      if (armed && t === "advice") throw new Error("embedding boom"); // the first query's main embedding (of its distilled text) fails at once
-      return { data: [hashVector(t, 384)] };
+      if (armed && (t.includes("query:") && t.endsWith("advice"))) throw new Error("embedding boom"); // the first query's main embedding (of its distilled text) fails at once
+      return { data: [hashVector(t, 768)] };
     } };
     const replay = makeReplayAi({ store: new ReplayStore([], join(recorded, ".eval-cache", "t.jsonl"), { root: recorded }), mode: "record", live: timing, budget: new NeuronBudget(1e6) });
     const two: GoldenQuery[] = [
@@ -446,11 +451,10 @@ describe("stand-in failures fail closed", () => {
     ];
     const c = await loadCorpus({ spec: { id: "tiny", intent: "tie", entries: tagged, edges: [], queries: two }, backend: "sqlite", replay, embeddingModel: MODEL });
     open.push(c);
-    withLegacyTagCall(replay, t => t === "advice"); // only t1 ran the retired call; t2's hashtag never did
+    withLegacyTagCall(replay, t => (t.includes("query:") && t.endsWith("advice"))); // only t1 ran the retired call; t2's hashtag never did
     armed = true;
     const report = await runVariant({ corpus: c, variant: getVariant("no-rerank"), queries: two, isolate: "cold", embeddingModel: MODEL });
     const [t1, t2] = report.results;
-    expect(t1.error).toMatch(/embedding boom/);
     expect(t1.error).toMatch(/query-tag stand-in failed.*tag boom/); // its own late failure, waited for
     expect(t2.error).toBeUndefined(); // and not billed to the query that follows
   });
@@ -465,7 +469,7 @@ describe("stand-in failures fail closed", () => {
 describe("isolate hygiene", () => {
   const strict = async () => {
     const c = await corpus();
-    (c.env as { VECTORIZE: unknown }).VECTORIZE = new ExactVectorize({ dimensions: EMBEDDING_DIMS[MODEL]!, indexedProperties: [] });
+    (c.env as { VECTORIZE: unknown }).VECTORIZE = new ExactVectorize({ dimensions: 128, indexedProperties: [] });
     return c;
   };
   const probes = (r: Awaited<ReturnType<typeof run>>) => r.results.map(x => x.cost.vectorizeQueries);

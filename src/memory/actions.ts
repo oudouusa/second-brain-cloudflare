@@ -1,3 +1,4 @@
+import { assertMemoryWritesAllowed, memoryWriteMarker } from "../migration/write-lock";
 import type { Env } from "../env";
 import type { Identity } from "../lib/identity";
 import { getReadableEntry, assertCanEditContent, type EntryAccessRow } from "../lib/entry-access";
@@ -36,6 +37,7 @@ export async function resolveEntryAction(
   env: Env, ctx: AuditContext, identity: Identity, id: string,
   action: ResolveAction, untilInput: string | undefined, change: ChangeContext,
 ): Promise<ActionResult> {
+  await assertMemoryWritesAllowed(env);
   const cfg = await resolveConfig(env);
   let until: number | undefined;
   if (action === "snooze") {
@@ -71,7 +73,7 @@ export async function resolveEntryAction(
           guard: p2 => buildCasGuard(p2, casColumns),
         }),
         // versioning: snapshot
-        env.DB.prepare(`UPDATE entries AS e SET tags = ${tagsIdx}, updated_at = ${nowIdx}, staleness_checked_at = ${nowIdx} WHERE e.id = ${idIdx} AND ${buildCasGuard(p, casColumns)}`)
+        env.DB.prepare(`UPDATE entries AS e SET write_marker = ${p.add(memoryWriteMarker(env))}, tags = ${tagsIdx}, updated_at = ${nowIdx}, staleness_checked_at = ${nowIdx} WHERE e.id = ${idIdx} AND ${buildCasGuard(p, casColumns)}`)
           .bind(...p.values()),
         pruneStatement(env, id, cfg.VERSION_KEEP),
       ]);
@@ -129,7 +131,7 @@ export async function resolveEntryAction(
       const p = new Params();
       const nextTagsIdx = p.add(JSON.stringify(nextTags));
       // versioning: snapshot
-      statement = env.DB.prepare(`UPDATE entries AS e SET tags = ${nextTagsIdx} WHERE e.id = ${p.add(id)} AND ${buildCasGuard(p, casColumns)}`).bind(...p.values());
+      statement = env.DB.prepare(`UPDATE entries AS e SET write_marker = ${p.add(memoryWriteMarker(env))}, tags = ${nextTagsIdx} WHERE e.id = ${p.add(id)} AND ${buildCasGuard(p, casColumns)}`).bind(...p.values());
       payload = { loop_action: loopAction, prior: { tags } };
     } else if (action === "stop_standing") {
       // Design 2.2: removes only standing:active, versioned and CAS-guarded like done, so undo
@@ -143,7 +145,7 @@ export async function resolveEntryAction(
       const p = new Params();
       const nextTagsIdx = p.add(JSON.stringify(nextTags));
       // versioning: snapshot
-      statement = env.DB.prepare(`UPDATE entries AS e SET tags = ${nextTagsIdx} WHERE e.id = ${p.add(id)} AND ${buildCasGuard(p, casColumns)}`).bind(...p.values());
+      statement = env.DB.prepare(`UPDATE entries AS e SET write_marker = ${p.add(memoryWriteMarker(env))}, tags = ${nextTagsIdx} WHERE e.id = ${p.add(id)} AND ${buildCasGuard(p, casColumns)}`).bind(...p.values());
       payload = { standing_action: "stop", prior: { tags } };
     } else if (action === "snooze") {
       const nextWhen: WhenChange = { when_at: until };
@@ -155,7 +157,7 @@ export async function resolveEntryAction(
       const p = new Params();
       const untilIdx = p.add(until);
       // versioning: snapshot
-      statement = env.DB.prepare(`UPDATE entries AS e SET when_at = ${untilIdx} WHERE e.id = ${p.add(id)} AND ${buildCasGuard(p, casColumns)}`).bind(...p.values());
+      statement = env.DB.prepare(`UPDATE entries AS e SET write_marker = ${p.add(memoryWriteMarker(env))}, when_at = ${untilIdx} WHERE e.id = ${p.add(id)} AND ${buildCasGuard(p, casColumns)}`).bind(...p.values());
       payload = { due_action: "snooze", until, prior: priorWhen };
     } else {
       const nextWhen: WhenChange = { when_at: null, when_kind: null, when_source: "cleared", when_label: null };
@@ -167,7 +169,7 @@ export async function resolveEntryAction(
       const p = new Params();
       const idIdx = p.add(id);
       // versioning: snapshot
-      statement = env.DB.prepare(`UPDATE entries AS e SET when_at = NULL, when_kind = NULL, when_label = NULL, when_source = 'cleared' WHERE e.id = ${idIdx} AND ${buildCasGuard(p, casColumns)}`).bind(...p.values());
+      statement = env.DB.prepare(`UPDATE entries AS e SET write_marker = ${p.add(memoryWriteMarker(env))}, when_at = NULL, when_kind = NULL, when_label = NULL, when_source = 'cleared' WHERE e.id = ${idIdx} AND ${buildCasGuard(p, casColumns)}`).bind(...p.values());
       payload = { due_action: "clear", prior: priorWhen };
     }
     const results = await env.DB.batch([snapshot, statement, pruneStatement(env, id, cfg.VERSION_KEEP)]);
@@ -215,6 +217,7 @@ export async function resolveDecisionOutcome(
   env: Env, ctx: AuditContext, identity: Identity, id: string,
   result: DecisionOutcomeResult, note: string | undefined, change: ChangeContext,
 ): Promise<OutcomeActionResult> {
+  await assertMemoryWritesAllowed(env);
   const cfg = await resolveConfig(env);
   for (let attempt = 0; attempt < 3; attempt++) {
     const row = await getReadableEntry(env, identity, id, "id, workspace_id, actor_id, tags, content, when_at, when_kind, when_label, when_source") as (EntryAccessRow & Record<string, any> | null);
@@ -254,7 +257,7 @@ export async function resolveDecisionOutcome(
     const idIdx = p.add(id);
     // versioning: snapshot
     const statement = env.DB.prepare(
-      `UPDATE entries AS e SET ${contentIdx ? `content = ${contentIdx}, ` : ""}tags = ${tagsIdx}, when_at = ${whenAtIdx}, when_kind = ${whenKindIdx}, when_source = ${whenSourceIdx} WHERE e.id = ${idIdx} AND ${buildCasGuard(p, casColumns)}`,
+      `UPDATE entries AS e SET write_marker = ${p.add(memoryWriteMarker(env))}, ${contentIdx ? `content = ${contentIdx}, ` : ""}tags = ${tagsIdx}, when_at = ${whenAtIdx}, when_kind = ${whenKindIdx}, when_source = ${whenSourceIdx} WHERE e.id = ${idIdx} AND ${buildCasGuard(p, casColumns)}`,
     ).bind(...p.values());
     const results = await env.DB.batch([snapshot, statement, pruneStatement(env, id, cfg.VERSION_KEEP)]);
     if (changesOf(results[1]) === 0) continue;
@@ -274,6 +277,7 @@ export async function applyInsightResolution(
   env: Env, ctx: AuditContext, change: ChangeContext,
   found: Record<string, any>[], requestedCount: number, action: InsightAction,
 ): Promise<InsightResolution> {
+  await assertMemoryWritesAllowed(env);
   const cfg = await resolveConfig(env);
   const now = Date.now();
   const statements: D1PreparedStatement[] = [];
@@ -295,7 +299,7 @@ export async function applyInsightResolution(
       const p = new Params();
       const tagsIdx = p.add(JSON.stringify(promoted));
       // versioning: snapshot
-      statements.push(env.DB.prepare(`UPDATE entries AS e SET tags = ${tagsIdx} WHERE e.id = ${p.add(row.id)} AND ${buildCasGuard(p, casColumns)}`).bind(...p.values()));
+      statements.push(env.DB.prepare(`UPDATE entries AS e SET write_marker = ${p.add(memoryWriteMarker(env))}, tags = ${tagsIdx} WHERE e.id = ${p.add(row.id)} AND ${buildCasGuard(p, casColumns)}`).bind(...p.values()));
     } else {
       // validity: retraction-hooked
       const deprecated = withStatus(tags, "deprecated");
@@ -307,7 +311,7 @@ export async function applyInsightResolution(
       const tagsIdx = p.add(JSON.stringify(deprecated));
       const vecIdx = p.add("[]");
       // versioning: snapshot
-      statements.push(env.DB.prepare(`UPDATE entries AS e SET tags = ${tagsIdx}, vector_ids = ${vecIdx} WHERE e.id = ${p.add(row.id)} AND ${buildCasGuard(p, casColumns)}`).bind(...p.values()));
+      statements.push(env.DB.prepare(`UPDATE entries AS e SET write_marker = ${p.add(memoryWriteMarker(env))}, tags = ${tagsIdx}, vector_ids = ${vecIdx} WHERE e.id = ${p.add(row.id)} AND ${buildCasGuard(p, casColumns)}`).bind(...p.values()));
     }
     rows.push({ id: row.id as string, tags, vectorIds: JSON.parse(row.vector_ids ?? "[]"), updateAt: statements.length - 1 });
   }

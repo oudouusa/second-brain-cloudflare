@@ -135,7 +135,7 @@ describe("POST /team/members/remove with a failing Vectorize index", () => {
     expect(deletedByFirstCall).toHaveLength(VECTORIZE_DELETE_MAX_IDS_PER_CALL);
 
     // The nightly drain finishes the one id the route's own call could not reach.
-    await drainPendingVectorDeletes(env, overCap);
+    await drainPendingVectorDeletes(sqlite.admitEnv(env), overCap);
     const deletedTotal = (env.VECTORIZE.deleteByIds as any).mock.calls.flat(2) as string[];
     expect(new Set(deletedTotal)).toEqual(new Set(ids));
   });

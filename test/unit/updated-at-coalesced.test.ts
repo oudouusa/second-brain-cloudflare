@@ -103,9 +103,8 @@ function rawSqlReads(sql: string, relPath: string): Finding[] {
   // can never be NULL. A fragment naming NO table is NOT exempt: `ORDER BY updated_at
   // DESC` assigned to a constant and interpolated into a query elsewhere is the single
   // most likely way this bug gets reintroduced, and it names no table at all.
-  // projects.updated_at is its own nullable column (registry rows, not memories), so
-  // statements on `projects` alone are exempt the same way.
   if ((/\bedges\b/.test(sql) || /\bprojects\b/.test(sql)) && !/\bentries\b/.test(sql)) return [];
+  if (/^CREATE\s+TABLE\s+IF\s+NOT\s+EXISTS\s+entries\b/i.test(sql)) return [];
 
   const declarations = spans(sql, /ADD\s+COLUMN\s+updated_at/gi);
   // COALESCE or the equivalent IFNULL, with or without a table qualifier — a JOIN forces
@@ -116,6 +115,9 @@ function rawSqlReads(sql: string, relPath: string): Finding[] {
   );
   // The parenthesised column list of an INSERT — names the target, never reads a value.
   const insertColumns = spans(sql, /INSERT(?:\s+OR\s+\w+)?\s+INTO\s+entries\s*\([^)]*\)/gi);
+  // CREATE TRIGGER ... BEFORE UPDATE OF lists event columns. It neither reads nor writes
+  // their values; it declares which UPDATE statements should fire the trigger.
+  const triggerUpdateColumns = spans(sql, /BEFORE\s+UPDATE\s+OF[\s\S]*?\s+ON\s+entries/gi);
   // The SET clause of an UPDATE, up to WHERE. Assignment targets live here; the WHERE
   // that follows does not, which is what makes `SET updated_at = ? WHERE updated_at < ?`
   // resolve to one write and one raw read rather than being exempted wholesale.
@@ -124,7 +126,8 @@ function rawSqlReads(sql: string, relPath: string): Finding[] {
   const findings: Finding[] = [];
   for (const m of sql.matchAll(/\bupdated_at\b/g)) {
     const i = m.index!;
-    if (inAny(i, declarations) || inAny(i, coalesced) || inAny(i, insertColumns)) continue;
+    if (inAny(i, declarations) || inAny(i, coalesced) || inAny(i, insertColumns)
+      || inAny(i, triggerUpdateColumns)) continue;
     // In a SET clause and followed by `=` — an assignment target.
     if (inAny(i, setClauses) && /^\s*=/.test(sql.slice(i + "updated_at".length))) continue;
     if (relPath.replace(/\\/g, "/") === HYDRATION_EXEMPTION.file && sql.includes(HYDRATION_EXEMPTION.marker)) continue;
@@ -195,13 +198,17 @@ describe("entries.updated_at is never read without a created_at fallback", () =>
     expect(offenders).toEqual([]);
   });
 
-  it("initializeDatabase never reads or writes entries.updated_at", () => {
-    // The column is migrated by ALTER alone — no backfill, no probe. Anything else here
-    // runs on every cold isolate against an unindexed column.
+  it("initializeDatabase never reads or writes entries.updated_at values", () => {
+    // The column is migrated by ALTER alone — no backfill, no data probe. Trigger DDL may
+    // name it only in BEFORE UPDATE OF, which declares an event and touches no row value.
     const init = readFileSync(resolve(ROOT, "src/db/init.ts"), "utf8");
     for (const sql of sqlLiterals(init)) {
       if (!/\bentries\b/.test(sql)) continue;
-      expect(sql).toBe("ALTER TABLE entries ADD COLUMN updated_at INTEGER");
+      expect(
+        sql === "ALTER TABLE entries ADD COLUMN updated_at INTEGER"
+        || /^CREATE TABLE IF NOT EXISTS entries\b/.test(sql)
+        || /CREATE TRIGGER[\s\S]*BEFORE UPDATE OF[\s\S]*updated_at[\s\S]*ON entries/.test(sql),
+      ).toBe(true);
     }
     expect(init).not.toMatch(/SET updated_at = created_at/);
   });
@@ -250,6 +257,7 @@ describe("entries.updated_at is never read without a created_at fallback", () =>
 
     it.each([
       ["the ALTER that creates the column", "ALTER TABLE entries ADD COLUMN updated_at INTEGER"],
+      ["a trigger UPDATE OF event declaration", "CREATE TRIGGER x BEFORE UPDATE OF content, updated_at ON entries BEGIN SELECT 1; END"],
       ["a COALESCEd read", "SELECT id FROM entries WHERE COALESCE(updated_at, created_at) < ?"],
       ["a plain write", "UPDATE entries SET content = ?, tags = ?, updated_at = ? WHERE id = ?"],
       ["a write whose column order differs", "UPDATE entries SET importance_score = ?, updated_at = ? WHERE id = ?"],

@@ -30,7 +30,7 @@ function world(over: Record<string, any> = {}, opts: { memories?: any[]; capsule
   const rows: Row[] = PROJECT_ROWS.map((r) => ({ ...r, aliases: [...r.aliases] }));
   const routes: Record<string, any> = {
     "GET /projects": () => ({ body: { projects: rows } }),
-    "GET /list": (c: any) => ({ body: c.query.get("tag")?.startsWith("capsule:") ? (opts.capsule ?? CAPSULE_ENTRIES) : (opts.memories ?? MEMORIES) }),
+    "POST /list": (c: any) => ({ body: c.body?.tag?.startsWith("capsule:") ? (opts.capsule ?? CAPSULE_ENTRIES) : (opts.memories ?? MEMORIES) }),
     "GET /tags": () => ({ body: opts.tags ?? ["web", "landing", "cycling", "work", "kind:episodic", "project:website"] }),
     "PATCH /projects/website": (c: any) => {
       const row = rows.find((r) => r.id === "website")!;
@@ -59,7 +59,7 @@ async function open(over: Record<string, any> = {}, o: { teamMode?: boolean; slu
 }
 
 const patches = (h: any) => h.calls.filter((c: any) => c.method === "PATCH");
-const lists = (h: any) => h.calls.filter((c: any) => c.method === "GET" && c.path === "/list");
+const lists = (h: any) => h.calls.filter((c: any) => c.method === "POST" && c.path === "/list");
 
 describe("opening a project", () => {
   it("swaps the list for the detail view, and back", async () => {
@@ -129,16 +129,16 @@ describe("opening a project", () => {
 describe("memories", () => {
   it("asks for the project's memories with project=, and no workspace on a solo brain", async () => {
     const h = await open();
-    const scan = lists(h).find((c: any) => c.query.get("project") === "website")!;
-    expect(scan.query.get("n")).toBe("50");
-    expect(scan.query.has("workspace")).toBe(false);
-    expect(scan.query.has("tag")).toBe(false);
+    const scan = lists(h).find((c: any) => c.body?.project === "website")!;
+    expect(scan.body?.n).toBe(50);
+    expect(scan.body?.workspace).toBeUndefined();
+    expect(scan.body?.tag).toBeUndefined();
   });
 
   it("scopes the request to the project's workspace on a team brain", async () => {
     const h = await open({}, { teamMode: true, slug: "website", layer: "personal" });
-    const scan = lists(h).find((c: any) => c.query.get("project") === "website")!;
-    expect(scan.query.get("workspace")).toBe("personal");
+    const scan = lists(h).find((c: any) => c.body?.project === "website")!;
+    expect(scan.body?.workspace).toBe("personal");
   });
 
   it("renders each memory through the shared card", async () => {
@@ -154,7 +154,7 @@ describe("memories", () => {
   });
 
   it("says so when the memories cannot be loaded", async () => {
-    const h = await open({ "GET /list": (c: any) => (c.query.get("project") ? { status: 500, body: {} } : { body: [] }) });
+    const h = await open({ "POST /list": (c: any) => (c.body?.project ? { status: 500, body: {} } : { body: [] }) });
     expect(h.els.get("project-memories").innerHTML).toContain("Could not load memories");
   });
 
@@ -389,38 +389,38 @@ describe("digest", () => {
   });
 
   it("asks the Worker for the project's digest and shows the result", async () => {
-    const h = await open({ "GET /digest": { body: { project: "website", synthesis: "The site moves to a new host.", entry_id: "d1", source_count: 25 } } });
+    const h = await open({ "POST /digest": { body: { project: "website", synthesis: "The site moves to a new host.", entry_id: "d1", source_count: 25 } } });
     await h.ctx.runProjectDigest();
     const call = h.calls.find((c) => c.path === "/digest")!;
-    expect(call.query.get("project")).toBe("website");
-    expect(call.query.has("tag")).toBe(false);
+    expect(call.body?.project).toBe("website");
+    expect(call.body?.tag).toBeUndefined();
     const out = h.els.get("project-digest-result").innerHTML as string;
     expect(out).toContain("The site moves to a new host.");
     expect(out).toContain("25 original memories preserved");
   });
 
   it("reloads the memories, since the digest lands inside the project", async () => {
-    const h = await open({ "GET /digest": { body: { synthesis: "x", source_count: 20 } } });
+    const h = await open({ "POST /digest": { body: { synthesis: "x", source_count: 20 } } });
     const before = lists(h).length;
     await h.ctx.runProjectDigest();
     expect(lists(h).length).toBeGreaterThan(before);
   });
 
   it("scopes to the workspace on a team brain", async () => {
-    const h = await open({ "GET /digest": { body: { synthesis: "x", source_count: 20 } } }, { teamMode: true });
+    const h = await open({ "POST /digest": { body: { synthesis: "x", source_count: 20 } } }, { teamMode: true });
     await h.ctx.runProjectDigest();
-    expect(h.calls.find((c) => c.path === "/digest")!.query.get("workspace")).toBe("personal");
+    expect(h.calls.find((c) => c.path === "/digest")!.body?.workspace).toBe("personal");
   });
 
   it("shows the Worker's reason when there is nothing to digest yet", async () => {
-    const h = await open({ "GET /digest": { body: { error: "Could not create digest: fewer than 20 entries", source_count: 3 } } });
+    const h = await open({ "POST /digest": { body: { error: "Could not create digest: fewer than 20 entries", source_count: 3 } } });
     await h.ctx.runProjectDigest();
     expect(h.els.get("project-digest-result").innerHTML).toContain("fewer than 20 entries");
     expect(h.els.get("project-digest-btn").disabled).toBe(false);
   });
 
   it("reports a network failure and lets the user retry", async () => {
-    const h = await open({ "GET /digest": () => { throw new Error("offline"); } });
+    const h = await open({ "POST /digest": () => { throw new Error("offline"); } });
     await h.ctx.runProjectDigest();
     expect(h.els.get("project-digest-result").innerHTML).toContain("Request failed");
     expect(h.els.get("project-digest-btn").disabled).toBe(false);
@@ -429,7 +429,7 @@ describe("digest", () => {
   it("holds the button down while it works", async () => {
     let release: () => void = () => {};
     const gate = new Promise<void>((r) => (release = r));
-    const h = await open({ "GET /digest": () => ({ body: { synthesis: "x", source_count: 20 } }) });
+    const h = await open({ "POST /digest": () => ({ body: { synthesis: "x", source_count: 20 } }) });
     const real = h.ctx.fetch;
     h.ctx.fetch = async (u: string, i: any) => {
       if (String(u).includes("/digest")) await gate;
@@ -484,7 +484,7 @@ describe("capsule status", () => {
   });
 
   it("does not fail the whole view when the capsule scan fails", async () => {
-    const h = await open({ "GET /list": (c: any) => (c.query.get("tag") ? { status: 500, body: {} } : { body: MEMORIES }) });
+    const h = await open({ "POST /list": (c: any) => (c.body?.tag ? { status: 500, body: {} } : { body: MEMORIES }) });
     expect(h.els.get("project-memories").children).toHaveLength(2);
     expect(h.els.get("project-capsule").innerHTML).toContain("Empty");
   });

@@ -42,10 +42,9 @@ describe("integer query parameters (#277)", () => {
 
     beforeEach(() => {
       sqlite = makeSqliteD1();
-      // buildEntryFilterQuery's SELECT reads valid_from/valid_until, one of the
-      // columns src/db/init.ts adds by ALTER at runtime rather than in schema.sql.
-      sqlite.db.prepare(`ALTER TABLE entries ADD COLUMN valid_from INTEGER`).run();
-      sqlite.db.prepare(`ALTER TABLE entries ADD COLUMN valid_until INTEGER`).run();
+      // buildEntryFilterQueryが使う有効期間列はschema 9の参照DDLに含まれる。
+      expect(sqlite.columns()).toContain("valid_from");
+      expect(sqlite.columns()).toContain("valid_until");
       for (let i = 0; i < 5; i++) {
         sqlite.seed({ id: `e${i}`, content: `Entry ${i}`, createdAt: 1000 + i * 1000 });
       }
@@ -95,9 +94,9 @@ describe("integer query parameters (#277)", () => {
     });
   });
 
-  // ── GET /recall ────────────────────────────────────────────────────────────
+  // ── POST /recall ───────────────────────────────────────────────────────────
 
-  describe("GET /recall", () => {
+  describe("POST /recall", () => {
     let env: Env;
 
     beforeEach(() => {
@@ -110,7 +109,7 @@ describe("integer query parameters (#277)", () => {
       ["topK", "/recall?query=memory&topK=lots"],
       ["hops", "/recall?query=memory&hops=deep"],
     ])("answers 400 for a malformed ?%s=", async (name, path) => {
-      const res = await worker.fetch(req("GET", path), env, ctx);
+      const res = await worker.fetch(req("POST", path), env, ctx);
       expect(res.status).toBe(400);
       expect(await res.json()).toEqual({ ok: false, error: `${name} must be an integer` });
     });
@@ -119,12 +118,12 @@ describe("integer query parameters (#277)", () => {
       const db = makeTestDb();
       env = makeTestEnv(db);
       const vectorize = env.VECTORIZE as any;
-      await worker.fetch(req("GET", "/recall?query=memory&topK=lots"), env, ctx);
+      await worker.fetch(req("POST", "/recall?query=memory&topK=lots"), env, ctx);
       expect(vectorize.query).not.toHaveBeenCalled();
     });
 
     it("still accepts and clamps valid parameters", async () => {
-      const res = await worker.fetch(req("GET", "/recall?query=memory&topK=999&hops=99&after=1"), env, ctx);
+      const res = await worker.fetch(req("POST", "/recall?query=memory&topK=999&hops=99&after=1"), env, ctx);
       expect(res.status).toBe(200);
     });
   });
@@ -148,9 +147,7 @@ describe("integer query parameters (#277)", () => {
   // bounds rows returned rather than rows read — `weight` is unindexed, so the
   // scan happens either way — but the returned rows are what fix the node set,
   // and the node set is what decides how many D1 queries the request costs:
-  // 1 + ceil(N/100) + ceil(N/50), against this codebase's self-imposed
-  // ~50-call D1 budget (the platform's real ceiling is 1,000 calls per
-  // invocation).
+  // 1 + ceil(N/100) + ceil(N/50), against a 50-subrequest free-plan budget.
 
   describe("buildGraph", () => {
     class RecordingD1 extends D1Mock {
@@ -186,7 +183,7 @@ describe("integer query parameters (#277)", () => {
     });
 
     const edgeScan = (recorded: string[]) =>
-      recorded.find(s => s.startsWith("SELECT source_id, target_id FROM edges"));
+      recorded.find(s => s.includes("FROM edges ORDER BY weight DESC"));
 
     it.each([
       ["omitted", undefined],
@@ -197,20 +194,20 @@ describe("integer query parameters (#277)", () => {
     ])("always bounds the edge scan when limit is %s", async (_label, limit) => {
       await buildGraph({ limit }, env);
       expect(edgeScan(db.sql)).toBe(
-        `SELECT source_id, target_id FROM edges ORDER BY weight DESC LIMIT ${GRAPH_VIEW_MAX_NODES * 4}`,
+        `SELECT source_id, target_id, type, weight, provenance, created_at FROM edges ORDER BY weight DESC LIMIT ${GRAPH_VIEW_MAX_NODES * 4}`,
       );
     });
 
     it("still honours a caller's smaller limit", async () => {
       const { nodes } = await buildGraph({ limit: 3 }, env);
       expect(nodes).toHaveLength(3);
-      expect(edgeScan(db.sql)).toBe("SELECT source_id, target_id FROM edges ORDER BY weight DESC LIMIT 12");
+      expect(edgeScan(db.sql)).toBe("SELECT source_id, target_id, type, weight, provenance, created_at FROM edges ORDER BY weight DESC LIMIT 12");
     });
 
     it("caps a caller's oversized limit at the ceiling", async () => {
       await buildGraph({ limit: GRAPH_VIEW_MAX_NODES * 10 }, env);
       expect(edgeScan(db.sql)).toBe(
-        `SELECT source_id, target_id FROM edges ORDER BY weight DESC LIMIT ${GRAPH_VIEW_MAX_NODES * 4}`,
+        `SELECT source_id, target_id, type, weight, provenance, created_at FROM edges ORDER BY weight DESC LIMIT ${GRAPH_VIEW_MAX_NODES * 4}`,
       );
     });
 
@@ -242,15 +239,13 @@ describe("integer query parameters (#277)", () => {
     });
 
     /**
-     * The constraint that sets GRAPH_VIEW_MAX_NODES. This codebase holds itself
-     * to a self-imposed budget of ~50 D1/KV calls per invocation (the
-     * platform's real ceiling is 1,000 D1/KV/Vectorize calls per invocation),
-     * and buildGraph spends 1 + ceil(N/100) + ceil(N/50) D1 queries for N nodes
-     * plus one KV read for the config. That is what makes the node cap a
-     * deliberate limit rather than a taste question: at N=1634 the request
-     * exceeds this codebase's self-imposed budget — costing more D1 calls and
-     * CPU than allowed for, not actually failing the platform — with
-     * runGraphPass adding the edges that get it there on its own.
+     * The constraint that sets GRAPH_VIEW_MAX_NODES. Workers allow 50
+     * subrequests per invocation on the free plan, and buildGraph spends
+     * 1 + ceil(N/100) D1 queries for N nodes plus one KV read for
+     * the config. That is what makes the node cap a hard limit rather than a
+     * taste question: at N=1634 the request exceeds the budget and the graph tab
+     * is dead for every free-plan brain that size, with runGraphPass adding the
+     * edges that get it there on its own.
      *
      * Raising the cap without recomputing this is the mistake this test exists
      * to catch, so it asserts the measured cost rather than a ratio.
@@ -258,13 +253,11 @@ describe("integer query parameters (#277)", () => {
      * SCOPE: this measures the request's own D1 and KV calls on a warm isolate.
      * It deliberately does not cover the cold-isolate path, where
      * initializeDatabase fires under waitUntil and spends ~12 more from the same
-     * self-imposed budget, putting the first request against a fresh isolate at
-     * ~59 — over that self-imposed budget, though still far under the
-     * platform's real 1,000-call ceiling. Green here is not evidence that case
-     * is safe; it is #282.
+     * budget, putting the first request against a fresh isolate at ~59 — over
+     * the limit. Green here is not evidence that case is safe; it is #282.
      */
-    it("keeps a full-size /graph request inside this codebase's self-imposed D1 budget", async () => {
-      const SELF_IMPOSED_D1_BUDGET = 50;
+    it("keeps a full-size /graph request inside the free-plan subrequest budget", async () => {
+      const FREE_PLAN_SUBREQUESTS = 50;
       const big = seedOversized();
 
       let kvReads = 0;
@@ -276,47 +269,11 @@ describe("integer query parameters (#277)", () => {
       expect(res.status).toBe(200);
 
       const N = GRAPH_VIEW_MAX_NODES;
-      // v3 scoping: every statement binds the caller's workspace set (an admin's
-      // is three — personal, company, legacy '') alongside the ids, shrinking
-      // each batch. The unscoped formula re-derived for that arithmetic:
-      const scopeN = 3;
-      const predicted = 1
-        + Math.ceil(N / (100 - scopeN))
-        + Math.ceil(N / Math.floor((100 - scopeN) / 2));
-      // Identity resolution and tenant provisioning statements are accounted in
-      // the budget line below; this pins buildGraph's own query count.
-      // "BATCH" is a collapsed batch, and both of the ones on this path are
-      // tenancy: the token→identity read (now paired with the throttled
-      // last_used_at stamp) and the one-time provisioning write.
-      const tenancy = /sqlite_master|FROM workspaces|INTO workspaces|INTO users|FROM users|memberships|token_hash|maintenance_cursor|SET workspace_id|^BATCH$/;
-      expect(big.sql.filter((s: string) => !tenancy.test(s))).toHaveLength(predicted);
-      // Team edition adds one token-to-identity round trip per request and, on
-      // a first request against a fresh database, one-time tenant provisioning.
-      // A full-size team brain therefore sits above this codebase's
-      // self-imposed D1 ceiling even warm — accepted in the v3 spec (teams land
-      // on paid plans, where the platform's real ceiling is higher still).
-      // Unscoped single-user paths keep the original counts and do not
-      // regress; the +4 documents exactly how far over the team case goes.
-      //
-      // This bound is EXACT: the measured value is 54 against 50 + 4. Keep it
-      // exact. It was +11 while identity resolution and the tenant bootstrap
-      // each spent one D1 call per statement; both are batches now, and a
-      // batch is one D1 call however many statements it carries, so the same
-      // work costs 54 instead of 61. Re-pinning it at the measured number is the
-      // point — a bound of +11 would still have read as "unchanged since v3"
-      // while quietly admitting seven calls of tenancy-path growth that no
-      // test would have noticed.
-      //
-      // So: if you change this, measure the new value and re-pin it tight. A
-      // constant that did not move is not evidence that the assertion still
-      // binds — check the slack, not just the number.
-      //
-      // Read it before adding anything to the identity path. /graph is the
-      // largest request in the app: this is the endpoint where "one more query
-      // per request" stops being free. users.last_used_at is written on this
-      // path and costs nothing here, because it is batched with the identity
-      // read rather than issued beside it.
-      expect(big.sql.length + kvReads).toBeLessThanOrEqual(SELF_IMPOSED_D1_BUDGET + 4);
+      // Team identity/scope adds five fixed D1 statements; graph paging remains
+      // the same ceil(N/100) variable arm.
+      const predicted = 6 + Math.ceil(N / 100);
+      expect(big.sql).toHaveLength(predicted);
+      expect(big.sql.length + kvReads).toBeLessThanOrEqual(FREE_PLAN_SUBREQUESTS);
     });
   });
 });

@@ -1,4 +1,5 @@
-import { describe, it, expect } from "vitest";
+import { connect } from "cloudflare:sockets";
+import { afterEach, describe, it, expect, vi } from "vitest";
 import {
   parseEmailToken,
   isNoiseSender,
@@ -8,8 +9,18 @@ import {
   buildEmailContent,
   parseHeaders,
   imapDate,
+  ImapClient,
 } from "../../src/integrations";
+import {
+  parseBoundedImapLiteralSize,
+  ImapLiteralTooLargeError,
+  MAX_IMAP_BODY_BYTES,
+  MAX_IMAP_SEARCH_UID_SPAN,
+  buildUidSearchRangeQuery,
+} from "../../src/integrations/imap";
+import { runEmailSync } from "../../src/integrations/email";
 import type { EmailHeaderInfo } from "../../src/integrations";
+import { makeMemoryKV } from "../helpers/make-env";
 
 // ─── looksBulk ──────────────────────────────────────────────────────────────
 
@@ -163,6 +174,129 @@ describe("computeEmailPlan", () => {
       base({ uid: 3, messageId: "m3" }),
     ];
     expect(computeEmailPlan(headers, new Set(["m3"]))).toEqual([]);
+  });
+
+  it("deduplicates a message without Message-ID by its stable IMAP UID", () => {
+    expect(computeEmailPlan([base({ uid: 42, messageId: "" })], new Set(["uid:42"]))).toEqual([]);
+  });
+});
+
+describe("IMAP literal admission", () => {
+  it("accepts a body exactly at the bounded MIME processing limit", () => {
+    expect(parseBoundedImapLiteralSize(String(MAX_IMAP_BODY_BYTES), MAX_IMAP_BODY_BYTES))
+      .toBe(MAX_IMAP_BODY_BYTES);
+  });
+
+  it.each([String(MAX_IMAP_BODY_BYTES + 1), "999999999999999999999999"])(
+    "rejects %s before allocating the literal",
+    (declared) => {
+      expect(() => parseBoundedImapLiteralSize(declared, MAX_IMAP_BODY_BYTES))
+        .toThrow(ImapLiteralTooLargeError);
+    },
+  );
+
+  it.each([
+    ["not-a-number", 100],
+    ["101", 100],
+  ])("rejects malformed or over-limit literal %s", (declared, max) => {
+    expect(() => parseBoundedImapLiteralSize(declared, max)).toThrow(ImapLiteralTooLargeError);
+  });
+});
+
+describe("bounded email sync cursor", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  const service = {
+    id: "email-gmail",
+    name: "Gmail",
+    host: "imap.gmail.com",
+    connectLabel: "Connect",
+    connectPlaceholder: "password",
+    connectHint: "hint",
+  };
+
+  async function harness(config: Record<string, unknown>, overrides: Record<string, unknown> = {}) {
+    const kv = makeMemoryKV();
+    await kv.put("integrations:email-gmail", JSON.stringify({
+      provider: "email-gmail",
+      authKind: "token",
+      credentials: { token: JSON.stringify({ email: "me@example.com", appPassword: "secret" }) },
+      config,
+      status: "connected",
+      workspaceName: "me@example.com",
+      lastSyncedAt: null,
+      lastSyncError: null,
+      itemMap: {},
+      createdAt: 1,
+      updatedAt: 1,
+    }));
+    const raw = new TextEncoder().encode([
+      "From: Person <person@example.com>",
+      "Subject: Hello",
+      "Date: Thu, 27 Aug 2026 09:00:00 +0000",
+      "Content-Type: text/plain; charset=utf-8",
+      "",
+      "A bounded personal message.",
+    ].join("\r\n"));
+    const client = {
+      login: vi.fn(),
+      selectInbox: vi.fn().mockResolvedValue({ exists: 1, uidValidity: 2, uidNext: 12 }),
+      uidSearchRangeSince: vi.fn().mockResolvedValue([11]),
+      uidFetchHeaders: vi.fn().mockResolvedValue([{
+        uid: 11,
+        size: raw.byteLength,
+        headers: { from: "person@example.com", subject: "Hello", date: "today", "message-id": "" },
+      }]),
+      uidFetchBody: vi.fn().mockResolvedValue(raw),
+      close: vi.fn(),
+      ...overrides,
+    };
+    vi.spyOn(ImapClient, "connect").mockResolvedValue(client as any);
+    const store = {
+      createEntry: vi.fn().mockResolvedValue("entry-1"),
+      updateEntry: vi.fn(),
+      deleteEntry: vi.fn(),
+    };
+    const outcome = await runEmailSync({ OAUTH_KV: kv }, store as any, service);
+    const saved = JSON.parse((await kv.get("integrations:email-gmail"))!);
+    return { outcome, saved, store, client };
+  }
+
+  it("creates one message and advances a UID fallback identity", async () => {
+    const { outcome, saved, store } = await harness({});
+    expect(outcome).toMatchObject({ ok: true, created: 1, remaining: 0 });
+    expect(store.createEntry).toHaveBeenCalledTimes(1);
+    expect(saved.config).toMatchObject({ uidValidity: 2, scanAfterUid: 11 });
+    expect(saved.config.ingestedIds).toContain("uid:11");
+  });
+
+  it("drops stale uid identities when UIDVALIDITY changes", async () => {
+    const { outcome, saved } = await harness(
+      { uidValidity: 1, scanAfterUid: 99, ingestedIds: ["uid:11", "stable-id"] },
+      {
+        uidSearchRangeSince: vi.fn().mockResolvedValue([12]),
+        uidFetchHeaders: vi.fn().mockResolvedValue([{
+          uid: 12,
+          size: 100,
+          headers: { from: "person@example.com", subject: "Hello", date: "today", "message-id": "" },
+        }]),
+      },
+    );
+    expect(outcome).toMatchObject({ created: 1 });
+    expect(saved.config.ingestedIds).toContain("stable-id");
+    expect(saved.config.ingestedIds).toContain("uid:12");
+    expect(saved.config.ingestedIds).not.toContain("uid:11");
+  });
+
+  it("durably skips one oversized header and leaves later UIDs pending", async () => {
+    const { outcome, saved, store } = await harness({}, {
+      selectInbox: vi.fn().mockResolvedValue({ exists: 2, uidValidity: 2, uidNext: 13 }),
+      uidSearchRangeSince: vi.fn().mockResolvedValue([11, 12]),
+      uidFetchHeaders: vi.fn().mockRejectedValue(new ImapLiteralTooLargeError()),
+    });
+    expect(outcome).toMatchObject({ ok: true, created: 0, remaining: 1 });
+    expect(saved.config.scanAfterUid).toBe(11);
+    expect(store.createEntry).not.toHaveBeenCalled();
   });
 });
 
@@ -361,5 +495,56 @@ describe("imapDate", () => {
 
   it("formats a two-digit day and December correctly", () => {
     expect(imapDate(new Date(Date.UTC(2025, 11, 25)))).toBe("25-Dec-2025");
+  });
+
+  it("formats a bounded UID search cursor without changing date semantics", () => {
+    expect(buildUidSearchRangeQuery(new Date(Date.UTC(2026, 7, 27)), 101, 356))
+      .toBe("UID SEARCH UID 101:356 SINCE 27-Aug-2026");
+  });
+
+  it("rejects an unbounded UID search range before sending the command", () => {
+    expect(() => buildUidSearchRangeQuery(
+      new Date(Date.UTC(2026, 7, 27)),
+      1,
+      MAX_IMAP_SEARCH_UID_SPAN + 1,
+    )).toThrow(/search range exceeds/);
+  });
+
+  it.each([
+    [1.5, 2],
+    [1, 2.5],
+    [0, 1],
+    [2, 1],
+  ])("rejects invalid UID range %s:%s", (first, last) => {
+    expect(() => buildUidSearchRangeQuery(new Date(), first, last)).toThrow(/search range exceeds/);
+  });
+});
+
+
+describe("IMAPの接続所有権", () => {
+  afterEach(() => vi.useRealTimers());
+
+  it.each(["invalid", "error", "timeout"])("挨拶の%s時に呼出元へ返せない接続を閉じる", async mode => {
+    vi.useFakeTimers();
+    const failure = new Error("synthetic greeting failure");
+    let source!: ReadableStreamDefaultController<Uint8Array>;
+    const readable = new ReadableStream<Uint8Array>({
+      start(controller) {
+        source = controller;
+        if (mode === "error") controller.error(failure);
+        if (mode === "invalid") controller.enqueue(new TextEncoder().encode("* BYE unavailable\r\n"));
+      },
+    });
+    const writable = new WritableStream();
+    const close = vi.fn(async () => { if (mode !== "error") source.close(); });
+    vi.mocked(connect).mockReturnValueOnce({ readable, writable, close } as never);
+    const connection = ImapClient.connect("synthetic.invalid");
+    const rejected = mode === "error" ? expect(connection).rejects.toBe(failure)
+      : expect(connection).rejects.toThrow(mode === "timeout" ? "IMAP read timeout" : "unexpected IMAP greeting");
+    if (mode === "timeout") await vi.runAllTimersAsync();
+    await rejected;
+    expect(close).toHaveBeenCalledOnce();
+    expect(readable.locked).toBe(false);
+    expect(writable.locked).toBe(false);
   });
 });

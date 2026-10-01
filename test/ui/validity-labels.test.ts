@@ -592,8 +592,8 @@ describe("sendRecall's own entry map carries the six validity fields through to 
     ctx.TextEncoder = TextEncoder;
     ctx.fetch = async (url: string, init: any) => {
       ctx.__requests.push({ url, init });
-      if (url.includes("/recall?")) return { ok: true, json: async () => recallBody };
-      if (url.includes("/chat")) return { ok: true, body: sse(["Found it."]) };
+      if (url.endsWith("/recall") && init.method === "POST") return { ok: true, json: async () => recallBody };
+      if (url.includes("/chat")) return new Response(sse(["Found it."]));
       throw new Error("unexpected fetch " + url);
     };
     run(ctx, ["public/utils.js", "public/js/state.js", "public/js/recent.js", "public/js/ui-chat.js", "public/js/recall.js"]);

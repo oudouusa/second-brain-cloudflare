@@ -24,6 +24,11 @@ export function nightSummaryKey(workspaceId: string): string {
   return `night:${workspaceId}`;
 }
 
+const COUNT_FIELDS = ["linksInferred", "insightsProposed", "digestsWritten", "claimsFlagged", "whenJudged", "whenExtracted", "whenSkipped"] as const;
+function validCounter(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
 /**
  * Writes the whole record in one KV put, never partially. Callers pass every
  * count they have in hand at once, there is no append/patch form, so a pass
@@ -39,11 +44,12 @@ export async function recordNightSummary(
   workspaceId: string,
   counts: Omit<NightSummary, "ranAt">,
 ): Promise<void> {
+  if (!COUNT_FIELDS.every(field => validCounter(counts[field]))) return;
   const record: NightSummary = { ranAt: Date.now(), ...counts };
   try {
     await env.OAUTH_KV.put(nightSummaryKey(workspaceId), JSON.stringify(record));
-  } catch (e) {
-    console.error(`Night summary write failed for workspace ${workspaceId} (non-fatal):`, e);
+  } catch {
+    console.error("Night summary write failed (non-fatal)");
   }
 }
 
@@ -53,7 +59,8 @@ export async function readNightSummary(env: Env, workspaceId: string): Promise<N
     const raw = await env.OAUTH_KV.get(nightSummaryKey(workspaceId));
     if (!raw) return null;
     const parsed = JSON.parse(raw) as Partial<NightSummary>;
-    if (typeof parsed.ranAt !== "number") return null;
+    if (!parsed || !validCounter(parsed.ranAt)
+      || !COUNT_FIELDS.every(field => validCounter(parsed[field] ?? (field.startsWith("when") ? 0 : undefined)))) return null;
     return {
       ranAt: parsed.ranAt,
       linksInferred: parsed.linksInferred ?? 0,
@@ -66,8 +73,8 @@ export async function readNightSummary(env: Env, workspaceId: string): Promise<N
       whenExtracted: parsed.whenExtracted ?? 0,
       whenSkipped: parsed.whenSkipped ?? 0,
     };
-  } catch (e) {
-    console.error(`Night summary read failed for workspace ${workspaceId} (non-fatal):`, e);
+  } catch {
+    console.error("Night summary read failed (non-fatal)");
     return null;
   }
 }

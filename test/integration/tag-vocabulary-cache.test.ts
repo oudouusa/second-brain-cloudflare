@@ -49,6 +49,7 @@ import { makeSqliteD1, type SqliteD1 } from "../helpers/sqlite-d1";
 import { makeTestEnv, makeMemoryKV, makeKVMock } from "../helpers/make-env";
 import { req } from "../helpers/make-request";
 import type { Env } from "../../src/env";
+import { readDerivedStateGeneration } from "../../src/migration/write-lock";
 
 /**
  * The one statement this issue is about, in both its shapes: the corpus-wide scan
@@ -56,7 +57,7 @@ import type { Env } from "../../src/env";
  * caller's rebuild issues (one statement covering every stale workspace, so the
  * rows-read budget is the same either way).
  */
-const TAG_SCAN = /SELECT DISTINCT (?:workspace_id, )?value FROM entries, json_each/;
+const TAG_SCAN = /SELECT\s+DISTINCT\s+(?:workspace_id\s*,\s*)?value\s+FROM\s+entries\s*,\s*json_each/;
 
 let sqlite: SqliteD1 | null = null;
 afterEach(() => { sqlite?.close(); sqlite = null; });
@@ -80,6 +81,20 @@ interface Harness {
   scans: () => string[];
 }
 
+async function currentGeneration(h: Harness): Promise<string> {
+  return readDerivedStateGeneration(h.env);
+}
+
+async function putCurrentCache(
+  h: Harness,
+  value: { tags: string[]; rebuiltAt: number | string },
+): Promise<void> {
+  await h.kv.put(TAG_VOCABULARY_KEY, JSON.stringify({
+    ...value,
+    generation: await currentGeneration(h),
+  }));
+}
+
 /**
  * A brain with `tags` on every entry, real SQL underneath, and a KV that remembers
  * what was written to it. `failScan` makes the tag scan — and only the tag scan —
@@ -90,16 +105,6 @@ function harness(
   opts: { failScan?: boolean; kv?: KVNamespace } = {},
 ): Harness {
   sqlite = makeSqliteD1();
-  // `updated_at` and the time-anchor columns are added by ALTER in src/db/init.ts
-  // rather than in schema.sql, and that path goes through `exec`, which this
-  // facade does not run. Capture writes all seven.
-  sqlite.db.prepare(`ALTER TABLE entries ADD COLUMN updated_at INTEGER`).run();
-  sqlite.db.prepare(`ALTER TABLE entries ADD COLUMN when_at INTEGER`).run();
-  sqlite.db.prepare(`ALTER TABLE entries ADD COLUMN when_kind TEXT`).run();
-  sqlite.db.prepare(`ALTER TABLE entries ADD COLUMN when_source TEXT`).run();
-  sqlite.db.prepare(`ALTER TABLE entries ADD COLUMN when_label TEXT`).run();
-  sqlite.db.prepare(`ALTER TABLE entries ADD COLUMN valid_from INTEGER`).run();
-  sqlite.db.prepare(`ALTER TABLE entries ADD COLUMN valid_until INTEGER`).run();
   entries.forEach((e, i) => sqlite!.seed({ ...e, createdAt: 1_700_000_000_000 + i }));
 
   const issued: string[] = [];
@@ -121,7 +126,7 @@ function harness(
 
   const kv = opts.kv ?? makeMemoryKV();
   return {
-    env: makeTestEnv(undefined, { DB, OAUTH_KV: kv }),
+    env: sqlite.admitEnv(makeTestEnv(undefined, { DB, OAUTH_KV: kv })),
     issued,
     ctx: makeCtx(),
     kv,
@@ -213,10 +218,10 @@ describe("the tag vocabulary is scanned once, not per recall", () => {
     // same degradation as any other aged-out copy, so the caller gets something and
     // the correction happens behind the response.
     const h = harness(CORPUS);
-    await h.kv.put(TAG_VOCABULARY_KEY, JSON.stringify({
+    await putCurrentCache(h, {
       tags: ["frozen"],
       rebuiltAt: Date.now() + 365 * 86400000,
-    }));
+    });
 
     expect(await getTagVocabulary(h.env, h.ctx)).toEqual(["frozen"]);
     await h.ctx.settle();
@@ -228,10 +233,10 @@ describe("the tag vocabulary is scanned once, not per recall", () => {
     await getTagVocabulary(h.env);
     expect(h.scans()).toHaveLength(1);
 
-    await h.kv.put(TAG_VOCABULARY_KEY, JSON.stringify({
+    await putCurrentCache(h, {
       tags: ["stale-only"],
       rebuiltAt: Date.now() - TAG_VOCABULARY_MAX_AGE_MS - 1,
-    }));
+    });
 
     // The aged copy is what the caller gets — it is handed back before the rebuild
     // this call scheduled can have finished, which is the whole point of deferring it.
@@ -240,6 +245,25 @@ describe("the tag vocabulary is scanned once, not per recall", () => {
     await h.ctx.settle();
     expect(h.scans()).toHaveLength(2);
     expect(await getTagVocabulary(h.env, h.ctx)).toContain("work");
+  });
+
+  it("ignores an eventually-consistent cache from an older D1 generation", async () => {
+    const h = harness(CORPUS);
+    await getTagVocabulary(h.env);
+    const stale = JSON.parse((await h.kv.get(TAG_VOCABULARY_KEY))!);
+    await h.env.DB.prepare(
+      `UPDATE embedding_migration_generation SET generation = ? WHERE id = 'embedding-v1'`,
+    ).bind("generation-after-restore").run();
+    await h.kv.put(TAG_VOCABULARY_KEY, JSON.stringify({
+      tags: ["retired-brain"],
+      rebuiltAt: Date.now(),
+      generation: stale.generation,
+    }));
+
+    expect(await getTagVocabulary(h.env)).toEqual(ALL_TAGS);
+    expect(h.scans()).toHaveLength(2);
+    const fresh = JSON.parse((await h.kv.get(TAG_VOCABULARY_KEY))!);
+    expect(fresh.generation).toBe("generation-after-restore");
   });
 });
 
@@ -293,7 +317,8 @@ describe("a tag captured just now is inferable on the next recall", () => {
     const h = harness(CORPUS);
     await getTagVocabulary(h.env);
     const aged = Date.now() - TAG_VOCABULARY_MAX_AGE_MS - 1;
-    await h.kv.put(TAG_VOCABULARY_KEY, JSON.stringify({ tags: ["gone", "work"], rebuiltAt: aged }));
+    const generation = await currentGeneration(h);
+    await putCurrentCache(h, { tags: ["gone", "work"], rebuiltAt: aged });
 
     // A rebuild lands in the middle of the write-through: after its read, before its put.
     // Bound before the spy replaces the property, or the double would call itself.
@@ -304,7 +329,11 @@ describe("a tag captured just now is inferable on the next recall", () => {
       const value = await realGet(key);
       if (!interleaved) {
         interleaved = true;
-        await h.kv.put(TAG_VOCABULARY_KEY, JSON.stringify({ tags: ["work"], rebuiltAt: Date.now() }));
+        await h.kv.put(TAG_VOCABULARY_KEY, JSON.stringify({
+          tags: ["work"],
+          rebuiltAt: Date.now(),
+          generation,
+        }));
       }
       return value;
     }) as never);
@@ -364,11 +393,16 @@ describe("every way the cache can fail degrades, and none of them fails a reques
     const h = harness(CORPUS);
     await getTagVocabulary(h.env);
 
-    await h.kv.put(TAG_VOCABULARY_KEY, JSON.stringify({
+    await putCurrentCache(h, {
       tags: ["work", "legal"],
       rebuiltAt: Date.now() - TAG_VOCABULARY_MAX_AGE_MS - 1,
-    }));
+    });
+    const generation = await currentGeneration(h);
     const broken = harness([], { kv: h.kv, failScan: true });
+    await broken.env.DB.prepare(
+      `INSERT INTO embedding_migration_generation (id, generation) VALUES ('embedding-v1', ?)
+       ON CONFLICT(id) DO UPDATE SET generation = excluded.generation`,
+    ).bind(generation).run();
 
     expect(await getTagVocabulary(broken.env)).toEqual(["work", "legal"]);
   });
@@ -395,7 +429,7 @@ describe("every way the cache can fail degrades, and none of them fails a reques
 
   it("serves a blob whose timestamp is unusable, and reconciles it", async () => {
     const h = harness(CORPUS);
-    await h.kv.put(TAG_VOCABULARY_KEY, JSON.stringify({ tags: ["kept"], rebuiltAt: "yesterday" }));
+    await putCurrentCache(h, { tags: ["kept"], rebuiltAt: "yesterday" });
 
     expect(await getTagVocabulary(h.env, h.ctx)).toEqual(["kept"]);
     await h.ctx.settle();
@@ -415,11 +449,11 @@ describe("every way the cache can fail degrades, and none of them fails a reques
     // rejection unless it is caught — and the vocabulary it was refreshing has to
     // survive the attempt rather than be cleared by it.
     const kv = makeMemoryKV();
-    await kv.put(TAG_VOCABULARY_KEY, JSON.stringify({
+    const h = harness(CORPUS, { kv, failScan: true });
+    await putCurrentCache(h, {
       tags: ["work", "legal"],
       rebuiltAt: Date.now() - TAG_VOCABULARY_MAX_AGE_MS - 1,
-    }));
-    const h = harness(CORPUS, { kv, failScan: true });
+    });
 
     expect(await getTagVocabulary(h.env, h.ctx)).toEqual(["work", "legal"]);
     await expect(h.ctx.settle()).resolves.toBeUndefined();

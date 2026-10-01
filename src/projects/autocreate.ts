@@ -14,7 +14,7 @@ export async function autoCreateProject(
   target: { workspaceId: string; actorId: string; slug: string },
 ): Promise<void> {
   try {
-    if (await ensureProject(env.DB, target.workspaceId, target.slug)) {
+    if (await ensureProject(env.DB, target.workspaceId, target.slug, env)) {
       adminAuditEvent(env, ctx, {
         actorId: target.actorId,
         workspaceId: target.workspaceId,

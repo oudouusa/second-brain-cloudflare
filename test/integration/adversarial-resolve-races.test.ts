@@ -50,7 +50,7 @@ beforeEach(async () => {
   pending.length = 0;
   resetDatabaseInit();
   sqlite = makeSqliteD1();
-  env = makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV() });
+  env = sqlite.admitEnv(makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV() }));
   await initializeDatabase(env);
   await ensureTenantBootstrap(env);
 });
@@ -120,7 +120,7 @@ describe("adversarial resolve interleavings", () => {
     expect(scoped).toBeTruthy();
     // The row's own forget path moves it to entries_trash and deletes it from entries; what
     // applyInsightResolution's guard sees is that entries no longer has it under any guard.
-    await env.DB.prepare("DELETE FROM entries WHERE id = ?").bind("gone").run();
+    await sqlite.deleteFixtureRows("DELETE FROM entries WHERE id = ?", "gone");
 
     const result = await applyInsightResolution(env, ctx, { actorId: owner.userId, channel: "mcp" }, [scoped], 1, "confirm");
     expect(result.resolved).toEqual([]);

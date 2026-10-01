@@ -1,3 +1,4 @@
+import { projectEmbedding } from "../../src/embedding/profile";
 import { readFileSync, writeFileSync } from "node:fs";
 import { DEFAULTS, type Config } from "../../src/config";
 import { FTS_READY_KV_KEY, RERANK_MODEL, RERANK_READY_KV_KEY } from "../../src/constants";
@@ -140,13 +141,13 @@ export async function runVariant(o: {
           const input = args[1] as { text?: unknown } | undefined;
           if (activeQueryId && args[0] === o.embeddingModel && Array.isArray(input?.text)) {
             const values = (result as { data?: number[][] })?.data?.[0];
-            if (values) queryVectors.set(activeQueryId, values);
+            if (values) queryVectors.set(activeQueryId, projectEmbedding(values));
           }
           return result;
         };
       },
     }) : corpus.env.AI;
-    const env = { ...corpus.env, AI: captureAi, DB: withoutRecallCountWrites(corpus.env.DB, () => { intercepted++; }) } as typeof corpus.env;
+    const env = Object.assign(Object.create(corpus.env), { AI: captureAi, DB: withoutRecallCountWrites(corpus.env.DB, () => { intercepted++; }) }) as typeof corpus.env;
     const recallOnce = async (q: GoldenQuery) => {
       const diagnostics: RecallDiagnostics = {};
       corpus.replay.drainCalls();
@@ -241,7 +242,7 @@ export async function runVariant(o: {
     if (corpus.standingIds.length) {
       for (const q of o.queries) {
         const out = await corpus.env.AI.run(o.embeddingModel as never, { text: [q.text] } as never) as { data?: number[][] };
-        if (out.data?.[0]) rawVectors.set(q.id, out.data[0]);
+        if (out.data?.[0]) rawVectors.set(q.id, projectEmbedding(out.data[0]));
       }
     }
     const standing = corpus.standingIds.length ? await measureStanding(corpus, o.queries, { distilled: queryVectors, raw: rawVectors }) : undefined;

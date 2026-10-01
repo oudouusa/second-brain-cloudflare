@@ -35,7 +35,15 @@ describe("the superseded_by lookup starts from edges, never from the workspace i
     const env = { ...t.env, DB: { prepare: (sql: string) => wrap(prepare(sql), sql), batch: (s: any[]) => db.batch(s.map((x: any) => x.__inner ?? x)), exec: (q: string) => db.exec(q) } } as any;
     const today = new Date().toISOString().slice(0, 10);
     for (const p of ["/list?n=50", "/recall?query=atlas+ledger&topK=10&synthesize=0", `/recall?query=atlas+ledger&topK=10&synthesize=0&as_of=${today}`]) {
-      await worker.fetch(new Request(`http://localhost${p}`, { headers: { Authorization: "Bearer test-token" } }), env, { waitUntil: () => {} } as any);
+      const params = new URL(`http://localhost${p}`).searchParams;
+      const isRecall = p.startsWith("/recall");
+      const res = await worker.fetch(new Request(`http://localhost${isRecall ? "/recall" : p}`, {
+        method: isRecall ? "POST" : "GET", headers: { Authorization: "Bearer test-token", "Content-Type": "application/json" },
+        ...(isRecall ? { body: JSON.stringify({ query: params.get("query"), topK: 10, synthesize: false,
+          ...(params.has("as_of") ? { as_of: params.get("as_of") } : {}) }) } : {}),
+      }), env, { waitUntil: () => {} } as any);
+      expect(res.status).toBe(200);
+
     }
     // Every statement that joins the supersedes edges to entries (the superseded_by readers and, since T2-B B3/B4,
     // the as-of belief read in src/recall/as-of.ts) must start from edges.

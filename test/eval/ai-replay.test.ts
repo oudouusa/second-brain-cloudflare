@@ -283,18 +283,24 @@ describe("single flight", () => {
 describe("lock lease and fence", () => {
   const lockOf = (root: string, model: string, input: unknown, file: string) => `${join(cacheOf(root), file)}.${replayKey(model, input)}.lock`;
 
-  it("renews the lease during a slow live call, so a short stale time still gives one live call and one row", async () => {
-    const root = tmp();
-    const live = { run: vi.fn(async () => { await sleep(400); return { data: [[1]] }; }) };
-    const a = makeReplayAi({ store: store(root, "s.jsonl", { lockStaleMs: 90 }), mode: "record", live });
-    const b = makeReplayAi({ store: store(root, "s.jsonl", { lockStaleMs: 90 }), mode: "record", live });
-    const first = a.ai.run(MODEL as never, embedInput("x") as never);
-    await sleep(40);
-    const second = b.ai.run(MODEL as never, embedInput("x") as never);
-    const [ra, rb] = await Promise.all([first, second]);
-    expect(rb).toEqual(ra);
-    expect(live.run).toHaveBeenCalledTimes(1);
-    expect(rows(join(cacheOf(root), "s.jsonl"))).toHaveLength(1);
+  it("90msのleaseを更新し、400msの生成中に来た競合もモデル呼出しと記録を1件に保つ", async () => {
+    // coverage中のOS停止をlease故障と混同しない。期限と更新間隔は実装のまま時計だけを進める。
+    vi.useFakeTimers();
+    try {
+      const root = tmp();
+      const live = { run: vi.fn(async () => { await sleep(400); return { data: [[1]] }; }) };
+      const a = makeReplayAi({ store: store(root, "s.jsonl", { lockStaleMs: 90 }), mode: "record", live });
+      const b = makeReplayAi({ store: store(root, "s.jsonl", { lockStaleMs: 90 }), mode: "record", live });
+      const first = a.ai.run(MODEL as never, embedInput("x") as never);
+      await vi.advanceTimersByTimeAsync(40);
+      const second = b.ai.run(MODEL as never, embedInput("x") as never);
+      const results = Promise.all([first, second]);
+      await vi.advanceTimersByTimeAsync(400);
+      const [ra, rb] = await results;
+      expect(rb).toEqual(ra);
+      expect(live.run).toHaveBeenCalledTimes(1);
+      expect(rows(join(cacheOf(root), "s.jsonl"))).toHaveLength(1);
+    } finally { vi.useRealTimers(); }
   });
 
   it("does not append after losing the lock, and returns the winner's row", async () => {

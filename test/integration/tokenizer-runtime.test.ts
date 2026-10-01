@@ -10,6 +10,7 @@ import { Miniflare } from "miniflare";
 import { build } from "esbuild";
 import { resolve } from "node:path";
 import { tokenizeQuery } from "../../src/text/tokenize";
+import { tokenizeQueryDetailed } from "../../src/text/lexical-query";
 import { cleanTemp } from "../helpers/tmp";
 
 afterAll(cleanTemp);
@@ -30,25 +31,36 @@ describe("tokenizeQuery inside workerd matches Node (#326 ICU pin)", () => {
 
   beforeAll(async () => {
     const bundle = await build({
-      entryPoints: [resolve(import.meta.dirname, "../../src/text/tokenize.ts")],
+      stdin: {
+        contents: `
+          import { tokenizeQuery } from "./src/text/tokenize";
+          import { tokenizeQueryDetailed } from "./src/text/lexical-query";
+          export default {
+            async fetch(request) {
+              const { queries } = await request.json();
+              return Response.json({
+                segmenter: typeof Intl.Segmenter,
+                tokens: queries.map(q => tokenizeQuery(q)),
+                recallTerms: queries.map(q => tokenizeQueryDetailed(q)),
+              });
+            },
+          };
+        `,
+        resolveDir: resolve(import.meta.dirname, "../.."),
+        sourcefile: "tokenizer-runtime-entry.ts",
+        loader: "ts",
+      },
       bundle: true,
       format: "esm",
       write: false,
       platform: "browser",
       target: "esnext",
     });
-    const lib = bundle.outputFiles[0].text;
     mf = new Miniflare({
       modules: true,
       compatibilityDate: "2026-06-17",
       compatibilityFlags: ["nodejs_compat"],
-      script: `${lib}
-export default {
-  async fetch(request) {
-    const { queries } = await request.json();
-    return Response.json({ segmenter: typeof Intl.Segmenter, tokens: queries.map(q => tokenizeQuery(q)) });
-  },
-};`,
+      script: bundle.outputFiles[0].text,
     });
   }, 30_000);
 
@@ -58,8 +70,13 @@ export default {
 
   it("segments and normalizes identically", async () => {
     const res = await mf.dispatchFetch("http://pin/", { method: "POST", body: JSON.stringify({ queries: CASES }) });
-    const body = await res.json() as { segmenter: string; tokens: string[][] };
+    const body = await res.json() as {
+      segmenter: string;
+      tokens: string[][];
+      recallTerms: ReturnType<typeof tokenizeQueryDetailed>[];
+    };
     expect(body.segmenter).toBe("function");
     expect(body.tokens).toEqual(CASES.map(q => tokenizeQuery(q)));
+    expect(body.recallTerms).toEqual(CASES.map(q => tokenizeQueryDetailed(q)));
   });
 });

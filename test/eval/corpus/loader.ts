@@ -1,3 +1,5 @@
+import { EMBEDDING_PROFILE } from "../../../src/embedding/profile";
+import { acquireMemoryWriteAdmission, envWithMemoryWriteAdmission } from "../../../src/migration/write-lock";
 import { normalizeCaptureInput } from "../../../src/capture/entry";
 import { storeEntry } from "../../../src/capture/store";
 import { DEFAULTS } from "../../../src/config";
@@ -5,6 +7,7 @@ import { FTS_READY_KV_KEY } from "../../../src/constants";
 import { initializeDatabase, resetDatabaseInit } from "../../../src/db/init";
 import type { Env } from "../../../src/env";
 import { resetFtsReadyMemo } from "../../../src/recall/fts";
+import { QUERY_SIGNAL_CACHE_PREFIX } from "../../../src/recall/query-signal-cache";
 import { makeMemoryKV } from "../../helpers/make-env";
 import { EMBEDDING_DIMS, type ReplayAi } from "../ai-replay";
 import { openD1, type EvalD1 } from "../d1";
@@ -73,14 +76,18 @@ export async function loadCorpus(o: {
   const entries = o.spec.entries.map(e => ({ ...e, ...normalizeCaptureInput(e.content, e.tags) }));
   const d1 = await openD1(o.backend);
   try {
-    const kv = makeMemoryKV();
-    const vectorize = new ExactVectorize({ dimensions });
-    const env = {
-      DB: d1.db, OAUTH_KV: kv, VECTORIZE: vectorize as unknown as VectorizeIndex, AI: o.replay.ai, AUTH_TOKEN: "eval", VECTORIZE_GRACE_MS: "0",
+    const memoryKv = makeMemoryKV();
+    // forkのquery signal cacheは同じ検索の再実行でAI呼出しを省き、evalの費用計測を変えるため保存しない。
+    const kv = { ...memoryKv, put: (key: string, ...rest: unknown[]) => key.startsWith(QUERY_SIGNAL_CACHE_PREFIX)
+      ? Promise.resolve() : (memoryKv.put as (...args: unknown[]) => Promise<void>)(key, ...rest) } as KVNamespace;
+    const vectorize = new ExactVectorize({ dimensions: o.embeddingModel === EMBEDDING_PROFILE.model ? EMBEDDING_PROFILE.dimensions : dimensions });
+    let env = {
+      DB: d1.db, OAUTH_KV: kv, VECTORIZE: vectorize as unknown as Vectorize, AI: o.replay.ai, AUTH_TOKEN: "eval", VECTORIZE_GRACE_MS: "0",
     } as unknown as Env;
     resetDatabaseInit();
     resetFtsReadyMemo();
     await initializeDatabase(env);
+    env = Object.assign(envWithMemoryWriteAdmission(env, await acquireMemoryWriteAdmission(env)), env);
 
     const { edges } = o.spec;
     for (let i = 0; i < entries.length; i += 100) {

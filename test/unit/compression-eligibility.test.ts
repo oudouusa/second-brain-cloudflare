@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { compressionEligibilitySql, COMPRESSION_MIN_RECALL, isReservedTag, isTopicTag, isTopicTagSql } from "../../src/compression/eligibility";
+import { compressionEligibilitySql, COMPRESSION_MIN_RECALL, isReservedTag, isTopicTag, isTopicTagSql, isCompressionTag, isCompressionTagSql } from "../../src/compression/eligibility";
 import { STATUS_PREFIX } from "../../src/memory/status";
 import { KIND_PREFIX } from "../../src/memory/kind";
 import { VOLATILITY_PREFIX } from "../../src/memory/volatility";
@@ -137,8 +137,21 @@ describe("reserved tags", () => {
   });
 
   it("reserves the namespace, not the bare word", () => {
-    for (const tag of ["volatility", "stale", "status", "kind", "capsule", "capsule-slot", "project", "work"]) {
+    for (const tag of ["volatility", "stale", "status", "kind", "capsule", "capsule-slot", "project", "project-atlas", "work"]) {
       expect(isTopicTag(tag)).toBe(true); // a user may legitimately tag something "stale"
+    }
+  });
+
+  it("汎用分類タグは保存用に残し、大文字小文字を問わず要約の話題から外す", () => {
+    for (const tag of ["personal", "work", "task", "idea", "context", "codex-response"]) {
+      expect(isReservedTag(tag)).toBe(false);
+      expect(isTopicTag(tag)).toBe(true);
+      expect(isCompressionTag(tag)).toBe(false);
+      expect(isCompressionTag(tag.toUpperCase())).toBe(false);
+      expect(isCompressionTagSql()).toContain(`'${tag}'`);
+    }
+    for (const tag of ["work-notes", "task-runner", "personal-website", "context-menu", "project-atlas"]) {
+      expect(isCompressionTag(tag)).toBe(true);
     }
   });
 

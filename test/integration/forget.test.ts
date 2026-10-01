@@ -73,7 +73,10 @@ describe("POST /forget", () => {
   it("cascade-deletes edges touching the forgotten entry", async () => {
     t = await makeTrashEnv();
     t.seed("entry-1");
-    t.edge("e1", "entry-1", "other"); t.edge("e2", "another", "entry-1"); t.edge("e3", "x", "y");
+    for (const id of ["other", "another", "x", "y"]) t.seed(id);
+    await t.edge("e1", "entry-1", "other");
+    await t.edge("e2", "another", "entry-1");
+    await t.edge("e3", "x", "y");
     const res = await worker.fetch(req("POST", "/forget", { body: { id: "entry-1" } }), t.env, ctx);
     expect(res.status).toBe(200);
     // Edges with entry-1 as source OR target are removed; the unrelated edge survives — no dangling edges.

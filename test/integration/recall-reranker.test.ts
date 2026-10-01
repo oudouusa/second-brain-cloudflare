@@ -7,6 +7,7 @@ import { resetFtsReadyMemo } from "../../src/recall/fts";
 import { resetRerankReadyMemo } from "../../src/recall/model-reranker";
 import { recallEntries } from "../../src/recall/search";
 import type { RecallDiagnostics } from "../../src/recall/types";
+import { createNightlyD1Budget } from "../../src/runtime/d1-budget";
 import { TAG_VOCABULARY_KEY } from "../../src/tags/vocabulary";
 import { makeMemoryKV, makeTestEnv, makeVectorizeMock } from "../helpers/make-env";
 import { makeSqliteD1, type SqliteD1 } from "../helpers/sqlite-d1";
@@ -24,9 +25,7 @@ describe("recall reranker step", () => {
     resetFtsReadyMemo();
     const sqlite = makeSqliteD1();
     open.push(sqlite);
-    await sqlite.db.prepare(`ALTER TABLE entries ADD COLUMN updated_at INTEGER`).run();
-    await sqlite.db.prepare(`ALTER TABLE entries ADD COLUMN valid_from INTEGER`).run();
-    await sqlite.db.prepare(`ALTER TABLE entries ADD COLUMN valid_until INTEGER`).run();
+    if (!sqlite.columns().includes("updated_at")) await sqlite.db.prepare(`ALTER TABLE entries ADD COLUMN updated_at INTEGER`).run();
     IDS.forEach((id, i) => sqlite.seed({ id, content: CONTENT[id], createdAt: 1000 + i, tags: ["work"] }));
     const kv = makeMemoryKV();
     await kv.put(TAG_VOCABULARY_KEY, JSON.stringify({ tags: ["work"], rebuiltAt: Date.now() }));
@@ -39,7 +38,7 @@ describe("recall reranker step", () => {
         if (o.scorer === "hang") return new Promise(() => {});
         return (o.scorer ?? ((c: { text: string }[]) => ({ response: c.map((_, id) => ({ id, score: id })) })))(input.contexts);
       }
-      if (model.startsWith("@cf/baai/bge")) return { data: [new Array(384).fill(0.1)] };
+      if (model === "@cf/google/embeddinggemma-300m") return { data: [new Array(768).fill(0.1)] };
       return new ReadableStream({ start(c) { c.enqueue(new TextEncoder().encode('data: {"response":"3"}\n\n')); c.enqueue(new TextEncoder().encode("data: [DONE]\n\n")); c.close(); } });
     });
     const matches = [
@@ -61,6 +60,22 @@ describe("recall reranker step", () => {
     await Promise.all(s.deferred);
     return { result, diagnostics };
   }
+
+  it("rerankerの本文読取もD1予算に計上し既存の30文以内に収める", async () => {
+    const offFixture = await setup();
+    const offBudget = createNightlyD1Budget(offFixture.env, 30);
+    offFixture.env = offBudget.env;
+    const off = await recall(offFixture, "off");
+    const onFixture = await setup();
+    const onBudget = createNightlyD1Budget(onFixture.env, 30);
+    onFixture.env = onBudget.env;
+    const on = await recall(onFixture, "on");
+    expect(on.diagnostics.rerankRoute).toBe("applied");
+    expect(onBudget.stats().used).toBe(offBudget.stats().used + 1);
+    expect(on.diagnostics.operations?.d1Statements).toBe(off.diagnostics.operations!.d1Statements + 1);
+    expect(onBudget.stats().used).toBeLessThanOrEqual(30);
+    expect(onBudget.stats().deferred).toBe(0);
+  });
 
   it("off never calls the model, on scores one batch and reorders within the bounded blend", async () => {
     const off = await recall(await setup(), "off");
@@ -135,6 +150,8 @@ describe("recall reranker step", () => {
     try {
       const s = await setup({ scorer: scorer as never });
       const pending = recall(s, "on");
+      // HMACは実非同期処理なので、モデル開始を待ってから仮想時間を進める。
+      await vi.waitFor(() => expect(s.rerankInputs).toHaveLength(1));
       await vi.advanceTimersByTimeAsync(10_000);
       const got = await pending;
       expect(got.diagnostics.rerankRoute).toBe(route);
@@ -258,7 +275,7 @@ describe("recall reranker step", () => {
   });
 
   it("an unavailable corpus total means not evidence, and says so in the diagnostics", async () => {
-    const r = await singleTermCorpus(3, 160, { limit: 50, breakCounts: true });
+    const r = await singleTermCorpus(30, 160, { limit: 50, breakCounts: true });
     expect(r.sent).toEqual(r.head);
     expect(r.diagnostics.rerankEvidence).toBe("suppressed-no-total");
   });
@@ -273,6 +290,7 @@ describe("recall reranker step", () => {
         const s = await setup({ scorer: slow as never });
         const diagnostics: RecallDiagnostics = {};
         const pending = recallEntries({ query: "launch planning tomato", topK: 5, hops: 0, synthesize: false }, s.env, s.ctx, { ...DEFAULTS, RERANK_MODE: "on" }, { diagnostics, ...(tuning && { variant: { rerankTuning: tuning } }) });
+        await vi.waitFor(() => expect(s.rerankInputs).toHaveLength(1));
         await vi.advanceTimersByTimeAsync(5000);
         await pending;
         return diagnostics.rerankRoute;

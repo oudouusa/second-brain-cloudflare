@@ -1,7 +1,11 @@
+import { afterEach } from "vitest";
+import { chatGptResponse, mockChatGptFetch } from "../helpers/chatgpt-provider";
+afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 import { describe, it, expect, vi } from "vitest";
 import { checkDuplicateAndContradiction } from "../../src/capture/duplicate";
 import type { MergeAction } from "../../src/capture/duplicate";
 import { makeTestDb, makeVectorizeMock, makeKVMock } from "../helpers/make-env";
+import { embeddingMetadata } from "../../src/embedding/profile";
 import type { Env } from "../../src/env";
 
 function makeEnv(aiResponse: string, vectorMatches: any[] = [], dbEntries: any[] = []): Env {
@@ -14,8 +18,8 @@ function makeEnv(aiResponse: string, vectorMatches: any[] = [], dbEntries: any[]
     }),
     AI: {
       run: vi.fn().mockImplementation(async (model: string) => {
-        if (model === "@cf/baai/bge-small-en-v1.5")
-          return { data: [new Array(384).fill(0.1)] };
+        if (model === "@cf/google/embeddinggemma-300m")
+          return { data: [new Array(768).fill(0.1)] };
         return new ReadableStream({
           start(c) {
             c.enqueue(new TextEncoder().encode(`data: {"response":${JSON.stringify(aiResponse)}}\n\n`));
@@ -35,7 +39,7 @@ function entry(id: string, content: string) {
 }
 
 function match(id: string, score: number) {
-  return { id, score, metadata: { parentId: id } };
+  return { id, score, metadata: { parentId: id, ...embeddingMetadata() } };
 }
 
 describe("checkDuplicateAndContradiction()", () => {
@@ -98,7 +102,7 @@ describe("checkDuplicateAndContradiction()", () => {
       }),
       AI: {
         run: vi.fn().mockImplementation(async (model: string) => {
-          if (model === "@cf/baai/bge-small-en-v1.5") return { data: [new Array(384).fill(0.1)] };
+          if (model === "@cf/google/embeddinggemma-300m") return { data: [new Array(768).fill(0.1)] };
           throw new Error("AI service unavailable");
         }),
       } as unknown as Ai,
@@ -110,8 +114,8 @@ describe("checkDuplicateAndContradiction()", () => {
   });
 
   it("returns blocked duplicate and skips contradiction check", async () => {
-    const queryFn = vi.fn().mockResolvedValue({ matches: [match("a", 0.96)] });
-    const env = makeEnv("", [match("a", 0.96)], [entry("a", "Original content")]);
+    const queryFn = vi.fn().mockResolvedValue({ matches: [match("a", 0.99)] });
+    const env = makeEnv("", [match("a", 0.99)], [entry("a", "Original content")]);
     (env.VECTORIZE as any).query = queryFn;
     const { duplicate, contradiction } = await checkDuplicateAndContradiction("Original content", env);
     expect(duplicate.status).toBe("blocked");
@@ -128,7 +132,7 @@ describe("checkDuplicateAndContradiction()", () => {
     expect(mergeAction).toEqual({ action: "keep_both" });
   });
 
-  // ── Smart merge (flagged band 0.85–0.95) ────────────────────────────────────
+  // ── Smart merge (calibrated flagged band 0.80–0.98) ─────────────────────────
 
   it("returns mergeAction=keep_both for flagged entry when LLM says keep_both", async () => {
     const env = makeEnv('{"action":"keep_both"}', [match("near", 0.88)], [entry("near", "I prefer dark mode")]);
@@ -182,7 +186,7 @@ describe("checkDuplicateAndContradiction()", () => {
       }),
       AI: {
         run: vi.fn().mockImplementation(async (model: string) => {
-          if (model === "@cf/baai/bge-small-en-v1.5") return { data: [new Array(384).fill(0.1)] };
+          if (model === "@cf/google/embeddinggemma-300m") return { data: [new Array(768).fill(0.1)] };
           throw new Error("AI unavailable");
         }),
       } as unknown as Ai,
@@ -241,13 +245,13 @@ describe("checkDuplicateAndContradiction()", () => {
   });
 
   it("returns mergeAction=null for blocked entries", async () => {
-    const env = makeEnv("", [match("a", 0.97)], [entry("a", "Original content")]);
+    const env = makeEnv("", [match("a", 0.99)], [entry("a", "Original content")]);
     const { mergeAction, contradiction } = await checkDuplicateAndContradiction("Original content", env);
     expect(mergeAction).toBeNull();
     expect(contradiction.detected).toBe(false);
   });
 
-  it("uses contradiction-only prompt (not combined) for 0.45–0.85 range", async () => {
+  it("uses contradiction-only prompt (not combined) for 0.45–0.80 range", async () => {
     // AI mock returns old contradiction format — should still be parsed correctly
     const env = makeEnv(
       '{"contradicts": true, "conflicting_id": "abc123", "reason": "different city"}',
@@ -258,5 +262,33 @@ describe("checkDuplicateAndContradiction()", () => {
     expect(contradiction.detected).toBe(true);
     expect(contradiction.conflicting_id).toBe("abc123");
     expect(mergeAction).toBeNull();
+  });
+});
+
+describe("ChatGPT直接接続の保存判断境界", () => {
+  it.each([
+    ['{"action":"merge","target_id":"a","merged_content":"kept condition"}', "stop", "merge"],
+    ['{"action":"replace","target_id":"a"}', "length", "keep_both"],
+    ['{"action":"replace","target_id":"unoffered"}', "stop", "keep_both"],
+    ['{"action":"merge","target_id":"a","merged_content":42}', "stop", "keep_both"],
+    ['{"action":"merge","target_id":"a","merged_content":"' + 'x'.repeat(401) + '"}', "stop", "keep_both"],
+  ])("不完全・範囲外の統合結果を使わない", async (content, finishReason, expected) => {
+    const env = makeEnv("must not call Scout", [match("a", 0.85)], [{ ...entry("a", "original"), workspace_id: "owner-personal" }]);
+    const fetch = mockChatGptFetch(vi.fn().mockImplementation(async () => chatGptResponse(content, finishReason)));
+    env.CHATGPT_OPERATIONS = "smart-merge,contradiction";
+    env.CHATGPT_OWNER_WORKSPACE_ID = "owner-personal";
+    const result = await checkDuplicateAndContradiction("new", env, undefined, "owner-personal");
+    expect(result.mergeAction?.action).toBe(expected);
+    expect(fetch).toHaveBeenCalledOnce();
+    expect(JSON.parse(fetch.mock.calls[0][1].body).model).toBe("gpt-5.6-terra");
+    expect((env.AI.run as ReturnType<typeof vi.fn>).mock.calls.every(([model]) => model === "@cf/google/embeddinggemma-300m")).toBe(true);
+  });
+  it("直接接続障害時にScoutを使わない", async () => {
+    const env = makeEnv("must not call Scout", [match("a", 0.72)], [{ ...entry("a", "original"), workspace_id: "owner-personal" }]);
+    mockChatGptFetch(vi.fn().mockRejectedValue(new Error("offline")));
+    env.CHATGPT_OPERATIONS = "smart-merge,contradiction";
+    env.CHATGPT_OWNER_WORKSPACE_ID = "owner-personal";
+    expect((await checkDuplicateAndContradiction("new", env, undefined, "owner-personal")).contradiction.detected).toBe(false);
+    expect((env.AI.run as ReturnType<typeof vi.fn>).mock.calls.every(([model]) => model === "@cf/google/embeddinggemma-300m")).toBe(true);
   });
 });

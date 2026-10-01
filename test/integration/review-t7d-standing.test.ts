@@ -39,7 +39,7 @@ async function setup() {
   const sqlite = makeSqliteD1();
   open.push(sqlite);
   const kv = makeMemoryKV();
-  const env: Env = makeTestEnv(undefined, {
+  let env: Env = sqlite.admitEnv(makeTestEnv(undefined, {
     DB: sqlite.db as unknown as D1Database,
     OAUTH_KV: kv,
     VECTORIZE: makeVectorizeMock({
@@ -48,8 +48,9 @@ async function setup() {
       getByIds: vi.fn(async (ids: string[]) =>
         ids.map(id => ({ id, values: id === "v" ? [1, 0, 0] : [0, 1, 0] })) as any),
     }),
-  });
+  }));
   await initializeDatabase(env);
+    env = sqlite.admitEnv(env);
   return { env, sqlite, kv };
 }
 

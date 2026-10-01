@@ -29,7 +29,7 @@ describe("forgetEntry", () => {
     // The row is deleted between forget's read and its batch.
     const real = t.sqlite.db.batch.bind(t.sqlite.db);
     (t.sqlite.db as any).batch = async (stmts: unknown[]) => {
-      await t.sqlite.db.prepare(`DELETE FROM entries WHERE id = 'x'`).run();
+      await t.sqlite.deleteFixtureRows(`DELETE FROM entries WHERE id = 'x'`);
       return real(stmts as any);
     };
     expect(await forget("x")).toEqual({ status: "not_found" });

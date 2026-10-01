@@ -72,7 +72,7 @@ async function makeEnv(vectorize: ReturnType<typeof makeVectorizeMock>) {
   resetDatabaseInit();
   await initializeDatabase(env);
   const roots = await ensureTenantBootstrap(env);
-  return { env, roots };
+  return { env: d1.admitEnv(env), roots };
 }
 
 // Deliberately shares no word with any fixture content in this file, so the
@@ -95,7 +95,7 @@ describe("#347 scoped recall visibility genuinely depends on the vector re-stamp
     const { id } = await env.DB.prepare(`SELECT id FROM entries WHERE source = 'notion' LIMIT 1`).first<{ id: string }>() ?? {};
     expect(id).toBeTruthy();
 
-    const before = await worker.fetch(req("GET", `/recall?query=${QUERY}`, { token: bob.token }), env, makeCtx().ctx);
+    const before = await worker.fetch(req("POST", "/recall", { token: bob.token, body: { query: QUERY } }), env, makeCtx().ctx);
     expect(before.status).toBe(200);
     const beforeIds = ((await before.json()) as any).results.map((r: any) => r.id);
     expect(beforeIds).not.toContain(id); // owner's personal metadata is not in Bob's $in set
@@ -121,7 +121,7 @@ describe("#347 scoped recall visibility genuinely depends on the vector re-stamp
     expect(moveData.vectorFailures).toBe(0);
     await moveCall.drain();
 
-    const after = await worker.fetch(req("GET", `/recall?query=${QUERY}`, { token: bob.token }), env, makeCtx().ctx);
+    const after = await worker.fetch(req("POST", "/recall", { token: bob.token, body: { query: QUERY } }), env, makeCtx().ctx);
     expect(after.status).toBe(200);
     const afterIds = ((await after.json()) as any).results.map((r: any) => r.id);
     expect(afterIds).toContain(id); // now filtered IN, because the metadata itself changed
@@ -159,7 +159,7 @@ describe("#347 scoped recall visibility genuinely depends on the vector re-stamp
     expect(firstData.moved).toBe(1); // D1 committed regardless of Vectorize's outage
     expect(firstData.vectorFailures).toBe(1); // and the response says so — not a clean success
 
-    const midway = await worker.fetch(req("GET", `/recall?query=${QUERY}`, { token: bob.token }), env, makeCtx().ctx);
+    const midway = await worker.fetch(req("POST", "/recall", { token: bob.token, body: { query: QUERY } }), env, makeCtx().ctx);
     const midwayIds = ((await midway.json()) as any).results.map((r: any) => r.id);
     expect(midwayIds).not.toContain(id); // moved in D1, but still invisible on the metadata-gated path
 
@@ -177,7 +177,7 @@ describe("#347 scoped recall visibility genuinely depends on the vector re-stamp
     expect(secondData.alreadyThere).toBe(1); // idempotent: the D1 row was already correct
     expect(secondData.vectorFailures).toBe(0); // and this run repaired the vector metadata
 
-    const after = await worker.fetch(req("GET", `/recall?query=${QUERY}`, { token: bob.token }), env, makeCtx().ctx);
+    const after = await worker.fetch(req("POST", "/recall", { token: bob.token, body: { query: QUERY } }), env, makeCtx().ctx);
     const afterIds = ((await after.json()) as any).results.map((r: any) => r.id);
     expect(afterIds).toContain(id);
   });

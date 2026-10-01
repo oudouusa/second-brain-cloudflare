@@ -25,7 +25,7 @@ exports[`internal.variant.arms > matches the unmodified SQL, top-k IDs, and stab
       "SELECT name, sql FROM sqlite_master WHERE (type = 'table' AND name = 'entries_fts') OR (type = 'trigger' AND name IN ('entries_fts_insert','entries_fts_update','entries_fts_delete'))",
       "WITH s AS MATERIALIZED (SELECT e.id, e.created_at, e.tags, e.source, lower(e.content) AS lc, 0 AS sh, bm25(entries_fts) AS rk, entries_fts.rowid AS ord
        FROM entries_fts JOIN entries e ON e.rowid = entries_fts.rowid AND e.id = entries_fts.id
-       WHERE entries_fts MATCH ? AND (e.valid_until IS NULL OR e.valid_until > ?) AND tags NOT LIKE '%"quarantine:instruction"%' ESCAPE '\\' AND tags NOT LIKE '%"quarantine:hidden"%' ESCAPE '\\' AND tags NOT LIKE '%"quarantine:burst"%' ESCAPE '\\' AND tags NOT LIKE '%"quarantine:capsule"%' ESCAPE '\\' AND tags NOT LIKE '%"quarantine:too\\_long"%' ESCAPE '\\'
+       WHERE entries_fts MATCH ? AND (e.valid_until IS NULL OR e.valid_until > ?) AND tags NOT LIKE '%"quarantine:instruction"%' ESCAPE '\\' AND tags NOT LIKE '%"quarantine:hidden"%' ESCAPE '\\' AND tags NOT LIKE '%"quarantine:burst"%' ESCAPE '\\' AND tags NOT LIKE '%"quarantine:capsule"%' ESCAPE '\\' AND tags NOT LIKE '%"quarantine:too\\_long"%' ESCAPE '\\' AND tags NOT LIKE '%"auto-pattern"%' AND tags NOT LIKE '%"auto-insight"%' AND tags NOT LIKE '%"status:deprecated"%'
        ORDER BY sh DESC, rk, ord LIMIT ?)
     SELECT id, created_at, tags, source, l0, l1, fl FROM (
       SELECT id, created_at, tags, source, sh, rk, ord, CASE WHEN p0 = 0 THEN 0 WHEN (substr(lc, p0 - 1, 1) NOT GLOB '[A-Za-z0-9_]' AND substr(lc, p0 + 6, 1) NOT GLOB '[A-Za-z0-9_]') THEN 2 WHEN q0 = 0 THEN 1 WHEN (substr(lc, (p0 + q0) - 1, 1) NOT GLOB '[A-Za-z0-9_]' AND substr(lc, (p0 + q0) + 6, 1) NOT GLOB '[A-Za-z0-9_]') THEN 2 ELSE 1 END AS l0, CASE WHEN p1 = 0 THEN 0 WHEN (substr(lc, p1 - 1, 1) NOT GLOB '[A-Za-z0-9_]' AND substr(lc, p1 + 6, 1) NOT GLOB '[A-Za-z0-9_]') THEN 2 WHEN q1 = 0 THEN 1 WHEN (substr(lc, (p1 + q1) - 1, 1) NOT GLOB '[A-Za-z0-9_]' AND substr(lc, (p1 + q1) + 6, 1) NOT GLOB '[A-Za-z0-9_]') THEN 2 ELSE 1 END AS l1, fl FROM (
@@ -40,13 +40,15 @@ exports[`internal.variant.arms > matches the unmodified SQL, top-k IDs, and stab
     "candidateIds": [
       "dense-doc",
     ],
+    "collapsedDirectRolloverIds": [],
+    "collapsedGraphRolloverIds": [],
     "corpusIdfUsed": true,
     "denseIds": [
       "dense-doc",
     ],
     "distillSource": "fts",
     "eligibleRelatedIds": [],
-    "embeddingMode": "distilled",
+    "embeddingMode": "semantic",
     "finalIds": [
       "dense-doc",
     ],
@@ -57,17 +59,19 @@ exports[`internal.variant.arms > matches the unmodified SQL, top-k IDs, and stab
     ],
     "keywordIds": [],
     "lexicalArmSkipped": false,
+    "lineageFallbackUsed": false,
     "operations": {
       "aiCalls": 1,
       "d1RowsRead": null,
-      "d1RowsWritten": 0,
-      "d1Statements": 6,
+      "d1RowsWritten": 2,
+      "d1Statements": 12,
       "embeddingCalls": 1,
-      "kvReads": 3,
-      "kvWrites": 1,
+      "kvReads": 5,
+      "kvWrites": 2,
       "vectorizeGets": 0,
       "vectorizeQueries": 1,
     },
+    "promotedDirectRolloverIds": [],
     "rerankRoute": "too-few",
     "retrievalTokenCount": 2,
     "selectedRelatedIds": [],
@@ -76,10 +80,41 @@ exports[`internal.variant.arms > matches the unmodified SQL, top-k IDs, and stab
     "dense-doc",
   ],
   "sql": [
-    "BATCH",
+    "WITH RECURSIVE g AS MATERIALIZED (
+       SELECT total, everyone, max(CAST(0.3 * total AS INTEGER) + 1, 2001) AS cap
+       FROM (SELECT COALESCE(SUM(CASE WHEN 1 THEN n END), 0) AS total, max(COALESCE(SUM(n), 0), 1) AS everyone FROM entry_counts)
+     ),
+     walk(i, total, cap, everyone, m0, m1, e) AS (
+       SELECT 0, total, cap, everyone, cap, cap, CASE WHEN 2 * cap > total THEN min(cap, coalesce((SELECT doc FROM entries_fts_vocab WHERE term = json_extract(?1, '$[' || (0) || ']')), 0) * total / everyone) END FROM g
+       UNION ALL
+       SELECT w.i + 1, total, cap, everyone, CASE WHEN (json_extract(?2, '$[' || w.i || ']') >> 0) & 1 THEN min(m0, e) ELSE m0 END, CASE WHEN (json_extract(?2, '$[' || w.i || ']') >> 1) & 1 THEN min(m1, e) ELSE m1 END,
+         CASE WHEN CASE WHEN (json_extract(?2, '$[' || w.i || ']') >> 0) & 1 THEN min(m0, e) ELSE m0 END + CASE WHEN (json_extract(?2, '$[' || w.i || ']') >> 1) & 1 THEN min(m1, e) ELSE m1 END > total AND w.i + 1 < 8 THEN min(cap, coalesce((SELECT doc FROM entries_fts_vocab WHERE term = json_extract(?1, '$[' || (w.i + 1) || ']')), 0) * total / everyone) END
+       FROM walk w WHERE w.e IS NOT NULL
+     ),
+     p AS MATERIALIZED (SELECT total, cap, (SELECT min(m0 + m1) > total FROM walk) AS scan FROM g)
+     SELECT total, CASE WHEN scan THEN NULL ELSE (SELECT count(*) FROM (SELECT 1 FROM entries_fts JOIN entries e ON e.rowid = entries_fts.rowid AND e.id = entries_fts.id WHERE entries_fts MATCH ?5 AND e.content LIKE ?3 ESCAPE '\\' LIMIT (SELECT cap FROM g))) END AS n0, CASE WHEN scan THEN NULL ELSE (SELECT count(*) FROM (SELECT 1 FROM entries_fts JOIN entries e ON e.rowid = entries_fts.rowid AND e.id = entries_fts.id WHERE entries_fts MATCH ?6 AND e.content LIKE ?4 ESCAPE '\\' LIMIT (SELECT cap FROM g))) END AS n1,
+       CASE WHEN scan THEN (SELECT json_array(COUNT(*), SUM(CASE WHEN content LIKE ?3 ESCAPE '\\' THEN 1 ELSE 0 END), SUM(CASE WHEN content LIKE ?4 ESCAPE '\\' THEN 1 ELSE 0 END)) FROM entries) END AS scanned
+     FROM p",
+    "SELECT name, sql FROM sqlite_master WHERE (type = 'table' AND name = 'entries_fts') OR (type = 'trigger' AND name IN ('entries_fts_insert','entries_fts_update','entries_fts_delete'))",
+    "SELECT generation FROM embedding_migration_generation WHERE id = ?",
+    "INSERT INTO embedding_migration_generation (id, generation) VALUES (?, ?)
+     ON CONFLICT(id) DO NOTHING",
+    "SELECT generation FROM embedding_migration_generation WHERE id = ?",
+    "SELECT generation FROM embedding_migration_generation WHERE id = ?",
     "SELECT DISTINCT value FROM entries, json_each(entries.tags)",
-    "BATCH",
-    "SELECT id, source, recall_count, importance_score, contradiction_wins, contradiction_losses, tags, workspace_id, actor_id, valid_until FROM entries WHERE id IN (?)",
+    "SELECT name, sql FROM sqlite_master WHERE (type = 'table' AND name = 'entries_fts') OR (type = 'trigger' AND name IN ('entries_fts_insert','entries_fts_update','entries_fts_delete'))",
+    "WITH s AS MATERIALIZED (SELECT e.id, e.created_at, e.tags, e.source, lower(e.content) AS lc, 0 AS sh, bm25(entries_fts) AS rk, entries_fts.rowid AS ord
+       FROM entries_fts JOIN entries e ON e.rowid = entries_fts.rowid AND e.id = entries_fts.id
+       WHERE entries_fts MATCH ? AND (e.valid_until IS NULL OR e.valid_until > ?) AND tags NOT LIKE '%"quarantine:instruction"%' ESCAPE '\\' AND tags NOT LIKE '%"quarantine:hidden"%' ESCAPE '\\' AND tags NOT LIKE '%"quarantine:burst"%' ESCAPE '\\' AND tags NOT LIKE '%"quarantine:capsule"%' ESCAPE '\\' AND tags NOT LIKE '%"quarantine:too\\_long"%' ESCAPE '\\' AND tags NOT LIKE '%"auto-pattern"%' AND tags NOT LIKE '%"auto-insight"%' AND tags NOT LIKE '%"status:deprecated"%'
+       ORDER BY sh DESC, rk, ord LIMIT ?)
+    SELECT id, created_at, tags, source, l0, l1, fl FROM (
+      SELECT id, created_at, tags, source, sh, rk, ord, CASE WHEN p0 = 0 THEN 0 WHEN (substr(lc, p0 - 1, 1) NOT GLOB '[A-Za-z0-9_]' AND substr(lc, p0 + 6, 1) NOT GLOB '[A-Za-z0-9_]') THEN 2 WHEN q0 = 0 THEN 1 WHEN (substr(lc, (p0 + q0) - 1, 1) NOT GLOB '[A-Za-z0-9_]' AND substr(lc, (p0 + q0) + 6, 1) NOT GLOB '[A-Za-z0-9_]') THEN 2 ELSE 1 END AS l0, CASE WHEN p1 = 0 THEN 0 WHEN (substr(lc, p1 - 1, 1) NOT GLOB '[A-Za-z0-9_]' AND substr(lc, p1 + 6, 1) NOT GLOB '[A-Za-z0-9_]') THEN 2 WHEN q1 = 0 THEN 1 WHEN (substr(lc, (p1 + q1) - 1, 1) NOT GLOB '[A-Za-z0-9_]' AND substr(lc, (p1 + q1) + 6, 1) NOT GLOB '[A-Za-z0-9_]') THEN 2 ELSE 1 END AS l1, fl FROM (
+        SELECT id, created_at, tags, source, sh, rk, ord, lc, p0, p1, instr(substr(lc, p0 + 1), ?4) AS q0, instr(substr(lc, p1 + 1), ?5) AS q1, fl FROM (
+          SELECT id, created_at, tags, source, sh, rk, ord, lc, instr(lc, ?4) AS p0, instr(lc, ?5) AS p1, (instr(lc, char(8490)) > 0 OR instr(lc, char(304)) > 0) AS fl FROM s
+        )
+      )
+    ) ORDER BY sh DESC, rk, ord",
+    "SELECT id, created_at, recall_count, importance_score, contradiction_wins, contradiction_losses, tags, memory_tier, workspace_id, actor_id, valid_until FROM entries WHERE id IN (?)",
     "SELECT id, content, tags, source, created_at, updated_at, workspace_id, actor_id, valid_from, valid_until,
               CASE WHEN entries.valid_until IS NULL THEN NULL ELSE (SELECT json_object('id', s.id, 'preview', substr(s.content, 1, 60))
        FROM edges g CROSS JOIN entries s ON s.id = g.source_id
@@ -90,7 +125,8 @@ exports[`internal.variant.arms > matches the unmodified SQL, top-k IDs, and stab
         AND COALESCE(s.valid_from, s.created_at) = entries.valid_until
       ORDER BY s.created_at DESC LIMIT 1) END AS superseded_by_json
          FROM entries WHERE id IN (?) AND tags NOT LIKE '%"auto-pattern"%' AND tags NOT LIKE '%"auto-insight"%' AND tags NOT LIKE '%"status:deprecated"%' AND (valid_until IS NULL OR valid_until > ?) AND tags NOT LIKE '%"quarantine:instruction"%' ESCAPE '\\' AND tags NOT LIKE '%"quarantine:hidden"%' ESCAPE '\\' AND tags NOT LIKE '%"quarantine:burst"%' ESCAPE '\\' AND tags NOT LIKE '%"quarantine:capsule"%' ESCAPE '\\' AND tags NOT LIKE '%"quarantine:too\\_long"%' ESCAPE '\\'",
-    "UPDATE entries SET recall_count = recall_count + 1 WHERE id IN (?)",
+    "UPDATE entries SET recall_count = recall_count + 1, last_recalled_at = ?, write_marker = ?
+        WHERE id IN (SELECT value FROM json_each(?))",
   ],
 }
 `;
@@ -120,7 +156,7 @@ exports[`internal.variant.arms > matches the unmodified SQL, top-k IDs, and stab
       "SELECT name, sql FROM sqlite_master WHERE (type = 'table' AND name = 'entries_fts') OR (type = 'trigger' AND name IN ('entries_fts_insert','entries_fts_update','entries_fts_delete'))",
       "WITH s AS MATERIALIZED (SELECT e.id, e.created_at, e.tags, e.source, lower(e.content) AS lc, 0 AS sh, bm25(entries_fts) AS rk, entries_fts.rowid AS ord
        FROM entries_fts JOIN entries e ON e.rowid = entries_fts.rowid AND e.id = entries_fts.id
-       WHERE entries_fts MATCH ? AND (e.valid_until IS NULL OR e.valid_until > ?) AND tags NOT LIKE '%"quarantine:instruction"%' ESCAPE '\\' AND tags NOT LIKE '%"quarantine:hidden"%' ESCAPE '\\' AND tags NOT LIKE '%"quarantine:burst"%' ESCAPE '\\' AND tags NOT LIKE '%"quarantine:capsule"%' ESCAPE '\\' AND tags NOT LIKE '%"quarantine:too\\_long"%' ESCAPE '\\'
+       WHERE entries_fts MATCH ? AND (e.valid_until IS NULL OR e.valid_until > ?) AND tags NOT LIKE '%"quarantine:instruction"%' ESCAPE '\\' AND tags NOT LIKE '%"quarantine:hidden"%' ESCAPE '\\' AND tags NOT LIKE '%"quarantine:burst"%' ESCAPE '\\' AND tags NOT LIKE '%"quarantine:capsule"%' ESCAPE '\\' AND tags NOT LIKE '%"quarantine:too\\_long"%' ESCAPE '\\' AND tags NOT LIKE '%"auto-pattern"%' AND tags NOT LIKE '%"auto-insight"%' AND tags NOT LIKE '%"status:deprecated"%'
        ORDER BY sh DESC, rk, ord LIMIT ?)
     SELECT id, created_at, tags, source, l0, l1, fl FROM (
       SELECT id, created_at, tags, source, sh, rk, ord, CASE WHEN p0 = 0 THEN 0 WHEN (substr(lc, p0 - 1, 1) NOT GLOB '[A-Za-z0-9_]' AND substr(lc, p0 + 8, 1) NOT GLOB '[A-Za-z0-9_]') THEN 2 WHEN q0 = 0 THEN 1 WHEN (substr(lc, (p0 + q0) - 1, 1) NOT GLOB '[A-Za-z0-9_]' AND substr(lc, (p0 + q0) + 8, 1) NOT GLOB '[A-Za-z0-9_]') THEN 2 ELSE 1 END AS l0, CASE WHEN p1 = 0 THEN 0 WHEN (substr(lc, p1 - 1, 1) NOT GLOB '[A-Za-z0-9_]' AND substr(lc, p1 + 8, 1) NOT GLOB '[A-Za-z0-9_]') THEN 2 WHEN q1 = 0 THEN 1 WHEN (substr(lc, (p1 + q1) - 1, 1) NOT GLOB '[A-Za-z0-9_]' AND substr(lc, (p1 + q1) + 8, 1) NOT GLOB '[A-Za-z0-9_]') THEN 2 ELSE 1 END AS l1, fl FROM (
@@ -135,13 +171,15 @@ exports[`internal.variant.arms > matches the unmodified SQL, top-k IDs, and stab
     "candidateIds": [
       "dense-doc",
     ],
+    "collapsedDirectRolloverIds": [],
+    "collapsedGraphRolloverIds": [],
     "corpusIdfUsed": true,
     "denseIds": [
       "dense-doc",
     ],
     "distillSource": "fts",
     "eligibleRelatedIds": [],
-    "embeddingMode": "distilled",
+    "embeddingMode": "semantic",
     "finalIds": [
       "dense-doc",
     ],
@@ -154,17 +192,19 @@ exports[`internal.variant.arms > matches the unmodified SQL, top-k IDs, and stab
       "dense-doc",
     ],
     "lexicalArmSkipped": false,
+    "lineageFallbackUsed": false,
     "operations": {
       "aiCalls": 1,
       "d1RowsRead": null,
-      "d1RowsWritten": 0,
-      "d1Statements": 6,
+      "d1RowsWritten": 2,
+      "d1Statements": 12,
       "embeddingCalls": 1,
-      "kvReads": 3,
-      "kvWrites": 1,
+      "kvReads": 5,
+      "kvWrites": 2,
       "vectorizeGets": 0,
       "vectorizeQueries": 1,
     },
+    "promotedDirectRolloverIds": [],
     "rerankRoute": "too-few",
     "retrievalTokenCount": 2,
     "selectedRelatedIds": [],
@@ -173,10 +213,41 @@ exports[`internal.variant.arms > matches the unmodified SQL, top-k IDs, and stab
     "dense-doc",
   ],
   "sql": [
-    "BATCH",
+    "WITH RECURSIVE g AS MATERIALIZED (
+       SELECT total, everyone, max(CAST(0.3 * total AS INTEGER) + 1, 2001) AS cap
+       FROM (SELECT COALESCE(SUM(CASE WHEN 1 THEN n END), 0) AS total, max(COALESCE(SUM(n), 0), 1) AS everyone FROM entry_counts)
+     ),
+     walk(i, total, cap, everyone, m0, m1, e) AS (
+       SELECT 0, total, cap, everyone, cap, cap, CASE WHEN 2 * cap > total THEN min(cap, coalesce((SELECT doc FROM entries_fts_vocab WHERE term = json_extract(?1, '$[' || (0) || ']')), 0) * total / everyone) END FROM g
+       UNION ALL
+       SELECT w.i + 1, total, cap, everyone, CASE WHEN (json_extract(?2, '$[' || w.i || ']') >> 0) & 1 THEN min(m0, e) ELSE m0 END, CASE WHEN (json_extract(?2, '$[' || w.i || ']') >> 1) & 1 THEN min(m1, e) ELSE m1 END,
+         CASE WHEN CASE WHEN (json_extract(?2, '$[' || w.i || ']') >> 0) & 1 THEN min(m0, e) ELSE m0 END + CASE WHEN (json_extract(?2, '$[' || w.i || ']') >> 1) & 1 THEN min(m1, e) ELSE m1 END > total AND w.i + 1 < 12 THEN min(cap, coalesce((SELECT doc FROM entries_fts_vocab WHERE term = json_extract(?1, '$[' || (w.i + 1) || ']')), 0) * total / everyone) END
+       FROM walk w WHERE w.e IS NOT NULL
+     ),
+     p AS MATERIALIZED (SELECT total, cap, (SELECT min(m0 + m1) > total FROM walk) AS scan FROM g)
+     SELECT total, CASE WHEN scan THEN NULL ELSE (SELECT count(*) FROM (SELECT 1 FROM entries_fts JOIN entries e ON e.rowid = entries_fts.rowid AND e.id = entries_fts.id WHERE entries_fts MATCH ?5 AND e.content LIKE ?3 ESCAPE '\\' LIMIT (SELECT cap FROM g))) END AS n0, CASE WHEN scan THEN NULL ELSE (SELECT count(*) FROM (SELECT 1 FROM entries_fts JOIN entries e ON e.rowid = entries_fts.rowid AND e.id = entries_fts.id WHERE entries_fts MATCH ?6 AND e.content LIKE ?4 ESCAPE '\\' LIMIT (SELECT cap FROM g))) END AS n1,
+       CASE WHEN scan THEN (SELECT json_array(COUNT(*), SUM(CASE WHEN content LIKE ?3 ESCAPE '\\' THEN 1 ELSE 0 END), SUM(CASE WHEN content LIKE ?4 ESCAPE '\\' THEN 1 ELSE 0 END)) FROM entries) END AS scanned
+     FROM p",
+    "SELECT name, sql FROM sqlite_master WHERE (type = 'table' AND name = 'entries_fts') OR (type = 'trigger' AND name IN ('entries_fts_insert','entries_fts_update','entries_fts_delete'))",
+    "SELECT generation FROM embedding_migration_generation WHERE id = ?",
+    "INSERT INTO embedding_migration_generation (id, generation) VALUES (?, ?)
+     ON CONFLICT(id) DO NOTHING",
+    "SELECT generation FROM embedding_migration_generation WHERE id = ?",
+    "SELECT generation FROM embedding_migration_generation WHERE id = ?",
     "SELECT DISTINCT value FROM entries, json_each(entries.tags)",
-    "BATCH",
-    "SELECT id, source, recall_count, importance_score, contradiction_wins, contradiction_losses, tags, workspace_id, actor_id, valid_until FROM entries WHERE id IN (?)",
+    "SELECT name, sql FROM sqlite_master WHERE (type = 'table' AND name = 'entries_fts') OR (type = 'trigger' AND name IN ('entries_fts_insert','entries_fts_update','entries_fts_delete'))",
+    "WITH s AS MATERIALIZED (SELECT e.id, e.created_at, e.tags, e.source, lower(e.content) AS lc, 0 AS sh, bm25(entries_fts) AS rk, entries_fts.rowid AS ord
+       FROM entries_fts JOIN entries e ON e.rowid = entries_fts.rowid AND e.id = entries_fts.id
+       WHERE entries_fts MATCH ? AND (e.valid_until IS NULL OR e.valid_until > ?) AND tags NOT LIKE '%"quarantine:instruction"%' ESCAPE '\\' AND tags NOT LIKE '%"quarantine:hidden"%' ESCAPE '\\' AND tags NOT LIKE '%"quarantine:burst"%' ESCAPE '\\' AND tags NOT LIKE '%"quarantine:capsule"%' ESCAPE '\\' AND tags NOT LIKE '%"quarantine:too\\_long"%' ESCAPE '\\' AND tags NOT LIKE '%"auto-pattern"%' AND tags NOT LIKE '%"auto-insight"%' AND tags NOT LIKE '%"status:deprecated"%'
+       ORDER BY sh DESC, rk, ord LIMIT ?)
+    SELECT id, created_at, tags, source, l0, l1, fl FROM (
+      SELECT id, created_at, tags, source, sh, rk, ord, CASE WHEN p0 = 0 THEN 0 WHEN (substr(lc, p0 - 1, 1) NOT GLOB '[A-Za-z0-9_]' AND substr(lc, p0 + 8, 1) NOT GLOB '[A-Za-z0-9_]') THEN 2 WHEN q0 = 0 THEN 1 WHEN (substr(lc, (p0 + q0) - 1, 1) NOT GLOB '[A-Za-z0-9_]' AND substr(lc, (p0 + q0) + 8, 1) NOT GLOB '[A-Za-z0-9_]') THEN 2 ELSE 1 END AS l0, CASE WHEN p1 = 0 THEN 0 WHEN (substr(lc, p1 - 1, 1) NOT GLOB '[A-Za-z0-9_]' AND substr(lc, p1 + 8, 1) NOT GLOB '[A-Za-z0-9_]') THEN 2 WHEN q1 = 0 THEN 1 WHEN (substr(lc, (p1 + q1) - 1, 1) NOT GLOB '[A-Za-z0-9_]' AND substr(lc, (p1 + q1) + 8, 1) NOT GLOB '[A-Za-z0-9_]') THEN 2 ELSE 1 END AS l1, fl FROM (
+        SELECT id, created_at, tags, source, sh, rk, ord, lc, p0, p1, instr(substr(lc, p0 + 1), ?4) AS q0, instr(substr(lc, p1 + 1), ?5) AS q1, fl FROM (
+          SELECT id, created_at, tags, source, sh, rk, ord, lc, instr(lc, ?4) AS p0, instr(lc, ?5) AS p1, (instr(lc, char(8490)) > 0 OR instr(lc, char(304)) > 0) AS fl FROM s
+        )
+      )
+    ) ORDER BY sh DESC, rk, ord",
+    "SELECT id, created_at, recall_count, importance_score, contradiction_wins, contradiction_losses, tags, memory_tier, workspace_id, actor_id, valid_until FROM entries WHERE id IN (?)",
     "SELECT id, content, tags, source, created_at, updated_at, workspace_id, actor_id, valid_from, valid_until,
               CASE WHEN entries.valid_until IS NULL THEN NULL ELSE (SELECT json_object('id', s.id, 'preview', substr(s.content, 1, 60))
        FROM edges g CROSS JOIN entries s ON s.id = g.source_id
@@ -187,7 +258,8 @@ exports[`internal.variant.arms > matches the unmodified SQL, top-k IDs, and stab
         AND COALESCE(s.valid_from, s.created_at) = entries.valid_until
       ORDER BY s.created_at DESC LIMIT 1) END AS superseded_by_json
          FROM entries WHERE id IN (?) AND tags NOT LIKE '%"auto-pattern"%' AND tags NOT LIKE '%"auto-insight"%' AND tags NOT LIKE '%"status:deprecated"%' AND (valid_until IS NULL OR valid_until > ?) AND tags NOT LIKE '%"quarantine:instruction"%' ESCAPE '\\' AND tags NOT LIKE '%"quarantine:hidden"%' ESCAPE '\\' AND tags NOT LIKE '%"quarantine:burst"%' ESCAPE '\\' AND tags NOT LIKE '%"quarantine:capsule"%' ESCAPE '\\' AND tags NOT LIKE '%"quarantine:too\\_long"%' ESCAPE '\\'",
-    "UPDATE entries SET recall_count = recall_count + 1 WHERE id IN (?)",
+    "UPDATE entries SET recall_count = recall_count + 1, last_recalled_at = ?, write_marker = ?
+        WHERE id IN (SELECT value FROM json_each(?))",
   ],
 }
 `;
@@ -217,7 +289,7 @@ exports[`internal.variant.arms > matches the unmodified SQL, top-k IDs, and stab
       "SELECT name, sql FROM sqlite_master WHERE (type = 'table' AND name = 'entries_fts') OR (type = 'trigger' AND name IN ('entries_fts_insert','entries_fts_update','entries_fts_delete'))",
       "WITH s AS MATERIALIZED (SELECT e.id, e.created_at, e.tags, e.source, lower(e.content) AS lc, 0 AS sh, bm25(entries_fts) AS rk, entries_fts.rowid AS ord
        FROM entries_fts JOIN entries e ON e.rowid = entries_fts.rowid AND e.id = entries_fts.id
-       WHERE entries_fts MATCH ? AND (e.valid_until IS NULL OR e.valid_until > ?) AND tags NOT LIKE '%"quarantine:instruction"%' ESCAPE '\\' AND tags NOT LIKE '%"quarantine:hidden"%' ESCAPE '\\' AND tags NOT LIKE '%"quarantine:burst"%' ESCAPE '\\' AND tags NOT LIKE '%"quarantine:capsule"%' ESCAPE '\\' AND tags NOT LIKE '%"quarantine:too\\_long"%' ESCAPE '\\'
+       WHERE entries_fts MATCH ? AND (e.valid_until IS NULL OR e.valid_until > ?) AND tags NOT LIKE '%"quarantine:instruction"%' ESCAPE '\\' AND tags NOT LIKE '%"quarantine:hidden"%' ESCAPE '\\' AND tags NOT LIKE '%"quarantine:burst"%' ESCAPE '\\' AND tags NOT LIKE '%"quarantine:capsule"%' ESCAPE '\\' AND tags NOT LIKE '%"quarantine:too\\_long"%' ESCAPE '\\' AND tags NOT LIKE '%"auto-pattern"%' AND tags NOT LIKE '%"auto-insight"%' AND tags NOT LIKE '%"status:deprecated"%'
        ORDER BY sh DESC, rk, ord LIMIT ?)
     SELECT id, created_at, tags, source, l0, l1, fl FROM (
       SELECT id, created_at, tags, source, sh, rk, ord, CASE WHEN p0 = 0 THEN 0 WHEN (substr(lc, p0 - 1, 1) NOT GLOB '[A-Za-z0-9_]' AND substr(lc, p0 + 12, 1) NOT GLOB '[A-Za-z0-9_]') THEN 2 WHEN q0 = 0 THEN 1 WHEN (substr(lc, (p0 + q0) - 1, 1) NOT GLOB '[A-Za-z0-9_]' AND substr(lc, (p0 + q0) + 12, 1) NOT GLOB '[A-Za-z0-9_]') THEN 2 ELSE 1 END AS l0, CASE WHEN p1 = 0 THEN 0 WHEN (substr(lc, p1 - 1, 1) NOT GLOB '[A-Za-z0-9_]' AND substr(lc, p1 + 7, 1) NOT GLOB '[A-Za-z0-9_]') THEN 2 WHEN q1 = 0 THEN 1 WHEN (substr(lc, (p1 + q1) - 1, 1) NOT GLOB '[A-Za-z0-9_]' AND substr(lc, (p1 + q1) + 7, 1) NOT GLOB '[A-Za-z0-9_]') THEN 2 ELSE 1 END AS l1, fl FROM (
@@ -233,13 +305,15 @@ exports[`internal.variant.arms > matches the unmodified SQL, top-k IDs, and stab
       "kw-doc",
       "dense-doc",
     ],
+    "collapsedDirectRolloverIds": [],
+    "collapsedGraphRolloverIds": [],
     "corpusIdfUsed": true,
     "denseIds": [
       "dense-doc",
     ],
     "distillSource": "fts",
     "eligibleRelatedIds": [],
-    "embeddingMode": "distilled",
+    "embeddingMode": "semantic",
     "finalIds": [
       "kw-doc",
       "dense-doc",
@@ -254,17 +328,19 @@ exports[`internal.variant.arms > matches the unmodified SQL, top-k IDs, and stab
       "kw-doc",
     ],
     "lexicalArmSkipped": false,
+    "lineageFallbackUsed": false,
     "operations": {
       "aiCalls": 1,
       "d1RowsRead": null,
-      "d1RowsWritten": 0,
-      "d1Statements": 6,
+      "d1RowsWritten": 3,
+      "d1Statements": 12,
       "embeddingCalls": 1,
-      "kvReads": 3,
-      "kvWrites": 1,
+      "kvReads": 5,
+      "kvWrites": 2,
       "vectorizeGets": 0,
       "vectorizeQueries": 1,
     },
+    "promotedDirectRolloverIds": [],
     "rerankRoute": "too-few",
     "retrievalTokenCount": 2,
     "selectedRelatedIds": [],
@@ -274,10 +350,41 @@ exports[`internal.variant.arms > matches the unmodified SQL, top-k IDs, and stab
     "dense-doc",
   ],
   "sql": [
-    "BATCH",
+    "WITH RECURSIVE g AS MATERIALIZED (
+       SELECT total, everyone, max(CAST(0.3 * total AS INTEGER) + 1, 2001) AS cap
+       FROM (SELECT COALESCE(SUM(CASE WHEN 1 THEN n END), 0) AS total, max(COALESCE(SUM(n), 0), 1) AS everyone FROM entry_counts)
+     ),
+     walk(i, total, cap, everyone, m0, m1, e) AS (
+       SELECT 0, total, cap, everyone, cap, cap, CASE WHEN 2 * cap > total THEN min(cap, coalesce((SELECT doc FROM entries_fts_vocab WHERE term = json_extract(?1, '$[' || (0) || ']')), 0) * total / everyone) END FROM g
+       UNION ALL
+       SELECT w.i + 1, total, cap, everyone, CASE WHEN (json_extract(?2, '$[' || w.i || ']') >> 0) & 1 THEN min(m0, e) ELSE m0 END, CASE WHEN (json_extract(?2, '$[' || w.i || ']') >> 1) & 1 THEN min(m1, e) ELSE m1 END,
+         CASE WHEN CASE WHEN (json_extract(?2, '$[' || w.i || ']') >> 0) & 1 THEN min(m0, e) ELSE m0 END + CASE WHEN (json_extract(?2, '$[' || w.i || ']') >> 1) & 1 THEN min(m1, e) ELSE m1 END > total AND w.i + 1 < 15 THEN min(cap, coalesce((SELECT doc FROM entries_fts_vocab WHERE term = json_extract(?1, '$[' || (w.i + 1) || ']')), 0) * total / everyone) END
+       FROM walk w WHERE w.e IS NOT NULL
+     ),
+     p AS MATERIALIZED (SELECT total, cap, (SELECT min(m0 + m1) > total FROM walk) AS scan FROM g)
+     SELECT total, CASE WHEN scan THEN NULL ELSE (SELECT count(*) FROM (SELECT 1 FROM entries_fts JOIN entries e ON e.rowid = entries_fts.rowid AND e.id = entries_fts.id WHERE entries_fts MATCH ?5 AND e.content LIKE ?3 ESCAPE '\\' LIMIT (SELECT cap FROM g))) END AS n0, CASE WHEN scan THEN NULL ELSE (SELECT count(*) FROM (SELECT 1 FROM entries_fts JOIN entries e ON e.rowid = entries_fts.rowid AND e.id = entries_fts.id WHERE entries_fts MATCH ?6 AND e.content LIKE ?4 ESCAPE '\\' LIMIT (SELECT cap FROM g))) END AS n1,
+       CASE WHEN scan THEN (SELECT json_array(COUNT(*), SUM(CASE WHEN content LIKE ?3 ESCAPE '\\' THEN 1 ELSE 0 END), SUM(CASE WHEN content LIKE ?4 ESCAPE '\\' THEN 1 ELSE 0 END)) FROM entries) END AS scanned
+     FROM p",
+    "SELECT name, sql FROM sqlite_master WHERE (type = 'table' AND name = 'entries_fts') OR (type = 'trigger' AND name IN ('entries_fts_insert','entries_fts_update','entries_fts_delete'))",
+    "SELECT generation FROM embedding_migration_generation WHERE id = ?",
+    "INSERT INTO embedding_migration_generation (id, generation) VALUES (?, ?)
+     ON CONFLICT(id) DO NOTHING",
+    "SELECT generation FROM embedding_migration_generation WHERE id = ?",
+    "SELECT generation FROM embedding_migration_generation WHERE id = ?",
     "SELECT DISTINCT value FROM entries, json_each(entries.tags)",
-    "BATCH",
-    "SELECT id, source, recall_count, importance_score, contradiction_wins, contradiction_losses, tags, workspace_id, actor_id, valid_until FROM entries WHERE id IN (?, ?)",
+    "SELECT name, sql FROM sqlite_master WHERE (type = 'table' AND name = 'entries_fts') OR (type = 'trigger' AND name IN ('entries_fts_insert','entries_fts_update','entries_fts_delete'))",
+    "WITH s AS MATERIALIZED (SELECT e.id, e.created_at, e.tags, e.source, lower(e.content) AS lc, 0 AS sh, bm25(entries_fts) AS rk, entries_fts.rowid AS ord
+       FROM entries_fts JOIN entries e ON e.rowid = entries_fts.rowid AND e.id = entries_fts.id
+       WHERE entries_fts MATCH ? AND (e.valid_until IS NULL OR e.valid_until > ?) AND tags NOT LIKE '%"quarantine:instruction"%' ESCAPE '\\' AND tags NOT LIKE '%"quarantine:hidden"%' ESCAPE '\\' AND tags NOT LIKE '%"quarantine:burst"%' ESCAPE '\\' AND tags NOT LIKE '%"quarantine:capsule"%' ESCAPE '\\' AND tags NOT LIKE '%"quarantine:too\\_long"%' ESCAPE '\\' AND tags NOT LIKE '%"auto-pattern"%' AND tags NOT LIKE '%"auto-insight"%' AND tags NOT LIKE '%"status:deprecated"%'
+       ORDER BY sh DESC, rk, ord LIMIT ?)
+    SELECT id, created_at, tags, source, l0, l1, fl FROM (
+      SELECT id, created_at, tags, source, sh, rk, ord, CASE WHEN p0 = 0 THEN 0 WHEN (substr(lc, p0 - 1, 1) NOT GLOB '[A-Za-z0-9_]' AND substr(lc, p0 + 12, 1) NOT GLOB '[A-Za-z0-9_]') THEN 2 WHEN q0 = 0 THEN 1 WHEN (substr(lc, (p0 + q0) - 1, 1) NOT GLOB '[A-Za-z0-9_]' AND substr(lc, (p0 + q0) + 12, 1) NOT GLOB '[A-Za-z0-9_]') THEN 2 ELSE 1 END AS l0, CASE WHEN p1 = 0 THEN 0 WHEN (substr(lc, p1 - 1, 1) NOT GLOB '[A-Za-z0-9_]' AND substr(lc, p1 + 7, 1) NOT GLOB '[A-Za-z0-9_]') THEN 2 WHEN q1 = 0 THEN 1 WHEN (substr(lc, (p1 + q1) - 1, 1) NOT GLOB '[A-Za-z0-9_]' AND substr(lc, (p1 + q1) + 7, 1) NOT GLOB '[A-Za-z0-9_]') THEN 2 ELSE 1 END AS l1, fl FROM (
+        SELECT id, created_at, tags, source, sh, rk, ord, lc, p0, p1, instr(substr(lc, p0 + 1), ?4) AS q0, instr(substr(lc, p1 + 1), ?5) AS q1, fl FROM (
+          SELECT id, created_at, tags, source, sh, rk, ord, lc, instr(lc, ?4) AS p0, instr(lc, ?5) AS p1, (instr(lc, char(8490)) > 0 OR instr(lc, char(304)) > 0) AS fl FROM s
+        )
+      )
+    ) ORDER BY sh DESC, rk, ord",
+    "SELECT id, created_at, recall_count, importance_score, contradiction_wins, contradiction_losses, tags, memory_tier, workspace_id, actor_id, valid_until FROM entries WHERE id IN (?, ?)",
     "SELECT id, content, tags, source, created_at, updated_at, workspace_id, actor_id, valid_from, valid_until,
               CASE WHEN entries.valid_until IS NULL THEN NULL ELSE (SELECT json_object('id', s.id, 'preview', substr(s.content, 1, 60))
        FROM edges g CROSS JOIN entries s ON s.id = g.source_id
@@ -288,7 +395,8 @@ exports[`internal.variant.arms > matches the unmodified SQL, top-k IDs, and stab
         AND COALESCE(s.valid_from, s.created_at) = entries.valid_until
       ORDER BY s.created_at DESC LIMIT 1) END AS superseded_by_json
          FROM entries WHERE id IN (?, ?) AND tags NOT LIKE '%"auto-pattern"%' AND tags NOT LIKE '%"auto-insight"%' AND tags NOT LIKE '%"status:deprecated"%' AND (valid_until IS NULL OR valid_until > ?) AND tags NOT LIKE '%"quarantine:instruction"%' ESCAPE '\\' AND tags NOT LIKE '%"quarantine:hidden"%' ESCAPE '\\' AND tags NOT LIKE '%"quarantine:burst"%' ESCAPE '\\' AND tags NOT LIKE '%"quarantine:capsule"%' ESCAPE '\\' AND tags NOT LIKE '%"quarantine:too\\_long"%' ESCAPE '\\'",
-    "UPDATE entries SET recall_count = recall_count + 1 WHERE id IN (?, ?)",
+    "UPDATE entries SET recall_count = recall_count + 1, last_recalled_at = ?, write_marker = ?
+        WHERE id IN (SELECT value FROM json_each(?))",
   ],
 }
 `;

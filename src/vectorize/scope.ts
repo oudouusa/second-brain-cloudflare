@@ -50,16 +50,31 @@ export function resetVectorizeFilterState(): void {
 export async function queryVectorizeScoped<M = unknown>(
   vectorize: Queryable,
   values: number[],
-  opts: { topK: number; filter: VectorizeWorkspaceFilter["filter"]; onDegrade?: () => void },
+  opts: {
+    topK: number;
+    filter: VectorizeWorkspaceFilter["filter"];
+    onDegrade?: () => void;
+    /**
+     * Recall-only upgrade compatibility. A Vectorize index without a
+     * workspace_id metadata index can accept the filter yet silently return no
+     * vectors, rather than rejecting it. Probe unfiltered once in that state;
+     * D1's mandatory workspace predicate remains the security boundary.
+     */
+    fallbackOnEmpty?: boolean;
+  },
 ): Promise<{ matches: M[]; degraded: boolean }> {
-  const unfiltered = async (): Promise<{ matches: M[]; degraded: boolean }> => {
-    degradedQueryCount++;
+  const queryUnfiltered = async (): Promise<M[]> => {
     const result = await vectorize.query(values, {
       topK: opts.topK,
       returnMetadata: "all",
       returnValues: true,
     });
-    return { matches: (result?.matches ?? []) as M[], degraded: true };
+    return (result?.matches ?? []) as M[];
+  };
+  const unfiltered = async (): Promise<{ matches: M[]; degraded: boolean }> => {
+    const matches = await queryUnfiltered();
+    degradedQueryCount++;
+    return { matches, degraded: true };
   };
 
   // Report degradation to the first caller that can record it.
@@ -81,8 +96,33 @@ export async function queryVectorizeScoped<M = unknown>(
       returnValues: true,
       filter: opts.filter,
     });
+    const filteredMatches = (result.matches ?? []) as M[];
+    if (opts.fallbackOnEmpty && filteredMatches.length === 0) {
+      try {
+        const unfilteredMatches = await queryUnfiltered();
+        const readableWorkspaces = new Set(opts.filter.workspace_id.$in);
+        const filterSilentlyHidCandidate = unfilteredMatches.some(match => {
+          const workspaceId = (match as { metadata?: { workspace_id?: unknown } })?.metadata?.workspace_id;
+          // Missing metadata is the upgraded-brain shape: D1 rows were
+          // backfilled into a workspace, but their existing vectors were not
+          // rewritten. A readable stamped id being absent is equally strong
+          // evidence that the filter answer cannot be trusted.
+          return typeof workspaceId !== "string" || readableWorkspaces.has(workspaceId);
+        });
+        if (filterSilentlyHidCandidate) {
+          workspaceFiltersSupported = false;
+          notifyOnce();
+          degradedQueryCount++;
+          return { matches: unfilteredMatches, degraded: true };
+        }
+      } catch (e) {
+        // The filtered query itself succeeded. A failed compatibility probe
+        // must not turn a valid empty result into a recall outage.
+        console.error("Vectorize empty-filter probe failed (keeping filtered results):", e);
+      }
+    }
     workspaceFiltersSupported = true;
-    return { matches: (result.matches ?? []) as M[], degraded: false };
+    return { matches: filteredMatches, degraded: false };
   } catch (e) {
     if (!/filter/i.test(String(e))) throw e;
     console.error("Vectorize rejected the workspace filter (falling back to unfiltered queries for this isolate):", e);

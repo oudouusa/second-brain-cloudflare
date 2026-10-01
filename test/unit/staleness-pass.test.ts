@@ -338,7 +338,7 @@ describe("runStalenessPass D1 round-trip cost", () => {
   function countingEnv(db: D1Mock, overrides: Partial<D1Database> = {}) {
     const prepared: string[] = [];
     const execd: string[] = [];
-    const isSchemaProbe = (sql: string) => sql.startsWith("SELECT type AS kind, name FROM sqlite_master");
+    const isSchemaProbe = (sql: string) => sql.startsWith("WITH schema_groups");
     const billed = { run: 0, first: 0, all: 0, exec: 0, batch: 0, batched: [] as number[],
       get total() { return this.run + this.first + this.all + this.exec + this.batch; } };
     const wrap = (stmt: any): any => ({
@@ -447,7 +447,7 @@ describe("runStalenessPass D1 round-trip cost", () => {
     const original = db.prepare.bind(db);
     let flipped = false;
     (db as any).prepare = (sql: string) => {
-      if (!flipped && sql.startsWith("UPDATE entries SET tags = ?, staleness_checked_at = ?")) {
+      if (!flipped && sql.startsWith("UPDATE entries SET tags = ?, staleness_checked_at = ?, updated_at = ?")) {
         flipped = true; // only job-0's guard is invalidated
         db.entries[0].tags = '["touched-by-someone-else"]';
       }
@@ -511,7 +511,7 @@ describe("runStalenessPass D1 round-trip cost", () => {
     let rewritten = false;
     (db as any).prepare = (sql: string) => {
       // Land the concurrent rewrite between the candidate query and the CAS write.
-      if (!rewritten && sql.startsWith("UPDATE entries SET tags = ?, staleness_checked_at = ?")) {
+      if (!rewritten && sql.startsWith("UPDATE entries SET tags = ?, staleness_checked_at = ?, updated_at = ?")) {
         rewritten = true;
         db.entries[0].content = "Birthday is March 12"; // now durable
         db.entries[0].updated_at = Date.now();
@@ -544,7 +544,7 @@ describe("runStalenessPass D1 round-trip cost", () => {
     const original = db.prepare.bind(db);
     let raced = false;
     (db as any).prepare = (sql: string) => {
-      if (!raced && sql.startsWith("UPDATE entries SET tags = ?, staleness_checked_at = ?")) {
+      if (!raced && sql.startsWith("UPDATE entries SET tags = ?, staleness_checked_at = ?, updated_at = ?")) {
         raced = true;
         db.entries[0].content = "Birthday is March 12";
         db.entries[0].tags = '["personal"]';
@@ -582,7 +582,7 @@ describe("runStalenessPass D1 round-trip cost", () => {
     let rewrites = 0;
     (db as any).prepare = (sql: string) => {
       // Rewrite before every attempt, so no CAS can ever land.
-      if (sql.startsWith("UPDATE entries SET tags = ?, staleness_checked_at = ?")) {
+      if (sql.startsWith("UPDATE entries SET tags = ?, staleness_checked_at = ?, updated_at = ?")) {
         db.entries[0].content = `rewritten ${++rewrites}`;
       }
       return original(sql);
@@ -627,7 +627,7 @@ describe("runStalenessPass D1 round-trip cost", () => {
       if (sql.startsWith("SELECT id, tags, content FROM entries WHERE id IN")) {
         return { bind: () => ({ all: async () => { throw new Error("D1_ERROR: connection lost"); } }) };
       }
-      if (!flipped && sql.startsWith("UPDATE entries SET tags = ?, staleness_checked_at = ?")) {
+      if (!flipped && sql.startsWith("UPDATE entries SET tags = ?, staleness_checked_at = ?, updated_at = ?")) {
         flipped = true;
         db.entries[0].tags = '["touched-by-someone-else"]';
       }
@@ -645,16 +645,17 @@ describe("runStalenessPass D1 round-trip cost", () => {
     const original = db.prepare.bind(db);
     (db as any).prepare = (sql: string) => {
       const stmt = original(sql);
-      const isCas = sql.startsWith("UPDATE entries SET tags = ?, staleness_checked_at = ?");
+      const isCas = sql.startsWith("UPDATE entries SET tags = ?, staleness_checked_at = ?, updated_at = ?");
       const isCursor = sql.startsWith("UPDATE entries SET staleness_checked_at = ?");
       if (!isCas && !isCursor) return stmt;
       return {
         bind: (...args: any[]) => {
           const bound = stmt.bind(...args);
           // The two statements bind the id in different positions — casWrite is
-          // (tags, now, id, …) and cursorWrite is (now, id) — so a single index would
+          // (tags, checkedAt, updatedAt, writeMarker, id, …) and cursorWrite is (now, marker, id)
+          // — so a single index would
           // silently miss one of them and leave this test looking like coverage it is not.
-          const id = isCas ? args[2] : args[1];
+          const id = isCas ? args[4] : args[2];
           // Only job-1's CAS ever fails. Its cursor write is deliberately left working,
           // because the guarantee under test is that the cursor still lands when the
           // verdict cannot; the test below covers a cursor write that fails.
@@ -738,7 +739,7 @@ describe("runStalenessPass D1 round-trip cost", () => {
     const original = db.prepare.bind(db);
     let deprecated = false;
     (db as any).prepare = (sql: string) => {
-      if (!deprecated && sql.startsWith("UPDATE entries SET tags = ?, staleness_checked_at = ?")) {
+      if (!deprecated && sql.startsWith("UPDATE entries SET tags = ?, staleness_checked_at = ?, updated_at = ?")) {
         deprecated = true;
         db.entries[0].tags = '["status:deprecated"]';
       }
@@ -761,7 +762,7 @@ describe("runStalenessPass D1 round-trip cost", () => {
     const original = db.prepare.bind(db);
     let flipped = false;
     (db as any).prepare = (sql: string) => {
-      if (!flipped && sql.startsWith("UPDATE entries SET tags = ?, staleness_checked_at = ?")) {
+      if (!flipped && sql.startsWith("UPDATE entries SET tags = ?, staleness_checked_at = ?, updated_at = ?")) {
         flipped = true;
         db.entries[0].tags = '["touched-by-someone-else"]';
       }
@@ -795,7 +796,7 @@ describe("scheduled handler staleness wiring", () => {
     const pending: Promise<any>[] = [];
     const ctx = { waitUntil: (p: Promise<any>) => pending.push(p) } as any;
 
-    await (worker as any).scheduled({} as any, env, ctx);
+    await (worker as any).scheduled({ cron: "0 1 * * *" } as any, env, ctx);
     await Promise.allSettled(pending);
 
     const tags: string[] = JSON.parse(db.entries.find(e => e.id === "job")!.tags);

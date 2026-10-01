@@ -26,8 +26,9 @@ let companyWs = "";
 beforeEach(async () => {
   resetDatabaseInit();
   sqlite = makeSqliteD1();
-  env = makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV() });
+  env = sqlite.admitEnv(makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV() }));
   await initializeDatabase(env);
+  env = sqlite.admitEnv(env);
   const roots = await ensureTenantBootstrap(env);
   companyWs = roots.companyWorkspaceId;
   owner = (await resolveIdentityByUserId(env, roots.ownerUserId))!;
@@ -57,7 +58,7 @@ async function edit(id: string, next: string, over: {
       entryId: id, reason: over.reason ?? "update", change: { actorId: over.actorId ?? owner.userId, channel: (over.channel ?? "rest") as any },
       content: { kind: "next", content: next }, nextTags: tags, meta: over.meta, now,
     }),
-    sqlite.db.prepare(`UPDATE entries SET content = ?, tags = ?, updated_at = ? WHERE id = ?`).bind(next, JSON.stringify(tags), now, id),
+    sqlite.db.prepare(`UPDATE entries SET write_marker = '${sqlite.fixtureMarker()}', content = ?, tags = ?, updated_at = ? WHERE id = ?`).bind(next, JSON.stringify(tags), now, id),
     pruneStatement(env, id, over.keep ?? 20),
   ] as any[]);
 }
@@ -232,7 +233,7 @@ describe("buildEntryHistory", () => {
     // (still the author's personal one) at the moment this edit's snapshot runs.
     await edit("e5", "state1", { now: 200, actorId: author.userId });
     // The share: the row moves to the company workspace, and the move is recorded.
-    await sqlite.db.prepare(`UPDATE entries SET workspace_id = ? WHERE id = 'e5'`).bind(companyWs).run();
+    await sqlite.db.prepare(`UPDATE entries SET write_marker = '${sqlite.fixtureMarker()}', workspace_id = ? WHERE id = 'e5'`).bind(companyWs).run();
     await seedEvent("e5", "ev-share", { actorId: author.userId, event: "shared", createdAt: 300, payload: { channel: "rest", fromWorkspaceId: author.personalWorkspaceId, workspaceId: companyWs } });
     // Post-share version: workspace_id now copies the row's current (company) workspace_id.
     await edit("e5", "state2", { now: 400, actorId: author.userId });
@@ -292,7 +293,7 @@ describe("buildEntryHistory", () => {
         content: { kind: "unchanged" }, nextTags: "unchanged", nextState: { valid_until: 5000 },
         meta: { cause: "supersede", by: "closer-id" }, now: 1000,
       }),
-      sqlite.db.prepare(`UPDATE entries SET valid_until = ? WHERE id = ?`).bind(5000, "e10"),
+      sqlite.db.prepare(`UPDATE entries SET write_marker = '${sqlite.fixtureMarker()}', valid_until = ? WHERE id = ?`).bind(5000, "e10"),
     ] as any[]);
     const config = await resolveConfig(env);
     const historyRow = { ...(await historyRowFor("e10")), valid_until: 5000 };
@@ -313,7 +314,7 @@ describe("buildEntryHistory", () => {
         content: { kind: "unchanged" }, nextTags: "unchanged", nextState: { valid_until: 3000 },
         meta: { cause: "explicit" }, now: 1000,
       }),
-      sqlite.db.prepare(`UPDATE entries SET valid_until = ? WHERE id = ?`).bind(3000, "e11"),
+      sqlite.db.prepare(`UPDATE entries SET write_marker = '${sqlite.fixtureMarker()}', valid_until = ? WHERE id = ?`).bind(3000, "e11"),
     ] as any[]);
     await sqlite.db.batch([
       snapshotStatement(env, {
@@ -321,7 +322,7 @@ describe("buildEntryHistory", () => {
         content: { kind: "unchanged" }, nextTags: "unchanged", nextState: { valid_until: 5000 },
         meta: { cause: "explicit" }, now: 2000,
       }),
-      sqlite.db.prepare(`UPDATE entries SET valid_until = ? WHERE id = ?`).bind(5000, "e11"),
+      sqlite.db.prepare(`UPDATE entries SET write_marker = '${sqlite.fixtureMarker()}', valid_until = ? WHERE id = ?`).bind(5000, "e11"),
     ] as any[]);
     const config = await resolveConfig(env);
     const historyRow = { ...(await historyRowFor("e11")), valid_until: 5000 };

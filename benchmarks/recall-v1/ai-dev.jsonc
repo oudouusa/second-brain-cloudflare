@@ -1,0 +1,10 @@
+{
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  "name": "second-brain-cf-benchmark-local",
+  "main": "./ai-worker.mjs",
+  "compatibility_date": "2026-07-29",
+  "ai": {
+    "binding": "AI",
+    "remote": true
+  }
+}

@@ -89,9 +89,8 @@ describe("recall keyword arm: FTS5 with LIKE fallback", () => {
   it("matches CJK substrings through the trigram index", async () => {
     await env.OAUTH_KV.put(FTS_READY_KV_KEY, "1");
     resetFtsReadyMemo();
-    // jp-29's query tokens ("データベース", "バックアップ") are both >= 3
-    // codepoints, so they survive the trigram floor — unlike most of this
-    // fixture's 2-character word segments (see jp-01/jp-02, used as distractors).
+    // One long CJK word qualifies for trigram FTS. The two-word fixture also
+    // generates the fork's rescue bigrams and deliberately takes LIKE.
     const target = CJK_RECALL_FIXTURE.find(item => item.id === "jp-29")!;
     const distractorA = CJK_RECALL_FIXTURE.find(item => item.id === "jp-01")!;
     const distractorB = CJK_RECALL_FIXTURE.find(item => item.id === "jp-02")!;
@@ -99,7 +98,7 @@ describe("recall keyword arm: FTS5 with LIKE fallback", () => {
     for (const item of [target, distractorA, distractorB]) sqlite.seed({ id: item.id, content: item.content, createdAt: t++ });
 
     const diagnostics: RecallDiagnostics = {};
-    const res = await recallEntries({ query: target.query, topK: 5, synthesize: false }, env, ctx, undefined, { diagnostics });
+    const res = await recallEntries({ query: "データベース", topK: 5, synthesize: false }, env, ctx, undefined, { diagnostics });
 
     expect(diagnostics.ftsUsed).toBe(true);
     // v2.2: the FTS query now rides in a batch alongside the liveness check
@@ -606,19 +605,18 @@ describe("recall keyword arm: FTS5 with LIKE fallback", () => {
     expect(diagnostics.ftsUsed).toBe(true);
   });
 
-  it("keeps routing on FTS when df is unknown for the query", async () => {
+  it("routes a frequent single-token query to LIKE using its corpus df", async () => {
     await env.OAUTH_KV.put(FTS_READY_KV_KEY, "1");
     resetFtsReadyMemo();
-    // A 2,100-row corpus of the query's own token: had the scan run, the sum
-    // would sit far over the budget — but a single-token query skips it
-    // (distillToRareTerms early-exits with df null), so today's FTS rule holds.
+    // A single-token query now pays for corpus df just like a multi-token query.
+    // Its 2,001-capped df exceeds the unchanged 2,000 FTS match budget.
     for (let i = 0; i < 2100; i++) sqlite.seed({ id: `row-${i}`, content: "widget gadget ledger", createdAt: i + 1 });
 
     const diagnostics: RecallDiagnostics = {};
     await recallEntries({ query: "widget", topK: 5, synthesize: false }, env, ctx, undefined, { diagnostics });
 
-    expect(diagnostics.ftsRoute).toBe("fts");
-    expect(diagnostics.ftsUsed).toBe(true);
+    expect(diagnostics.ftsRoute).toBe("like-match-budget");
+    expect(diagnostics.ftsUsed).toBe(false);
   });
 
   it("sits exactly on the budget: sum == budget stays on the full FTS plan, sum == budget+1 bounds it", async () => {

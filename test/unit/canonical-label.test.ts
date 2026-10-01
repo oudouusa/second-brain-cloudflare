@@ -83,13 +83,13 @@ describe("REST /recall exposes edited_canonical_at", () => {
   it("returns the dated tag's value, or null when there is none", async () => {
     resetDatabaseInit();
     const sqlite = makeSqliteD1();
-    const env = makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV() });
+    const env = sqlite.admitEnv(makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV() }));
     await initializeDatabase(env);
     const edited = withEditedCanonical(["status:canonical"], Date.UTC(2026, 8, 26, 12));
     sqlite.seed({ id: "edited", content: "trusted note about the plan", createdAt: 1000, tags: edited });
     sqlite.seed({ id: "plain", content: "another note about the plan", createdAt: 1000, tags: [] });
     (env as any).VECTORIZE = makeVectorizeMock({ query: vi.fn().mockRejectedValue(new Error("index unavailable")) });
-    const res = await worker.fetch(req("GET", "/recall?query=note+plan"), env, ctx);
+    const res = await worker.fetch(req("POST", "/recall?query=note+plan"), env, ctx);
     const body = await res.json() as any;
     const edited1 = body.results.find((r: any) => r.id === "edited");
     const plain1 = body.results.find((r: any) => r.id === "plain");

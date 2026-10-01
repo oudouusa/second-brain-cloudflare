@@ -28,7 +28,7 @@ beforeEach(async () => {
   resetDatabaseInit();
   pending = [];
   sqlite = makeSqliteD1();
-  env = makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV() });
+  env = sqlite.admitEnv(makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV() }));
   await initializeDatabase(env);
   const roots = await ensureTenantBootstrap(env);
   owner = (await resolveIdentityByUserId(env, roots.ownerUserId))!;
@@ -118,7 +118,7 @@ describe("resolve outcome", () => {
   it("the outcome and its note land together in one write even with the embedding service down", async () => {
     seedRow("d4");
     const failingKV = { get: async () => null, put: async () => { throw new Error("kv down"); }, delete: async () => {}, list: async () => ({ keys: [], list_complete: true, cacheStatus: null }) };
-    const noAiEnv = makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: failingKV as any, AI: undefined as any });
+    const noAiEnv = sqlite.admitEnv(makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: failingKV as any, AI: undefined as any }));
     const r = await resolveDecisionOutcome(noAiEnv, ctx, owner, "d4", "right", "a note", change());
     expect(r.ok).toBe(true);
     if (r.ok) expect(r.reply).toMatch(/^Recorded: .+ went right\. Undo is available\.$/);

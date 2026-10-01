@@ -1,9 +1,11 @@
-import { describe, it, expect, beforeEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import worker from "../../src/index";
 import { makeTestEnv, makeTestDb } from "../helpers/make-env";
 import { req } from "../helpers/make-request";
 import type { Env } from "../../src/env";
 import { D1Mock } from "../helpers/d1-mock";
+import { makeSqliteD1, type SqliteD1 } from "../helpers/sqlite-d1";
+import { processPendingClassification } from "../../src/capture/pending";
 
 const ctx = { waitUntil: (_: Promise<any>) => {} } as any;
 
@@ -28,7 +30,7 @@ function unclassifiedEntry(id: string, tags: string[] = ["work"]) {
 function makeClassifyingAIMock(result: { importance: number; canonical: boolean; kind: "episodic" | "semantic" }) {
   return {
     run: vi.fn().mockImplementation(async (model: string) => {
-      if (model === "@cf/baai/bge-small-en-v1.5") return { data: [new Array(384).fill(0.1)] };
+      if (model === "@cf/google/embeddinggemma-300m") return { data: [new Array(768).fill(0.1)] };
       return new ReadableStream({
         start(c) {
           c.enqueue(new TextEncoder().encode(`data: {"response":${JSON.stringify(JSON.stringify(result))}}\n\n`));
@@ -153,5 +155,22 @@ describe("POST /classify-pending", () => {
     // "bad" is still malformed/untagged so it's still selected next time; "good"
     // got tagged successfully and drops out of the unclassified set.
     expect(data.remaining).toBe(1);
+  });
+});
+
+describe("実 D1 changes による分類件数", () => {
+  let sqlite: SqliteD1 | undefined;
+  afterEach(() => { sqlite?.close(); sqlite = undefined; });
+
+  it("capsule 更新のトリガー分を処理件数に加えない", async () => {
+    sqlite = makeSqliteD1();
+    sqlite.seed({ id: "capsule", content: "A stable preference", createdAt: 1, tags: ["capsule:core"] });
+    const env = sqlite.admitEnv(makeTestEnv(undefined, {
+      DB: sqlite.db as unknown as D1Database,
+      AI: makeClassifyingAIMock({ importance: 4, canonical: true, kind: "semantic" }),
+    }));
+    const result = await processPendingClassification(env);
+    expect(result).toMatchObject({ processed: 1, failed: 0, remaining: 0 });
+    expect(JSON.parse(sqlite.rows()[0].tags as string)).toContain("kind:semantic");
   });
 });

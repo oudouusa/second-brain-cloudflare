@@ -25,7 +25,7 @@ const ctx = { waitUntil: (_: Promise<unknown>) => {} } as ExecutionContext;
 beforeEach(async () => {
   resetDatabaseInit();
   sqlite = makeSqliteD1();
-  env = makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV() });
+  env = sqlite.admitEnv(makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV() }));
   await initializeDatabase(env);
   const roots = await ensureTenantBootstrap(env);
   owner = (await resolveIdentityByUserId(env, roots.ownerUserId))!;
@@ -131,8 +131,8 @@ describe("budgets", () => {
   it("GET /decisions costs two statements plus identity; GET /decisions/calibration costs one plus identity", async () => {
     seedDecision("b1");
     const issued = (fn: () => Promise<unknown>) => {
-      const before = sqlite.issued.length;
-      return fn().then(() => sqlite.issued.length - before);
+      const before = sqlite.executions.length;
+      return fn().then(() => sqlite.executions.length - before);
     };
     const decisionsCost = await issued(() => worker.fetch(req("GET", "/decisions?state=all", { token: ownerToken }), env, ctx));
     const calibrationCost = await issued(() => worker.fetch(req("GET", "/decisions/calibration", { token: ownerToken }), env, ctx));

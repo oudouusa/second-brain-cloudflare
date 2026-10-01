@@ -18,14 +18,14 @@ afterAll(cleanTemp);
 const TOPICS = ["kayak", "sourdough", "violin", "taxes"];
 function fakeVector(text: string): number[] {
   const hit = TOPICS.findIndex(t => text.includes(t));
-  return Array.from({ length: 384 }, (_, i) => (hit >= 0 && i % TOPICS.length === hit ? 1 : 0.01));
+  return Array.from({ length: 768 }, (_, i) => (hit >= 0 && i % TOPICS.length === hit ? 1 : 0.01));
 }
 vi.mock("./local-ai", async orig => ({
   ...(await orig<typeof import("./local-ai")>()),
   makeLocalAi: () => ({
     run: async (_model: string, input: unknown) => {
       const { text } = input as { text: string[] };
-      return { shape: [text.length, 384], data: text.map(fakeVector), usage: { prompt_tokens: 4, total_tokens: 4 } };
+      return { shape: [text.length, 768], data: text.map(fakeVector), usage: { prompt_tokens: 4, total_tokens: 4 } };
     },
     producer: () => ({ kind: "local-transformers-js" as const, library: "@huggingface/transformers", libraryVersion: "0", onnxRuntime: "onnxruntime-node@0", repo: "stub/stub", revision: "0", dtype: "fp32" as const }),
   }),
@@ -75,6 +75,7 @@ beforeAll(async () => {
   root = mkdtempSync(join(tmpdir(), "longmemeval-"));
   mkdirSync(join(root, "db"), { recursive: true });
   copyFileSync(join(REAL_REPO, "db/schema.sql"), join(root, "db/schema.sql"));
+  copyFileSync(join(REAL_REPO, "db/fork-write-protection.sql"), join(root, "db/fork-write-protection.sql"));
   fixture();
   vi.stubEnv("SB_EVAL_ROOT", root);
   vi.resetModules();
@@ -83,8 +84,10 @@ beforeAll(async () => {
   aiReplay = await import("./ai-replay");
   corporaMod = await import("./corpora");
   variantsMod = await import("./variants");
+  // 合成試験専用の仮単価。実測CLIの価格表には追加しない。
+  aiReplay.NEURON_RATES[mod.EMBEDDING_MODEL] = { inputPerMillionTokens: 1841 };
 });
-afterAll(() => { vi.unstubAllEnvs(); vi.resetModules(); });
+afterAll(() => { delete aiReplay.NEURON_RATES[mod.EMBEDDING_MODEL]; vi.unstubAllEnvs(); vi.resetModules(); });
 
 describe("loadLongMemEvalData", () => {
   it("parses the neutral layout, keeping every question with at least one gold session", () => {

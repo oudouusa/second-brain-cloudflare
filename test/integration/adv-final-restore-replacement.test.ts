@@ -20,7 +20,7 @@ it("a stale restore cannot restore a different member's new trash row with the s
   const ownerRead = (await getTrashedEntry(t.env, owner, "reused"))!;
 
   // Interleaving: the old trash expires and is purged; Bob imports the same id and forgets it.
-  await t.env.DB.prepare("DELETE FROM entries_trash WHERE id = ?").bind("reused").run();
+  await t.sqlite.deleteFixtureRows("DELETE FROM entries_trash WHERE id = ?", "reused");
   t.seed("reused", { content: "Bob's private memory", actor_id: bob.userId,
     workspace_id: bob.personalWorkspaceId });
   await forgetEntry("reused", t.env, { actorId: bob.userId, channel: "rest" },

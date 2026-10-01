@@ -1,5 +1,6 @@
 import { validInputTags, projectSlugError, projectTagError, withProjectTag, MAX_INPUT_TAGS, MAX_INPUT_TAG_CHARS, reservedTagsNote, stripNewReservedTags } from "../tags/system";
 import { autoCreateProject } from "../projects/autocreate";
+import { parseExplicitWhen } from "../when/input";
 import type { Env } from "../env";
 import { resolveConfig, type Config } from "../config";
 import { VECTORIZE_FIX_HINT } from "../constants";
@@ -9,12 +10,11 @@ import { assertCanEditContent, getReadableEntry } from "../lib/entry-access";
 import { scopeWrite, effectiveWriteTarget, readTeamParam, type WriteContext } from "../lib/scope";
 import { captureEntry } from "../capture/entry";
 import { partitionIgnoredTags, t7ReplyText, validateT7Capture, validateT7RestFields, type T7CaptureInput } from "../capture/t7-capture";
-import { appendToEntry, EntryGoneError, updateEntryContent, WriteConflictError } from "../capture/store";
+import { appendToEntry, AppendOperationConflictError, MemoryInputError, EntryGoneError, updateEntryContent, WriteConflictError } from "../capture/store";
 import { isManagedMirror, mirrorEditError } from "../integrations/mirror";
 import { auditEvent } from "../lib/audit";
 import { maybeMarkFollowed } from "../recall/log";
 import { VOLATILITY_VALUES, withVolatility, type Volatility } from "../memory/volatility";
-import { parseExplicitWhen } from "../when/input";
 import { contentByteLength, isOverContentLimit, tooLargeRestBody, MAX_CONTENT_BYTES } from "../lib/content-size";
 import { parseValidityInput, updateEntryValidity, VALIDITY_WITH_CONTENT_ERROR, type UpdateValidityResult } from "../memory/validity";
 
@@ -22,6 +22,23 @@ import { parseValidityInput, updateEntryValidity, VALIDITY_WITH_CONTENT_ERROR, t
 // generic held message — there is no nightly check to wait on any more, just a note over the
 // scorer's budget that only the owner can read and release.
 const TOO_LONG_MESSAGE = "Saved, but held out of search because it is too long to check automatically. Read it and release it if it's fine. Shorter memories (about 5,000 words or less) are not held.";
+import {
+  WORKERS_AI_QUOTA_CODE,
+  WorkersAiQuotaError,
+  workersAiQuotaRetryMessage,
+  workersAiRetryAfterSeconds,
+} from "../lib/ai";
+
+function workersAiQuotaResponse(retryAt: number, unchanged: boolean): Response {
+  const response = json({
+    ok: false,
+    code: WORKERS_AI_QUOTA_CODE,
+    retry_at: retryAt,
+    error: `${workersAiQuotaRetryMessage(retryAt)}${unchanged ? " Your memory is unchanged." : ""}`,
+  }, 429);
+  response.headers.set("Retry-After", String(workersAiRetryAfterSeconds(retryAt)));
+  return response;
+}
 
 /** Validate route-only volatility input; MCP gets equivalent Zod validation. */
 /** Where this caller's writes land and who gets stamped on them. */
@@ -31,6 +48,10 @@ export async function writeContextFor(
   target?: unknown,
   team?: unknown,
 ): Promise<WriteContext | Response> {
+  // Precedence lives in effectiveWriteTarget: explicit request value, then the
+  // member's own default_share override, then the org's TEAM_DEFAULT_WORKSPACE,
+  // then personal. scopeWrite resolves the id from the identity, so no request
+  // value can name an arbitrary workspace.
   const orgDefault = (await resolveConfig(env)).TEAM_DEFAULT_WORKSPACE;
   const resolvedTarget = effectiveWriteTarget(identity, target, orgDefault);
   const teamRead = readTeamParam(team, identity, resolvedTarget);
@@ -90,6 +111,13 @@ export async function handleCaptureRoutes(
     if (badProjectTag) return json({ ok: false, error: badProjectTag }, 400);
     if (typeof body.content === "string" && body.content.includes("\0")) return json({ ok: false, error: "NUL is not allowed" }, 400);
     if (!body.content?.trim()) return json({ ok: false, error: "content is required" }, 400);
+    if (body.source !== undefined && typeof body.source !== "string") {
+      return json({ ok: false, error: "source must be a string" }, 400);
+    }
+    if (body.tags !== undefined
+      && (!Array.isArray(body.tags) || body.tags.some(tag => typeof tag !== "string"))) {
+      return json({ ok: false, error: "tags must be an array of strings" }, 400);
+    }
     // Rahil's decision (18-copy-deck.md 6.8): 128 KB per note, so a very large paste cannot
     // spend the Worker's 10 ms CPU budget on one write. Checked before anything is written.
     if (isOverContentLimit(body.content)) return json(tooLargeRestBody(), 413);
@@ -156,9 +184,7 @@ export async function handleCaptureRoutes(
       ? withVolatility(body.tags ?? [], captureVol.value)
       : body.tags ?? [];
     const captureTags = projectSlug ? withProjectTag(volatileTags, projectSlug) : volatileTags;
-    // MAX_INPUT_TAGS bounds the caller's own tags (checked above). The project: and
-    // volatility: tags the Worker adds may take a capture past it; refusing a capture
-    // over a convenience tag would lose the memory.
+    // forkの保存上限は自動付与タグを含めて検証する。
 
     // Computed on the caller's raw tags — captureEntry strips these again on its own
     // path (normalizeCaptureInput), this is purely for telling the caller honestly.
@@ -169,8 +195,26 @@ export async function handleCaptureRoutes(
 
     const writeCtx = await writeContextFor(env, identity, body.workspace, body.team);
     if (writeCtx instanceof Response) return writeCtx;
-
-    const result = await captureEntry(body.content, captureTags, body.source ?? "api", env, ctx, undefined, writeCtx, when, { channel: "rest", t7: t7Input, validity: validity.value });
+    let result;
+    try {
+      const cfg = await resolveConfig(env);
+      result = await captureEntry(
+        body.content,
+        captureTags,
+        body.source?.trim() || "api",
+        env,
+        ctx,
+        cfg,
+        writeCtx,
+        when,
+        { channel: "rest", t7: t7Input, validity: validity.value },
+      );
+    } catch (error) {
+      if (error instanceof MemoryInputError) {
+        return json({ ok: false, error: error.message }, error.status);
+      }
+      throw error;
+    }
 
     if (result.status === "t7_refused") {
       return json({ ok: false, error: result.error }, 400);
@@ -181,9 +225,6 @@ export async function handleCaptureRoutes(
     }
 
     if (result.status !== "blocked") {
-      // Audit at the edge where identity and ctx both live; the domain layer
-      // stays free of request state. "stored"/"flagged" are creations, the
-      // rest are rewrites of an existing row.
       auditEvent(env, ctx, {
         entryId: result.id,
         actorId: identity.userId,
@@ -251,8 +292,16 @@ export async function handleCaptureRoutes(
     // to show what was filed under what.
     return json(withReservedNote({
       ok: true, id: result.id, tags: result.tags ?? [],
+      semantic_unavailable: result.semanticUnavailable ?? false,
+      semantic_unavailable_reason: result.semanticUnavailableReason ?? null,
+      semantic_retry_at: result.semanticRetryAt ?? null,
+      classification_pending: result.classificationDeferred ?? false,
+      classification_status: result.held ? "held" : result.classificationDeferred ? "deferred" : "scheduled",
       held: result.held ? { reason: result.held.reasons[0] } : null,
-      message: result.held?.reasons[0] === "too_long" ? TOO_LONG_MESSAGE : await t7Message(),
+      message: result.held?.reasons[0] === "too_long" ? TOO_LONG_MESSAGE
+        : result.semanticUnavailable && result.semanticRetryAt
+          ? `Stored in D1 and keyword-searchable. Semantic indexing is pending. ${result.classificationDeferred ? "AI classification is also deferred; /classify-pending can retry it." : "AI classification is scheduled separately."} Scheduled indexing recovery starts after ${new Date(result.semanticRetryAt).toISOString()} (09:00 JST); /vectorize-pending can retry it manually.`
+          : await t7Message(),
     }, ignoredReservedTags, t7Notes));
   }
 
@@ -262,11 +311,15 @@ export async function handleCaptureRoutes(
     if (auth instanceof Response) return auth;
     const identity = auth;
 
-    let body: { id?: string; addition?: string; volatility?: unknown };
+    let body: { id?: string; addition?: string; volatility?: unknown; operation_id?: unknown };
     try { body = await request.json(); } catch { return json({ ok: false, error: "Invalid JSON" }, 400); }
     if (!body.id?.trim()) return json({ ok: false, error: "id is required" }, 400);
     if (typeof body.addition === "string" && body.addition.includes("\0")) return json({ ok: false, error: "NUL is not allowed" }, 400);
     if (!body.addition?.trim()) return json({ ok: false, error: "addition is required" }, 400);
+    if (body.operation_id !== undefined
+      && (typeof body.operation_id !== "string" || !body.operation_id.trim() || body.operation_id.length > 128)) {
+      return json({ ok: false, error: "operation_id must be a non-empty string of at most 128 characters" }, 400);
+    }
 
     const appendVol = readVolatility(body.volatility);
     if (appendVol.error) return json({ ok: false, error: appendVol.error }, 400);
@@ -279,9 +332,9 @@ export async function handleCaptureRoutes(
     const denied = assertCanEditContent(identity, row);
     if (denied) return json({ ok: false, error: denied.message }, 403);
 
-    const existingContent = row.content as string;
-    const tags: string[] = JSON.parse(row.tags ?? "[]");
     const source = row.source as string;
+    const existingContent = row.content as string;
+    const tags: string[] = JSON.parse(row.tags as string);
 
     if (await isManagedMirror(source, env)) {
       return json({ ok: false, error: mirrorEditError(source) }, 409);
@@ -299,15 +352,18 @@ export async function handleCaptureRoutes(
     try {
       const writeCtx = await writeContextFor(env, identity);
       if (writeCtx instanceof Response) return writeCtx;
-      appendResult = await appendToEntry(env, id, existingContent, addition, tags, source, cfg, appendVol.value, writeCtx, { actorId: identity.userId, channel: "rest" }, undefined, row.workspace_id as string, ctx);
+      appendResult = await appendToEntry(env, id, existingContent, addition, tags, source, cfg, appendVol.value, writeCtx, { actorId: identity.userId, channel: "rest" }, undefined, row.workspace_id as string, ctx, { operationId: typeof body.operation_id === "string" ? body.operation_id.trim() : undefined });
     } catch (e) {
       if (e instanceof WriteConflictError) return json({ ok: false, error: "Entry changed while saving, try again" }, 409);
       if (e instanceof EntryGoneError) return json({ ok: false, error: e.message }, 404);
+      if (e instanceof MemoryInputError) return json({ ok: false, error: e.message }, e.status);
+      if (e instanceof AppendOperationConflictError) return json({ ok: false, error: e.message }, 409);
+      if (e instanceof WorkersAiQuotaError) return workersAiQuotaResponse(e.retryAt, true);
       return json({ ok: false, error: `Append failed: ${(e as Error).message}` }, 500);
     }
     const { indexed, held, wasCanonical, eventId } = appendResult;
 
-    auditEvent(env, ctx, {
+    if (!appendResult.replayed) auditEvent(env, ctx, {
       id: eventId,
       entryId: id, actorId: identity.userId, event: "appended",
       payload: { channel: "rest", ...(wasCanonical ? { was_canonical: true } : {}) },
@@ -330,10 +386,23 @@ export async function handleCaptureRoutes(
     return json({
       ok: true,
       id,
-      semantic_unavailable: !indexed,
-      message: indexed
-        ? "Update appended successfully with timestamp"
-        : `Update appended, but not indexed for semantic search (Vectorize unavailable) — it is still findable by keyword. Fix: ${VECTORIZE_FIX_HINT}.`,
+      replayed: appendResult.replayed,
+      semantic_unavailable: !appendResult.indexed,
+      semantic_unavailable_reason: appendResult.semanticUnavailableReason ?? null,
+      semantic_retry_at: appendResult.semanticRetryAt ?? null,
+      rollover_status: appendResult.rollover.status,
+      content_chars: appendResult.rollover.contentChars,
+      rollover_warn_at: appendResult.rollover.warnAt,
+      rollover_at: appendResult.rollover.rolloverAt,
+      message: appendResult.replayed
+        ? "This append operation was already applied; no duplicate was added"
+        : appendResult.indexed
+          ? "Update appended successfully with timestamp"
+          : appendResult.semanticUnavailableReason === "workers_ai_quota_exhausted"
+            ? `Update appended to D1 and queued for semantic indexing. It is already findable by keyword; scheduled recovery starts after ${new Date(appendResult.semanticRetryAt ?? Date.now()).toISOString()} (09:00 JST), and /vectorize-pending can retry it manually.`
+            : appendResult.semanticUnavailableReason === "vectorize_unavailable"
+              ? `Update appended to D1 and queued for semantic indexing because Vectorize is unavailable. It is already findable by keyword; /vectorize-pending will retry it. Fix: ${VECTORIZE_FIX_HINT}.`
+              : "This append operation was already applied and remains queued for semantic indexing; no duplicate was added. It is already findable by keyword, and /vectorize-pending will retry it.",
     });
   }
 
@@ -418,7 +487,13 @@ export async function handleCaptureRoutes(
     const { ignored: ignoredReservedTags } = stripNewReservedTags(replaceTags ?? []);
 
     const cfg = await resolveConfig(env);
-    const result = await updateEntryContent(env, id, newContent, cfg, updateVol.value, replaceTags, writeCtx, { actorId: identity.userId, channel: "rest" }, row.workspace_id as string, ctx);
+    let result;
+    try {
+      result = await updateEntryContent(env, id, newContent, cfg, updateVol.value, replaceTags, writeCtx, { actorId: identity.userId, channel: "rest" }, row.workspace_id as string, ctx);
+    } catch (error) {
+      if (error instanceof MemoryInputError) return json({ ok: false, error: error.message }, error.status);
+      throw error;
+    }
 
     // Only reachable if the entry was deleted between the guard read and the write.
     if (result.status === "not_found") {
@@ -432,6 +507,7 @@ export async function handleCaptureRoutes(
     }
 
     if (result.status === "reembed_failed") {
+      if (result.reason === "workers_ai_quota_exhausted" && result.retryAt) return workersAiQuotaResponse(result.retryAt, true);
       return json({ ok: false, error: "Couldn't update: search did not update. The memory is unchanged. Try again." }, 500);
     }
 

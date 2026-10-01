@@ -110,7 +110,7 @@ function notionWorstCaseFetch(pushEndpointOk: () => Response) {
 }
 
 describe("the integration-sync cron shares one fetch budget between the mirror sync and push", () => {
-  it("a Notion sync that spends 35 fetches leaves push room for at most 15, never exceeding 50 combined", async () => {
+  it("forkの有界Notion同期とpushがexternal fetchの共有上限50を守る", async () => {
     sq = await migrated();
     const kv = makeMemoryKV();
     await kv.put("integrations:notion", JSON.stringify({
@@ -132,7 +132,7 @@ describe("the integration-sync cron shares one fetch budget between the mirror s
 
     const notionCalls = fetchMock.mock.calls.filter((c) => String(c[0]).includes("api.notion.com")).length;
     const pushCalls = fetchMock.mock.calls.filter((c) => !String(c[0]).includes("api.notion.com")).length;
-    expect(notionCalls).toBe(35);
+    expect(notionCalls).toBe(1);
     // The bug: push always got its own fresh MAX_PUSH_FETCHES_PER_RUN (40) regardless of what
     // the sync just spent. Fixed, push's budget is what's left of the shared ceiling.
     expect(pushCalls).toBeLessThanOrEqual(FREE_PLAN_EXTERNAL_SUBREQUESTS - notionCalls);
@@ -140,7 +140,7 @@ describe("the integration-sync cron shares one fetch budget between the mirror s
     expect(notionCalls + pushCalls).toBeLessThanOrEqual(FREE_PLAN_EXTERNAL_SUBREQUESTS);
   });
 
-  it("with no sync work, push still gets its own full MAX_PUSH_FETCHES_PER_RUN budget", async () => {
+  it("同期がない場合もforkのpush上限10件を処理する", async () => {
     sq = await migrated();
     const env = makeTestEnv(dbOf(sq) as any, { OAUTH_KV: makeMemoryKV() });
     await seedPushWantingManyFetches(env, sq, 20);
@@ -154,6 +154,7 @@ describe("the integration-sync cron shares one fetch budget between the mirror s
 
     // No provider connected, so the sync makes zero fetches — push is not left starved by a
     // budget split that assumes the sync always runs.
-    expect(fetchMock.mock.calls.length).toBe(MAX_PUSH_FETCHES_PER_RUN);
+    expect(fetchMock.mock.calls.length).toBe(10);
+    expect(fetchMock.mock.calls.length).toBeLessThanOrEqual(MAX_PUSH_FETCHES_PER_RUN);
   });
 });

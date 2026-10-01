@@ -15,6 +15,9 @@ coverage/
 # The two files below are meant to be tracked.
 docs/*
 !docs/dashboard-architecture.md
+!docs/fork/
+!docs/fork/*.md
+!docs/team-integration.md
 .claude/
 # .cursor/** rather than .cursor/* so anything else added anywhere under
 # .cursor stays ignored. Only the shipped memory rule is re-included:
@@ -23,7 +26,18 @@ docs/*
 !.cursor/rules/
 !.cursor/rules/second-brain-memory.mdc
 .dev.vars
+.dev.vars.*
+!.dev.vars.example
 .env
+.env.*
+!.env.example
+
+# 資格情報と認証の一時ファイル。サンプルには別の名前を使う。
+*.cred
+pending.json
+registration.json
+credentials.json
+private-settings.json
 worker-configuration.d.ts
 # Per-environment wrangler overrides. wrangler.jsonc is the shared, ID-free
 # config users deploy from; these carry real account resource IDs and stay local.
@@ -40,7 +54,7 @@ devharness/
 
 # ── Anything that could hold somebody's memories ──────────────────────────────
 # `wrangler d1 export` writes every entry, in plaintext, to wherever --output
-# points; docs/local-testing.md sends it to /tmp, but the repo root is one
+# points; a local export can be sent to /tmp, but the repo root is one
 # mistyped flag away. A local D1 is the same content in SQLite form. Neither is
 # ever something to commit, and both are large enough to be committed by
 # accident via `git add -A` and never noticed.
@@ -49,6 +63,9 @@ devharness/
 # test/fixtures/schema-3.7.0.sql is a frozen historical schema fixture (Task 11), not a dump either.
 *.sql
 !db/schema.sql
+!db/fork-write-protection.sql
+!test/fixtures/schema-v3.sql
+!test/fixtures/schema-v7.sql
 !test/fixtures/schema-3.7.0.sql
 *.sqlite
 *.sqlite3

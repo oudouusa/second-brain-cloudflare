@@ -229,8 +229,8 @@ describe("REST /capture and MCP remember parity (workerd-free, in-process)", () 
     await worker.fetch(req("POST", "/capture", { body: { content: "When X, do Y.", standing: true } }), envRest, ctx);
 
     const { buildMcpServer } = await import("../../src/mcp/server");
-    const { Client } = await import("@modelcontextprotocol/sdk/client/index.js");
-    const { InMemoryTransport } = await import("@modelcontextprotocol/sdk/inMemory.js");
+    const { Client } = await import("@modelcontextprotocol/client");
+    const { InMemoryTransport } = await import("@modelcontextprotocol/client");
     const dbMcp = makeTestDb();
     const envMcp = makeTestEnv(dbMcp);
     const server = buildMcpServer(envMcp, ctx);

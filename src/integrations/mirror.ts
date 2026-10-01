@@ -1,18 +1,20 @@
+import { assertMemoryWritesAllowed, memoryWriteMarker } from "../migration/write-lock";
 import type { Env } from "../env";
+import { chatGptEnvForWorkspaces } from "../lib/chatgpt";
 import { resolveConfig, type Config } from "../config";
 import {
   INTEGRATION_PROVIDERS,
   getProvider,
   loadIntegration,
   updateIntegration,
-  deleteIntegration,
+  acquireIntegrationOperation, releaseIntegrationOperation, IntegrationOperationLockedError, renewIntegrationOperation, withIntegrationOperation,
 } from "../integrations";
 import type { IntegrationProvider, MirrorStore } from "./framework";
 import { narrowMirrorLayer } from "./framework";
 import { initializeDatabase } from "../db/init";
 import { forgetEntry } from "../capture/lifecycle";
 import { AUDIT_BATCH_MAX, writeAuditEvents, type AuditEventInput } from "../lib/audit";
-import { deleteStaleVectors, embedContextForRow, storeEntry } from "../capture/store";
+import { deleteStaleVectors, embedContextForRow, storeEntry, upsertEntryVectors, discardUpload } from "../capture/store";
 import { classifyEntry } from "../capture/classify";
 import { withKind } from "../memory/kind";
 import { withStatus } from "../memory/status";
@@ -47,6 +49,7 @@ export function makeMirrorStore(env: Env, writeCtx: WriteContext = OWNER_WRITE_C
   // failure to latch.
   let pending: Promise<Readonly<Config>> | null = resolved ? Promise.resolve(resolved) : null;
   const config = () => (pending ??= resolveConfig(env));
+  const beforeMutation = () => renewIntegrationOperation(env);
 
   // Deletion events wait here and go out in batches, not one INSERT per delete: a
   // calendar retention prune is unbounded and a sync has a D1 budget. The caller
@@ -61,6 +64,7 @@ export function makeMirrorStore(env: Env, writeCtx: WriteContext = OWNER_WRITE_C
   return {
     flushAudit,
     async createEntry(content, tags, source) {
+      await assertMemoryWritesAllowed(env);
       // Re-checks live state, not the record this store was built from (T-0089.7.5, "3.7 had the
       // same problem"): runScheduledIntegrationSync and the manual sync route both check
       // disconnecting only once, before their whole batch starts, so a disconnect purge that
@@ -111,7 +115,7 @@ export function makeMirrorStore(env: Env, writeCtx: WriteContext = OWNER_WRITE_C
       // other held row's classification.
       if (!decision.hold) {
         try {
-          const c = await classifyEntry(content, env, cfg);
+          const c = await classifyEntry(content, chatGptEnvForWorkspaces(env, [writeCtx.workspaceId]), cfg);
           importance = c.importance;
           if (c.kind) finalTags = withKind(finalTags, c.kind);
           if (c.canonical) finalTags = withStatus(finalTags, "canonical");
@@ -122,9 +126,10 @@ export function makeMirrorStore(env: Env, writeCtx: WriteContext = OWNER_WRITE_C
 
       // versioning: exempt: creation — a new row has no prior state to keep
       const insertStatement = env.DB.prepare(
-        `INSERT INTO entries (id, content, tags, source, created_at, updated_at, vector_ids, importance_score, workspace_id, actor_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-      ).bind(id, content, JSON.stringify(finalTags), source, now, now, "[]", importance, writeCtx.workspaceId, writeCtx.actorId);
+        `INSERT INTO entries (id, content, tags, source, created_at, updated_at, vector_ids, importance_score, workspace_id, actor_id, write_marker) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).bind(id, content, JSON.stringify(finalTags), source, now, now, "[]", importance, writeCtx.workspaceId, writeCtx.actorId, memoryWriteMarker(env));
 
+      await beforeMutation();
       if (decision.hold) {
         // Same shape as a held capture (W1): the INSERT (with the tags the sync asked for)
         // and the hold's own version, guarded UPDATE and prune all land in one batch, so a
@@ -153,124 +158,71 @@ export function makeMirrorStore(env: Env, writeCtx: WriteContext = OWNER_WRITE_C
       // connected provider.
       await rememberTags(env, finalTags, writeCtx.workspaceId);
       try {
-        await storeEntry(env, id, content, finalTags, source, now, cfg, writeCtx);
+        await storeEntry(env, id, content, finalTags, source, now, cfg, writeCtx, { expectedContent: content, expectedTagsJson: JSON.stringify(finalTags), expectedSource: source, expectedCreatedAt: now, expectedVectorIdsJson: "[]", beforeMutation });
       } catch (e) {
         console.error("Vectorize insert failed (non-fatal):", e);
       }
       return id;
     },
     async updateEntry(id, content) {
+      await assertMemoryWritesAllowed(env);
       const cfg = await config();
-      // Compare-and-set on the tags (and content) this attempt read (ADV-8): a user's set_status
-      // committed between the read and the batch must not be silently overwritten by tags this
-      // attempt computed from a state that has since moved. A lost attempt re-reads and recomputes
-      // rather than retrying the same stale write, bounded like every other CAS writer.
-      for (let attempt = 1; attempt <= WRITE_CAS_ATTEMPTS; attempt++) {
+      for (let attempt = 0; attempt < WRITE_CAS_ATTEMPTS; attempt++) {
         const row = await env.DB.prepare(
-          // scope-exempt: by-id: the mirrored row this connector wrote
-          `SELECT content, tags, source, vector_ids, workspace_id FROM entries WHERE id = ?`
-        ).bind(id).first() as Record<string, any> | null;
+          // scope-exempt: 接続のitem mapから解決した既存行のみ更新する。
+          `SELECT content, tags, source, vector_ids, workspace_id, created_at FROM entries WHERE id = ?`
+        ).bind(id).first<Record<string, any>>();
         if (!row) return "not_found";
-
-        const readContent: string = row.content;
-        const readTags: string = row.tags ?? "[]";
-        const tags: string[] = JSON.parse(readTags);
-        const oldVectorIds: string[] = JSON.parse(row.vector_ids ?? "[]");
-
-        let refreshedTags = tagsAfterWrite(tags);
+        const tags = JSON.parse(row.tags ?? "[]") as string[];
+        const refreshedTags = tagsAfterWrite(tags);
         const now = Date.now();
         const change = { actorId: writeCtx.actorId, channel: "system:mirror" as const };
-
-        // Track 4 (5.1, 5.4 W-e): scored on every changed sync. D4.1: an already-held row is
-        // never rescored — quarantine:* is worker-owned, so tagsAfterWrite above leaves it on
-        // refreshedTags regardless, and a benign re-sync must not look like a release.
-        const alreadyHeld = isHeld(tags);
-        const score = alreadyHeld ? null : scoreWrite(
-          { content, tags: refreshedTags, source: row.source as string, channel: "system:mirror", kind: "update" }, cfg,
-        );
-        // Codex review class D (T-0089.4.2): a `partial` score holds too, reason too_long.
-        const decision = score ? holdDecision(score) : { hold: false as const };
+        const decision = isHeld(tags) ? { hold: false as const } : holdDecision(scoreWrite({ content,
+          tags: refreshedTags, source: row.source, channel: "system:mirror", kind: "update" }, cfg));
         const heldTags = decision.hold ? heldTagsFor(refreshedTags, decision.reasons) : null;
-
-        // Versioned, keeping the last MIRROR_VERSION_KEEP (D1.1): the normal prune caps the row
-        // at VERSION_KEEP whatever it holds, and the mirror prune below brings it back to 3 once
-        // no user version remains in the window (N1) — both bottom-up, so the chain stays contiguous.
-        const results = await env.DB.batch([
-          snapshotStatement(env, {
-            entryId: id, reason: "mirror", change,
-            content: { kind: "next", content }, nextTags: refreshedTags, meta: { provider: providerId }, now,
-            guard: p => `e.content = ${p.add(readContent)} AND e.tags = ${p.add(readTags)}`,
-          }),
-          // versioning: snapshot — updated_at clamped strictly past its own previous value (the
-          // digest mark guard trusts it plus byte length; a same-millisecond, same-length sync
-          // with no clamp would leave it unmoved and invisible to it).
-          env.DB.prepare(`UPDATE entries SET content = ?, tags = ?, updated_at = MAX(?, COALESCE(updated_at, created_at) + 1) WHERE id = ? AND content = ? AND tags = ?`)
-            .bind(content, JSON.stringify(refreshedTags), now, id, readContent, readTags),
-          pruneStatement(env, id, cfg.VERSION_KEEP),
-          mirrorPruneStatement(env, id, Math.min(MIRROR_VERSION_KEEP, cfg.VERSION_KEEP)),
-          // 5.4: holdStatements appended to the same batch — the edit is its own version and the
-          // hold is the next. Guarded on the edit's OWN post-state, so a lost race (the UPDATE
-          // above changed nothing) cannot land the hold either.
-          ...(heldTags && decision.hold ? holdStatements(env, { snapshotStatement, pruneStatement, versionKeep: cfg.VERSION_KEEP }, {
-            entryId: id, reasons: decision.reasons, score: decision.score, signals: decision.signals, change, heldTags, now,
-            // holdStatements' own UPDATE targets plain `entries`, unaliased (unlike snapshotStatement's `entries e` above).
-            guard: p => `content = ${p.add(content)} AND tags = ${p.add(JSON.stringify(refreshedTags))}`,
-          }) : []),
-        ]);
-        if (changesOf(results[1]) === 0) continue;
-
-        if (heldTags) {
-          // No pre-commit re-embed here (saves a model call): a held update is never vectorized.
-          // The row's PRIOR vectors are deleted after commit, same as deprecateEntry (5.3 point 1).
-          if (oldVectorIds.length) {
-            try {
-              await deleteEntryVectors(env, [{ entryId: id, vectorIds: oldVectorIds }]);
-            } catch (e) {
-              console.error("Vectorize delete failed after a held mirror update (non-fatal):", e);
-            }
-          }
-          return "updated";
-        }
-        if (alreadyHeld) {
-          // Codex review class A (T-0089.4.2): a benign re-sync of an already-held row (D4.1) —
-          // refreshedTags still carries the quarantine: tag, so this skips storeEntry entirely
-          // rather than reaching upsertEntryVectors' own gate only to have it refused.
-          return "updated";
-        }
-
-        // The sync's write context decides where a NEW mirror goes (createEntry).
-        // An UPDATE refreshes a row whose home is already decided and may have moved
-        // since this batch's context was resolved (#351) — stamp from the row itself,
-        // exactly as the manual-edit path does.
         const embedCtx = embedContextForRow(row, writeCtx);
-        let newVectorIds: string[] = [];
-        let committed = false;
+        // 本文と新vector参照を同じCASで確定する。remote部分成功もoutboxが追跡する。
+        await beforeMutation();
+        const uploaded = heldTags || isHeld(tags) ? null : await upsertEntryVectors(env, id, content, refreshedTags, row.source, now, cfg, embedCtx,
+          { batchEmbeds: true, beforeMutation });
+        const vectorIds = uploaded?.vectorIds ?? [];
+        const guard = (p: { add(v: unknown): string }) => `e.content = ${p.add(row.content)} AND e.tags = ${p.add(row.tags)} AND e.vector_ids = ${p.add(row.vector_ids)} AND e.workspace_id = ${p.add(row.workspace_id)} AND e.created_at = ${p.add(row.created_at)}`;
+        let results;
         try {
-          // Compare-and-set on the vector_ids read with the row (round 6): the old ids are retired
-          // below only if this upload is what replaced them.
-          const stored = await storeEntry(env, id, content, refreshedTags, row.source as string, now, cfg, embedCtx, { expectedVectorIds: (row.vector_ids as string) ?? "[]" });
-          newVectorIds = stored.vectorIds;
-          committed = stored.committed !== false;
-        } catch (e) {
-          console.error("Vectorize re-embed failed (non-fatal):", e);
-        }
-        if (committed) {
-          try {
-            await deleteStaleVectors(env, id, oldVectorIds, newVectorIds);
-          } catch (e) {
-            console.error("Old vector cleanup failed (non-fatal):", e);
-          }
-        }
+          await beforeMutation();
+          results = await env.DB.batch([
+            snapshotStatement(env, { entryId: id, reason: "mirror", change, content: { kind: "next", content }, nextTags: refreshedTags,
+              meta: { provider: providerId }, now, guard }),
+            // versioning: snapshot
+            env.DB.prepare(`UPDATE entries SET content = ?, tags = ?, vector_ids = ?, pending_append_passages = '[]', updated_at = MAX(?, COALESCE(updated_at, created_at) + 1), write_marker = ?
+              WHERE id = ? AND content = ? AND tags = ? AND vector_ids = ? AND workspace_id = ? AND created_at = ?`)
+              .bind(content, JSON.stringify(refreshedTags), JSON.stringify(vectorIds), now, memoryWriteMarker(env), id, row.content, row.tags, row.vector_ids, row.workspace_id, row.created_at),
+            pruneStatement(env, id, cfg.VERSION_KEEP),
+            mirrorPruneStatement(env, id, Math.min(MIRROR_VERSION_KEEP, cfg.VERSION_KEEP)),
+            ...(heldTags && decision.hold ? holdStatements(env, { snapshotStatement, pruneStatement, versionKeep: cfg.VERSION_KEEP }, {
+              entryId: id, reasons: decision.reasons, score: decision.score, signals: decision.signals, change, heldTags, now,
+              guard: p => `content = ${p.add(content)} AND tags = ${p.add(JSON.stringify(refreshedTags))} AND workspace_id = ${p.add(row.workspace_id)}`,
+            }) : []),
+            env.DB.prepare(`INSERT INTO vector_cleanup_ops (op_id, entry_id, vector_ids, created_at, ready, expires_at, write_marker)
+              VALUES (?, ?, ?, ?, 1, ?, ?)`)
+              .bind(crypto.randomUUID(), id, row.vector_ids, now, now, memoryWriteMarker(env)),
+          ]);
+        } catch (error) { await discardUpload(env, id, vectorIds); throw error; }
+        if (changesOf(results[1]) === 0) { await discardUpload(env, id, vectorIds); continue; }
+        try {
+          await beforeMutation();
+          await deleteEntryVectors(env, [{ entryId: id, vectorIds: JSON.parse(row.vector_ids) }]);
+        } catch (error) { console.error("Mirror cleanup deferred:", error); }
         return "updated";
       }
-      // The row is still live (ADV-8's fix already checked that above) — every attempt just lost
-      // the race. Distinct from "not_found": a caller reading this as "gone" and re-creating the
-      // mirror duplicates the memory (round 2 adversary). The next sync retries it untouched.
-      console.error(`Mirror update lost its compare-and-set ${WRITE_CAS_ATTEMPTS} times in a row (non-fatal): ${id}`);
       return "busy";
     },
     async deleteEntry(id) {
-      const r = await forgetEntry(id, env, { actorId: writeCtx.actorId, channel: "system:mirror" }, { reason: "mirror", config: await config(), purge: false }, writeCtx.workspaceId);
+      await beforeMutation();
+      // scope-exempt: 認証済接続のitem mapが指定したrowの現在workspaceを削除CASへ渡す。
+      const row = await env.DB.prepare(`SELECT workspace_id FROM entries WHERE id = ?`).bind(id).first<{ workspace_id: string }>();
+      if (!row) return;
+      const r = await forgetEntry(id, env, { actorId: writeCtx.actorId, channel: "system:mirror" }, { reason: "mirror", config: await config(), purge: false, beforeMutation }, row.workspace_id);
       if (r.status !== "deleted") return;
       auditBuffer.push({
         entryId: id,
@@ -363,7 +315,6 @@ export async function runScheduledIntegrationSync(env: Env, resolved?: Readonly<
   let dueSince = Infinity;
   for (const provider of Object.values(INTEGRATION_PROVIDERS)) {
     const record = await loadIntegration(env, provider.id);
-    // A record being disconnected is mid-purge: syncing it would re-create what the purge just trashed.
     if (!record || record.disconnecting) continue;
     // Strict <, so registry order breaks ties deterministically — which is what
     // orders the first run after two providers are connected together.
@@ -376,16 +327,33 @@ export async function runScheduledIntegrationSync(env: Env, resolved?: Readonly<
   if (!due) return;
 
   await initializeDatabase(env);
-  const record = await loadIntegration(env, due.id);
-  const store = makeMirrorStore(env, await mirrorWriteContext(env, record), resolved, due.id);
+  let operation;
   try {
+    operation = await acquireIntegrationOperation(env, due.id, "sync");
+  } catch (error) {
+    if (error instanceof IntegrationOperationLockedError) return;
+    throw error;
+  }
+  const operationEnv = withIntegrationOperation(env, operation);
+  try {
+    const record = await loadIntegration(operationEnv, due.id);
+    // 保存先未指定の旧接続は従来のlegacy workspaceを維持する。
+    // layer/connectで明示された接続だけ、所有者の現行保存先を解決する。
+    const writeCtx = record?.config?.mirrorWorkspace === undefined
+      ? OWNER_WRITE_CONTEXT : await mirrorWriteContext(operationEnv, record);
+    const store = makeMirrorStore(operationEnv, writeCtx, resolved, due.id);
+    try {
     for (let i = 0; i < CRON_SYNC_MAX_BATCHES; i++) {
-      const result = await due.sync(env, store);
+      const result = await due.sync(operationEnv, store);
       if (!result.ok || result.remaining === 0) break;
     }
+    } finally { await store.flushAudit(); }
   } finally {
-    await store.flushAudit();
-    await advanceRotationCursor(env, due.id);
+    try {
+      await advanceRotationCursor(operationEnv, due.id);
+    } finally {
+      await releaseIntegrationOperation(env, operation);
+    }
   }
 }
 

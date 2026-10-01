@@ -4,6 +4,7 @@ import { runWeeklyInsights } from "../../src/insight/weekly";
 import { resetDatabaseInit, initializeDatabase } from "../../src/db/init";
 import { makeTestEnv, makeMemoryKV, makeVectorizeMock } from "../helpers/make-env";
 import { makeSqliteD1, type SqliteD1 } from "../helpers/sqlite-d1";
+import { pricingInsight, PRICING_INSIGHTS } from "../helpers/insight-fixture";
 import type { Env } from "../../src/env";
 
 const DAY = 86400000;
@@ -20,7 +21,7 @@ const sse = (text: string) => new ReadableStream({
 function makeAI(decision: () => string) {
   return {
     run: vi.fn().mockImplementation(async (model: string, opts: any) => {
-      if (model.startsWith("@cf/baai/bge")) return { data: [new Array(384).fill(0.1)] };
+      if (model === "@cf/google/embeddinggemma-300m") return { data: [new Array(768).fill(0.1)] };
       const prompt = String(opts?.messages?.[0]?.content ?? "");
       if (prompt.includes("Choose exactly one action") || prompt.includes("checking if a new memory contradicts")) return sse(decision());
       return opts?.stream ? sse("A digest of the work memories.") : { response: "3" };
@@ -40,24 +41,24 @@ describe("ADV systemWrite", () => {
     vi.spyOn(Date, "now").mockImplementation(() => now);
     resetDatabaseInit();
     sqlite = makeSqliteD1();
-    env = makeTestEnv(undefined, {
+    env = sqlite.admitEnv(makeTestEnv(undefined, {
       DB: sqlite.db as any, AI: makeAI(() => decision()), OAUTH_KV: makeMemoryKV(),
       VECTORIZE: makeVectorizeMock({ query: vi.fn().mockImplementation(async () => ({ matches: target ? [{ id: target, score, metadata: { parentId: target } }] : [] })) }),
-    }) as Env;
+    })) as Env;
     await initializeDatabase(env);
-    for (let i = 0; i < 12; i++) sqlite.seed({ id: `w-${i}`, content: `Memory about work number ${i}`, createdAt: now - 200 * DAY + i, tags: ["work"] });
+    for (let i = 0; i < 12; i++) sqlite.seed({ id: `w-${i}`, content: `Memory about work number ${i}`, createdAt: now - 200 * DAY + i, tags: ["rocket-project"] });
   });
   afterEach(() => { sqlite.close(); vi.restoreAllMocks(); });
 
   it("A: flagged digest (merge into its OWN earlier digest) inserts an orphan row, sources never roll up, repeats", async () => {
-    sqlite.seed({ id: "old-digest", content: "[Synthesized from 12 entries tagged \"work\"]\n\nOlder digest", createdAt: now - 3 * DAY, tags: ["synthesized", "work"], source: "system" });
+    sqlite.seed({ id: "old-digest", content: "[Synthesized from 12 entries tagged \"work\"]\n\nOlder digest", createdAt: now - 3 * DAY, tags: ["synthesized", "rocket-project"], source: "system" });
     target = "old-digest"; score = 0.9;
     decision = () => JSON.stringify({ action: "merge", target_id: "old-digest", merged_content: "combined digest" });
-    const r1 = await compressTag("work", env, ctx);
+    const r1 = await compressTag("rocket-project", env, ctx);
     now += 2 * DAY;
-    const r2 = await compressTag("work", env, ctx);
+    const r2 = await compressTag("rocket-project", env, ctx);
     now += 2 * DAY;
-    const r3 = await compressTag("work", env, ctx);
+    const r3 = await compressTag("rocket-project", env, ctx);
     const rows = sqlite.rows();
     const digests = rows.filter(r => String(r.tags).includes('"synthesized"'));
     const rolled = rows.filter(r => String(r.tags).includes('"rolled-up"'));
@@ -72,9 +73,9 @@ describe("ADV systemWrite", () => {
   it("B: a row whose source string is 'system' but written by a user is deprecated by a digest contradiction", async () => {
     // What POST /capture {source:"system"} or MCP remember {source:"system"} stores.
     sqlite.seed({ id: "user-row", content: "We decided the work plan is X", createdAt: now - 1 * DAY, tags: ["decisions"], source: "system" });
-    target = "user-row"; score = 0.8; // below flag, above candidate: contradiction-only prompt
+    target = "user-row"; score = 0.7; // below flag, above candidate: contradiction-only prompt
     decision = () => JSON.stringify({ contradicts: true, conflicting_id: "user-row", reason: "changed" });
-    await compressTag("work", env, ctx);
+    await compressTag("rocket-project", env, ctx);
     const row = sqlite.rows().find(r => r.id === "user-row")!;
     console.log("user-row tags", row.tags);
     expect(String(row.tags)).not.toContain("status:deprecated");
@@ -82,9 +83,9 @@ describe("ADV systemWrite", () => {
 
   it("C: a protected contradiction leaves the user row alone and stores a draft digest without rolling sources up", async () => {
     sqlite.seed({ id: "user-row", content: "We decided the work plan is X", createdAt: now - 1 * DAY, tags: ["decisions"], source: "api" });
-    target = "user-row"; score = 0.8;
+    target = "user-row"; score = 0.7;
     decision = () => JSON.stringify({ contradicts: true, conflicting_id: "user-row", reason: "changed" });
-    const r = await compressTag("work", env, ctx);
+    const r = await compressTag("rocket-project", env, ctx);
     const rows = sqlite.rows();
     const user = rows.find(x => x.id === "user-row")!;
     const digests = rows.filter(x => String(x.tags).includes('"synthesized"'));
@@ -100,11 +101,11 @@ describe("ADV systemWrite", () => {
   });
 
   it("D: a user row that merely carries the system tags but has an actor is still protected from merge", async () => {
-    sqlite.seed({ id: "user-digest", content: "[Synthesized from 12 entries tagged \"work\"]\n\nMine", createdAt: now - 3 * DAY, tags: ["synthesized", "work"], source: "system" });
+    sqlite.seed({ id: "user-digest", content: "[Synthesized from 12 entries tagged \"work\"]\n\nMine", createdAt: now - 3 * DAY, tags: ["synthesized", "rocket-project"], source: "system" });
     sqlite.db.prepare(`UPDATE entries SET actor_id = 'u1' WHERE id = 'user-digest'`).run();
     target = "user-digest"; score = 0.9;
     decision = () => JSON.stringify({ action: "merge", target_id: "user-digest", merged_content: "combined" });
-    await compressTag("work", env, ctx);
+    await compressTag("rocket-project", env, ctx);
     const row = sqlite.rows().find(r => r.id === "user-digest")!;
     expect(row.content).toContain("Mine");
     expect(sqlite.rows().filter(r => String(r.tags).includes('"synthesized"')).length).toBe(2);
@@ -123,7 +124,7 @@ describe("ADV systemWrite", () => {
     const base = ai.run.getMockImplementation();
     ai.run.mockImplementation(async (model: string, opts: any) => {
       const prompt = String(opts?.messages?.[0]?.content ?? "");
-      if (prompt.includes("Memory A:")) return sse('{"insight": true, "shape": "contradiction", "text": "You priced this tier at nine dollars flat, then moved it entirely to usage-based billing."}');
+      if (prompt.includes("Memory A:")) return sse(pricingInsight(PRICING_INSIGHTS["0"]));
       return base(model, opts);
     });
     await runWeeklyInsights(env, ctx);
@@ -166,10 +167,10 @@ describe("ADV systemWrite", () => {
       const prompt = String(opts?.messages?.[0]?.content ?? "");
       if (prompt.includes("Memory A:")) {
         if (prompt.includes("price tier")) {
-          return sse('{"insight": true, "shape": "contradiction", "text": "The predictable nine dollars price gave way once the plan moved to usage-based billing."}');
+          return sse(pricingInsight(PRICING_INSIGHTS["0"]));
         }
         if (prompt.includes("design review")) {
-          return sse('{"insight": true, "shape": "contradiction", "text": "The whole team review moved from Thursday afternoon to Tuesday mornings because client calls conflicted."}');
+          return sse(JSON.stringify({ insight: true, shape: "contradiction", text: "チーム全員の設計レビューを毎週木曜日の午後に開く方針から、顧客との通話予定が重なるため、火曜日の午前に変更する判断をしています。", evidence: { a: "every Thursday afternoon", b: "Tuesday mornings because Thursday conflicted with client calls" } }));
         }
       }
       return base(model, opts);

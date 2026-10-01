@@ -26,6 +26,9 @@
     "via_type": null,
     "linked_at": null,
     "related_to": null,
+    "via_source_id": null,
+    "via_target_id": null,
+    "via_direction": null,
     "similar": [],
     "edited_canonical_at": null,
     "valid_from": 1790164800000,
@@ -54,6 +57,9 @@
     "via_type": null,
     "linked_at": null,
     "related_to": null,
+    "via_source_id": null,
+    "via_target_id": null,
+    "via_direction": null,
     "similar": [],
     "edited_canonical_at": null,
     "valid_from": 1789473600000,
@@ -84,6 +90,9 @@
     "via_type": null,
     "linked_at": null,
     "related_to": null,
+    "via_source_id": null,
+    "via_target_id": null,
+    "via_direction": null,
     "similar": [],
     "edited_canonical_at": null,
     "valid_from": 1781697600000,
@@ -95,7 +104,17 @@
    }
   ],
   "insight": "3",
-  "semantic_unavailable": false
+  "graph_contribution": {
+   "requestedHops": 0,
+   "seedCount": 0,
+   "expandedCount": 0,
+   "eligibleCount": 0,
+   "selectedCount": 0
+  },
+  "semantic_unavailable": false,
+  "semantic_unavailable_reason": null,
+  "semantic_retry_at": null,
+  "query_signal_cache_hit": false
  },
  "restHops": {
   "ok": true,
@@ -124,6 +143,9 @@
     "via_type": null,
     "linked_at": null,
     "related_to": null,
+    "via_source_id": null,
+    "via_target_id": null,
+    "via_direction": null,
     "similar": [],
     "edited_canonical_at": null,
     "valid_from": 1790164800000,
@@ -152,6 +174,9 @@
     "via_type": null,
     "linked_at": null,
     "related_to": null,
+    "via_source_id": null,
+    "via_target_id": null,
+    "via_direction": null,
     "similar": [],
     "edited_canonical_at": null,
     "valid_from": 1789473600000,
@@ -182,6 +207,9 @@
     "via_type": null,
     "linked_at": null,
     "related_to": null,
+    "via_source_id": null,
+    "via_target_id": null,
+    "via_direction": null,
     "similar": [],
     "edited_canonical_at": null,
     "valid_from": 1781697600000,
@@ -193,8 +221,18 @@
    }
   ],
   "insight": "3",
-  "semantic_unavailable": false
+  "graph_contribution": {
+   "requestedHops": 1,
+   "seedCount": 3,
+   "expandedCount": 1,
+   "eligibleCount": 0,
+   "selectedCount": 0
+  },
+  "semantic_unavailable": false,
+  "semantic_unavailable_reason": null,
+  "semantic_retry_at": null,
+  "query_signal_cache_hit": false
  },
- "mcp": "1. [Sep 23, 2026 · api [status:canonical, work]] (100% match)\nID: e1\nAtlas ledger decision for gatewright\n\n2. [Sep 15, 2026 · api] (53% match)\nID: e3\nAtlas planning notes\n\n3. [Jun 17, 2026 · api [idea]] (24% match)\nID: e2\nA second memory about ledgers",
- "mcpHops": "1. [Sep 23, 2026 · api [status:canonical, work]] (100% match)\nID: e1\nAtlas ledger decision for gatewright\n\n2. [Sep 15, 2026 · api] (53% match)\nID: e3\nAtlas planning notes\n\n3. [Jun 17, 2026 · api [idea]] (24% match)\nID: e2\nA second memory about ledgers"
+ "mcp": "1. [Sep 23, 2026 · api [status:canonical, work]] (relative score: 1.00)\nID: e1\nAtlas ledger decision for gatewright\n\n2. [Sep 15, 2026 · api] (relative score: 0.53)\nID: e3\nAtlas planning notes\n\n3. [Jun 17, 2026 · api [idea]] (relative score: 0.24)\nID: e2\nA second memory about ledgers",
+ "mcpHops": "1. [Sep 23, 2026 · api [status:canonical, work]] (relative score: 1.00)\nID: e1\nAtlas ledger decision for gatewright\n\n2. [Sep 15, 2026 · api] (relative score: 0.53)\nID: e3\nAtlas planning notes\n\n3. [Jun 17, 2026 · api [idea]] (relative score: 0.24)\nID: e2\nA second memory about ledgers\n\nGraph contribution: 0 selected / 0 eligible / 1 expanded from 3 seeds (hops 1)."
 }

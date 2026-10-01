@@ -39,10 +39,11 @@ describe("#351: mirror updateEntry stamps vectors from the row's own workspace",
   it("updateEntry re-stamps vectors with the row's own workspace, not the sync's write context", async () => {
     const { vectorize, store } = makeStatefulVectorizeMock();
     const d1 = makeSqliteD1();
-    const env = { ...makeTestEnv(d1.db as unknown as D1Mock, { VECTORIZE: vectorize, OAUTH_KV: makeMemoryKV() }), AUTH_TOKEN: "test-token" } as Env;
+    let env = { ...makeTestEnv(d1.db as unknown as D1Mock, { VECTORIZE: vectorize, OAUTH_KV: makeMemoryKV() }), AUTH_TOKEN: "test-token" } as Env;
     resetDatabaseInit();
     await initializeDatabase(env);
     const roots = await ensureTenantBootstrap(env);
+    env = d1.admitEnv(env);
     const helper = makeCtx();
 
     await captureEntry("Mirrored page, later moved to company", [], "notion", env, helper.ctx, undefined, {

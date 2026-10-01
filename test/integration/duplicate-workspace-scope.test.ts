@@ -60,7 +60,7 @@ function seed(id: string, workspaceId: string, actorId: string, content: string)
 function scriptedAI(verdict: string, prompts: string[]): Ai {
   return {
     run: vi.fn().mockImplementation(async (model: string, opts: any) => {
-      if (model === "@cf/baai/bge-small-en-v1.5") return { data: [new Array(384).fill(0.1)] };
+      if (model === "@cf/google/embeddinggemma-300m") return { data: [new Array(768).fill(0.1)] };
       prompts.push(String(opts?.messages?.[0]?.content ?? ""));
       return new ReadableStream({
         start(c) {
@@ -118,6 +118,9 @@ beforeEach(async () => {
   const b = await createMember(env, { name: "Bob" });
   alice = { userId: a.member.userId, personalWorkspaceId: a.member.personalWorkspaceId };
   bob = { userId: b.member.userId, personalWorkspaceId: b.member.personalWorkspaceId };
+  // captureEntry is called directly below, outside the Worker request wrapper
+  // that normally acquires this capability.
+  env = sqlite.admitEnv(env);
   void roots;
 });
 
@@ -262,7 +265,8 @@ describe("the writer's own duplicates are still found, and still merged", () => 
       actorId: alice.userId,
     });
 
-    expect(result).toEqual({ status: "merged", id: "a-old" });
+    expect(result).toMatchObject({ status: "merged", id: "a-old" });
+    expect((await env.DB.prepare(`SELECT content, reason FROM entry_versions WHERE entry_id = ? ORDER BY seq DESC LIMIT 1`).bind(result.status === "merged" ? result.id : "").first())?.reason).toBe("merge");
     expect(await contentOf("a-old")).toBe("Alice: the counter-offer is 180 and the walk-away is 165");
     expect(prompts.join("\n")).toContain("Alice: the counter-offer is 180");
   });
@@ -285,7 +289,8 @@ describe("the writer's own duplicates are still found, and still merged", () => 
       { workspaceId: company.id, actorId: alice.userId },
     );
 
-    expect(result).toEqual({ status: "merged", id: "co-old" });
+    expect(result).toMatchObject({ status: "merged", id: "co-old" });
+    expect((await env.DB.prepare(`SELECT content, reason FROM entry_versions WHERE entry_id = ? ORDER BY seq DESC LIMIT 1`).bind(result.status === "merged" ? result.id : "").first())?.reason).toBe("merge");
     expect(await contentOf("co-old")).toBe("Company: the release freeze starts Monday and lifts Friday");
   });
 
@@ -307,7 +312,8 @@ describe("the writer's own duplicates are still found, and still merged", () => 
     });
 
     expect(vectorizeFilterState().supported).toBe(false);
-    expect(result).toEqual({ status: "merged", id: "solo-old" });
+    expect(result).toMatchObject({ status: "merged", id: "solo-old" });
+    expect((await env.DB.prepare(`SELECT content, reason FROM entry_versions WHERE entry_id = ? ORDER BY seq DESC LIMIT 1`).bind(result.status === "merged" ? result.id : "").first())?.reason).toBe("merge");
     expect(await contentOf("solo-old")).toBe("Solo: the counter-offer is 180 and the walk-away is 165");
     expect(prompts.join("\n")).toContain("Solo: the counter-offer is 180");
   });

@@ -25,8 +25,8 @@ describe("GET /tags", () => {
 
   it("returns distinct sorted tags across all entries", async () => {
     db.entries.push(
-      { id: "1", content: "A", tags: '["work","react"]', source: "api", created_at: 1, vector_ids: "[]" },
-      { id: "2", content: "B", tags: '["react","typescript"]', source: "api", created_at: 2, vector_ids: "[]" },
+      { id: "1", content: "A", tags: '["work","react"]', source: "api", created_at: 1, vector_ids: "[]", workspace_id: "", actor_id: "" },
+      { id: "2", content: "B", tags: '["react","typescript"]', source: "api", created_at: 2, vector_ids: "[]", workspace_id: "", actor_id: "" },
     );
 
     const res = await worker.fetch(req("GET", "/tags"), env, ctx);

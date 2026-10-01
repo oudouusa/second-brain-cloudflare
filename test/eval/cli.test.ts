@@ -1,3 +1,5 @@
+import { syntheticGemmaPricing } from "./fork-synthetic";
+syntheticGemmaPricing();
 import { existsSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -326,9 +328,10 @@ describe("main (end to end on a tiny registered corpus)", () => {
 
     it("run records limit and the golden-data fingerprint in the report", async () => {
       const out = outPath();
+      registerCorpusProvider("tiny-fingerprint", id => id === "tiny-fingerprint", async () => ({ ...(await resolveCorpus("tiny-cli")), id: "tiny-fingerprint", dataFingerprint: buildCorpus("core-1k").dataFingerprint }));
       const log = vi.spyOn(console, "log").mockImplementation(() => {});
       try {
-        expect(await main(["--variant", "baseline", "--corpus", "core-1k", "--hash-embeddings", "--limit", "3", "--json", out])).toBe(0);
+        expect(await main(["--variant", "baseline", "--corpus", "tiny-fingerprint", "--hash-embeddings", "--limit", "3", "--json", out])).toBe(0);
       } finally { log.mockRestore(); }
       const r = JSON.parse(readFileSync(out, "utf8")) as VariantReport;
       expect(r.limit).toBe(3);

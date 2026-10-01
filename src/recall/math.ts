@@ -132,7 +132,7 @@ function scoredMultiplier(
   const combined = Math.min(1.0, recency * frequency);
   // metadata.isUpdate marks an append's own chunk; "-update-" is 3.7's deterministic id for one.
   const isShortAppend = (meta?.isUpdate === true || match.id.includes("-update-")) &&
-    typeof meta?.content === "string" && meta.content.length < CHUNK_OVERLAP_CHARS;
+    typeof meta?.content === "string" && meta.content.length < CHUNK_OVERLAP_CHARS && meta?.keywordSupported !== true;
   const appendPenalty = isShortAppend ? 0.2 : 1.0;
   const rolledUpPenalty = tags.includes("rolled-up") ? 0.4 : 1.0;
 

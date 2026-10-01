@@ -14,6 +14,8 @@ import { initializeDatabase, resetDatabaseInit } from "../../src/db/init";
 import type { Env } from "../../src/env";
 import { nextWorkspace } from "../../src/runtime/rotation";
 import { runStalenessPass, STALENESS_AGE_MS } from "../../src/staleness/pass";
+import { ensureTenantBootstrap } from "../../src/lib/tenancy";
+import { memoryWriteMarker } from "../../src/migration/write-lock";
 
 async function makeEnv() {
   const d1 = makeSqliteD1();
@@ -22,7 +24,8 @@ async function makeEnv() {
   // The init memo is module-scoped; each fresh database needs the seam reset first.
   resetDatabaseInit();
   await initializeDatabase(env);
-  return { d1, env, ctx };
+  await ensureTenantBootstrap(env);
+  return { d1, env: d1.admitEnv(env) as Env, ctx };
 }
 
 /** Insert an entry directly into a workspace (bypassing capture's tenancy plumbing). */
@@ -58,6 +61,8 @@ describe("nextWorkspace", () => {
     await seedEntry(env, "legacy-1", "");
     await seedEntry(env, "a-1", "ws-a");
     expect(await nextWorkspace(env)).toBe("ws-a");
+    await env.DB.prepare(`UPDATE entries SET write_marker = ? WHERE workspace_id = 'ws-a'`)
+      .bind(memoryWriteMarker(env, "delete")).run();
     await env.DB.prepare(`DELETE FROM entries WHERE workspace_id = 'ws-a'`).run();
 
     // ws-a no longer has rows, but it is still the stored position: nothing sorts after
@@ -71,7 +76,9 @@ describe("nextWorkspace", () => {
     expect(await nextWorkspace(env)).toBeNull();
     const row = await cursorRow(env);
     expect(row.workspace_id).toBe("");
-    expect(row.advanced_at).toBe(0);
+    // Tenancy bootstrap seeds the cursor before the first cron; an empty ring
+    // leaves that bootstrap stamp untouched.
+    expect(row.advanced_at).toBeGreaterThan(0);
   });
 
   it("updates the cursor row: workspace_id moves and advanced_at is stamped", async () => {
@@ -80,7 +87,7 @@ describe("nextWorkspace", () => {
 
     const before = await cursorRow(env);
     expect(before.workspace_id).toBe("");
-    expect(before.advanced_at).toBe(0);
+    expect(before.advanced_at).toBeGreaterThan(0);
 
     const beforeMs = Date.now();
     expect(await nextWorkspace(env)).toBe("ws-a");

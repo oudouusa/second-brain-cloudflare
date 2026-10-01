@@ -17,12 +17,12 @@ describe("GET /entry", () => {
   });
 
   it("requires auth", async () => {
-    const res = await worker.fetch(req("GET", "/entry?id=a", { token: null }), env, ctx);
+    const res = await worker.fetch(req("POST", "/entry?id=a", { token: null }), env, ctx);
     expect(res.status).toBe(401);
   });
 
   it("returns 400 when id is missing", async () => {
-    const res = await worker.fetch(req("GET", "/entry"), env, ctx);
+    const res = await worker.fetch(req("POST", "/entry"), env, ctx);
     expect(res.status).toBe(400);
   });
 
@@ -30,7 +30,7 @@ describe("GET /entry", () => {
     const longContent = "A memory well past the eighty character graph label limit — ".repeat(4);
     db.entries.push({ id: "a", content: longContent, tags: '["work","kind:semantic"]', source: "api", created_at: 1234, vector_ids: '["v"]', recall_count: 3, importance_score: 4 });
 
-    const res = await worker.fetch(req("GET", "/entry?id=a"), env, ctx);
+    const res = await worker.fetch(req("POST", "/entry?id=a"), env, ctx);
     expect(res.status).toBe(200);
     const data = await res.json() as any;
     expect(data.ok).toBe(true);
@@ -52,6 +52,9 @@ describe("GET /entry", () => {
       recall_count: 3,
       contradiction_wins: 0,
       contradiction_losses: 0,
+      memory_tier: "warm",
+      pinned: false,
+      last_recalled_at: null,
       indexed: true,
       when_at: null,
       when_kind: null,
@@ -62,6 +65,7 @@ describe("GET /entry", () => {
       // a solo brain: the author lock only ever engages on the company layer.
       can_edit: true,
       timeline: [],
+      legacyVersions: [],
       valid_from: 1234,
       valid_from_stated: false,
       valid_until: null,
@@ -76,7 +80,7 @@ describe("GET /entry", () => {
   it("reports a memory recall cannot see as unindexed", async () => {
     db.entries.push({ id: "pending", content: "Just captured", tags: "[]", source: "api", created_at: 1, vector_ids: "[]" });
 
-    const res = await worker.fetch(req("GET", "/entry?id=pending"), env, ctx);
+    const res = await worker.fetch(req("POST", "/entry?id=pending"), env, ctx);
     const data = await res.json() as any;
     expect(data.entry.indexed).toBe(false);
   });
@@ -84,14 +88,14 @@ describe("GET /entry", () => {
   it("prefers updated_at when the memory has been edited since capture", async () => {
     db.entries.push({ id: "edited", content: "Changed", tags: "[]", source: "api", created_at: 1000, updated_at: 9000, vector_ids: '["v"]' });
 
-    const res = await worker.fetch(req("GET", "/entry?id=edited"), env, ctx);
+    const res = await worker.fetch(req("POST", "/entry?id=edited"), env, ctx);
     const data = await res.json() as any;
     expect(data.entry.created_at).toBe(1000);
     expect(data.entry.updated_at).toBe(9000);
   });
 
   it("404s for an unknown id", async () => {
-    const res = await worker.fetch(req("GET", "/entry?id=ghost"), env, ctx);
+    const res = await worker.fetch(req("POST", "/entry?id=ghost"), env, ctx);
     expect(res.status).toBe(404);
     const data = await res.json() as any;
     expect(data.ok).toBe(false);
@@ -106,7 +110,7 @@ describe("GET /entry", () => {
       when_at: 5000, when_kind: "due", when_source: "explicit",
     });
 
-    const res = await worker.fetch(req("GET", "/entry?id=anchored"), env, ctx);
+    const res = await worker.fetch(req("POST", "/entry?id=anchored"), env, ctx);
     const data = await res.json() as any;
     expect(data.entry.when_at).toBe(5000);
     expect(data.entry.when_kind).toBe("due");

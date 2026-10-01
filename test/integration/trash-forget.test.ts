@@ -136,7 +136,7 @@ describe("forget moves the row to the trash", () => {
     expect(count.count).toBe(1);
     const exp = await (await worker.fetch(new Request("http://localhost/export", { headers }), t.env, ctx)).json() as any;
     expect(exp.entries.map((e: any) => e.id)).toEqual(["b"]);
-    expect((await worker.fetch(new Request("http://localhost/entry?id=a", { headers }), t.env, ctx)).status).toBe(404);
+    expect((await worker.fetch(new Request("http://localhost/entry", { method: "POST", headers: { ...headers, "Content-Type": "application/json" }, body: JSON.stringify({ id: "a" }) }), t.env, ctx)).status).toBe(404);
   });
 });
 
@@ -175,11 +175,16 @@ describe("size fallbacks", () => {
   it("5,000 incoming edges select tier 2 through the route, and the deleted audit says edgesDropped", async () => {
     t = await makeTrashEnv();
     t.seed("hub");
-    // 4,000 edges of about 700 bytes each: past the 1.8 MB budget without touching content.
+    // 有効なendpointを持つ4,000 edgeで1.8 MBを超える。
+    const marker = t.sqlite.fixtureMarker();
     await t.sqlite.db.exec(`
       WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 4000)
-      INSERT INTO edges (id, source_id, target_id, type, weight, provenance, metadata, created_at, updated_at, workspace_id)
-      SELECT 'e' || i, 's' || i, 'hub', 'relates_to', 0.5, 'explicit', json_object('pad', replace(hex(zeroblob(300)), '00', 'ab')), 1, 1, '${t.roots.ownerPersonalWorkspaceId}' FROM n`);
+      INSERT INTO entries (id, content, tags, source, created_at, vector_ids, workspace_id, actor_id, write_marker)
+      SELECT 's' || i, 'source', '[]', 'api', 1, '[]', '${t.roots.ownerPersonalWorkspaceId}', '', '${marker}' FROM n`);
+    await t.sqlite.db.exec(`
+      WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 4000)
+      INSERT INTO edges (id, source_id, target_id, type, weight, provenance, metadata, created_at, updated_at, workspace_id, write_marker)
+      SELECT 'e' || i, 's' || i, 'hub', 'relates_to', 0.5, 'explicit', json_object('pad', replace(hex(zeroblob(300)), '00', 'ab')), 1, 1, '${t.roots.ownerPersonalWorkspaceId}', '${marker}' FROM n`);
     const res = await post("/forget", { id: "hub" });
     const data = await res.json() as any;
     expect(res.status).toBe(200);

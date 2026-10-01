@@ -11,11 +11,13 @@ export interface McpClientProps {
   clientId?: string;
   clientName?: string;
   via?: "token";
+  requestUrl?: string;
 }
 
 /** The slice of ToolCallback's `extra` this needs — see sdk shared/protocol.js. */
 export interface McpClientExtra {
   _meta?: Record<string, unknown>;
+  mcpReq?: { _meta?: Record<string, unknown>; envelope?: Record<string, unknown> };
   requestInfo?: { url?: string };
 }
 
@@ -110,11 +112,11 @@ export async function resolveClientLabel(
     if (fromLegacyGrant) return fromLegacyGrant;
   }
 
-  const meta = extra?._meta?.[CLIENT_INFO_META_KEY] as { name?: unknown } | undefined;
+  const meta = (extra?.mcpReq?.envelope?.[CLIENT_INFO_META_KEY] ?? extra?.mcpReq?._meta?.[CLIENT_INFO_META_KEY] ?? extra?._meta?.[CLIENT_INFO_META_KEY]) as { name?: unknown } | undefined;
   const fromMeta = clampClientLabel(meta?.name);
   if (fromMeta) return fromMeta;
 
-  const fromUrl = clientNameFromUrl(extra?.requestInfo?.url);
+  const fromUrl = clientNameFromUrl(extra?.requestInfo?.url ?? props?.requestUrl);
   if (fromUrl) return fromUrl;
 
   return null;

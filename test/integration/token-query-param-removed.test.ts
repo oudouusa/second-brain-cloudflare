@@ -30,7 +30,7 @@ const PROTECTED_ROUTES: Array<[string, string, unknown?]> = [
   ["POST", "/append", { id: "abc", addition: "update" }],
   ["GET", "/list", undefined],
   ["GET", "/tags", undefined],
-  ["GET", "/recall?query=test", undefined],
+  ["POST", "/recall?query=test", { query: "test" }],
   ["POST", "/forget", { id: "abc" }],
   ["POST", "/chat", { query: "what?" }],
   ["POST", "/mcp", undefined],

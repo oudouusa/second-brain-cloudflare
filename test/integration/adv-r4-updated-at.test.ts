@@ -11,7 +11,7 @@ import { ensureTenantBootstrap } from "../../src/lib/tenancy";
 import { resolveIdentityByUserId, type Identity } from "../../src/lib/identity";
 import { compressTag } from "../../src/compression/digest";
 import { updateEntryContent } from "../../src/capture/store";
-import { importExportPayload } from "../../src/entries/import";
+import { importAllPages as importExportPayload } from "../helpers/import-pages";
 import { runStalenessPass } from "../../src/staleness/pass";
 import { DEFAULTS } from "../../src/config";
 import type { Env } from "../../src/env";
@@ -32,11 +32,11 @@ beforeEach(async () => {
   resetDatabaseInit();
   digestEdit = null;
   sqlite = makeSqliteD1();
-  env = makeTestEnv(undefined, {
+  env = sqlite.admitEnv(makeTestEnv(undefined, {
     DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV(),
     VECTORIZE: makeVectorizeMock({ query: vi.fn(async (): Promise<any> => ({ matches: [] })) }),
     AI: { run: vi.fn(async (model: string, opts: any) => {
-      if (model.startsWith("@cf/baai/bge")) return { data: [new Array(384).fill(0.1)] };
+      if (model === "@cf/google/embeddinggemma-300m") return { data: [new Array(768).fill(0.1)] };
       const prompt = String(opts?.messages?.[0]?.content ?? "");
       if (prompt.includes("write a single cohesive paragraph")) {
         // The digest has read its sources and is synthesizing: a user edit lands now.
@@ -45,7 +45,7 @@ beforeEach(async () => {
       }
       return stream("3");
     }) } as any,
-  }) as Env;
+  })) as Env;
   await initializeDatabase(env);
   const roots = await ensureTenantBootstrap(env);
   owner = (await resolveIdentityByUserId(env, roots.ownerUserId))!;
@@ -68,7 +68,7 @@ describe("R4-U1 (MAJOR): an imported updated_at >= 2^53 makes the +1 clamp a no-
   it("a same-length edit during synthesis is not marked rolled-up", async () => {
     const old = Date.now() - 200 * DAY;
     const entries = Array.from({ length: 12 }, (_, i) => ({
-      id: `q${i}`, content: `Q3 launch note ${i}: ship the beta to design partners`, tags: ["work"],
+      id: `q${i}`, content: `Q3 launch note ${i}: ship the beta to design partners`, tags: ["rocket-project"],
       created_at: old + i, updated_at: i === 0 ? 1e300 : old + i,
     }));
     const summary = await importExportPayload(env, { entries }, { writeCtx: wctx() });
@@ -82,7 +82,7 @@ describe("R4-U1 (MAJOR): an imported updated_at >= 2^53 makes the +1 clamp a no-
       await edit("q0", edited);
       after = (await live("q0")).updated_at;
     };
-    await compressTag("work", env, ctx);
+    await compressTag("rocket-project", env, ctx);
 
     const row = await live("q0");
     expect(row.content.startsWith(edited)).toBe(true); // the user's edit committed
@@ -101,7 +101,7 @@ describe("R4-U2 (MINOR): a future updated_at is now sticky: every edit clamps pa
     const now = Date.now();
     const F = now * 1000; // updated_at exported in microseconds: year ~57,000
     const summary = await importExportPayload(env, { entries: [{
-      id: "f1", content: "The office wifi password is hunter2", tags: ["work"], created_at: now - 400 * DAY, updated_at: F,
+      id: "f1", content: "The office wifi password is hunter2", tags: ["rocket-project"], created_at: now - 400 * DAY, updated_at: F,
     }] }, { writeCtx: wctx() });
     expect(summary.imported).toBe(1);
 
@@ -128,12 +128,12 @@ describe("R4-U3 (MINOR): one future value poisons every later version's valid_fr
     const F = now + 5 * 365 * DAY; // five years ahead
     const old = now - 200 * DAY;
     const entries = Array.from({ length: 12 }, (_, i) => ({
-      id: `r${i}`, content: `Roadmap item ${i} for the platform team`, tags: ["work"], created_at: old + i,
+      id: `r${i}`, content: `Roadmap item ${i} for the platform team`, tags: ["rocket-project"], created_at: old + i,
       updated_at: i === 0 ? F : old + i,
     }));
     expect((await importExportPayload(env, { entries }, { writeCtx: wctx() })).imported).toBe(12);
 
-    await compressTag("work", env, ctx); // rollup: snapshot + mark on r0
+    await compressTag("rocket-project", env, ctx); // rollup: snapshot + mark on r0
     const afterMark = await live("r0");
     expect(JSON.parse(afterMark.tags)).toContain("rolled-up");
     const [v1] = await versions("r0");

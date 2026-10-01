@@ -16,16 +16,16 @@ async function setup(score: number, decision: string) {
   resetDatabaseInit();
   const sqlite = makeSqliteD1();
   const vectors = new Map<string, any>();
-  const env = makeTestEnv(undefined, {
+  const env = sqlite.admitEnv(makeTestEnv(undefined, {
     DB: sqlite.db as any,
     OAUTH_KV: makeMemoryKV(),
     VECTORIZE: makeVectorizeMock({
       query: vi.fn().mockResolvedValue({ matches: [{ id: "old", score, metadata: { parentId: "old" } }] }),
       upsert: vi.fn(async (rows: any[]): Promise<any> => { for (const row of rows) vectors.set(row.id, row.metadata); return { mutationId: "m" }; }),
     }),
-    AI: { run: vi.fn(async (model: string) => model.startsWith("@cf/baai/bge")
-      ? { data: [new Array(384).fill(0.1)] } : stream(decision)) } as any,
-  }) as Env;
+    AI: { run: vi.fn(async (model: string) => model === "@cf/google/embeddinggemma-300m"
+      ? { data: [new Array(768).fill(0.1)] } : stream(decision)) } as any,
+  })) as Env;
   await initializeDatabase(env);
   sqlite.seed({ id: "old", content: "Old digest", tags: ["synthesized"], source: "system", createdAt: 1000 });
   return { sqlite, env, vectors };
@@ -35,9 +35,9 @@ async function setup(score: number, decision: string) {
 describe("system-write races", () => {
   it("a protected contradiction must not roll user sources into a draft digest", async () => {
     const { sqlite, env } = await setup(0.72, '{"contradicts":true,"conflicting_id":"old","reason":"different"}');
-    sqlite.db.prepare(`UPDATE entries SET tags = '["work"]', source = 'api', actor_id = 'u1' WHERE id = 'old'`).run();
-    for (let i = 0; i < 12; i++) sqlite.seed({ id: `work-${i}`, content: `User work fact ${i}`, tags: ["work"], source: "api", createdAt: 1000 + i });
-    await compressTag("work", env, ctx);
+    sqlite.db.prepare(`UPDATE entries SET tags = '["rocket-project"]', source = 'api', actor_id = 'u1' WHERE id = 'old'`).run();
+    for (let i = 0; i < 12; i++) sqlite.seed({ id: `work-${i}`, content: `User work fact ${i}`, tags: ["rocket-project"], source: "api", createdAt: 1000 + i });
+    await compressTag("rocket-project", env, ctx);
     const digests = (await env.DB.prepare(`SELECT id, tags FROM entries WHERE source = 'system'`).all()).results as any[];
     const sources = (await env.DB.prepare(`SELECT id, tags, content FROM entries WHERE id LIKE 'work-%'`).all()).results as any[];
     expect(digests).toHaveLength(1);
@@ -71,7 +71,7 @@ describe("system-write races", () => {
     const { sqlite, env, vectors } = await setup(0.9, '{"action":"merge","target_id":"old","merged_content":"new system text"}');
     const db = env.DB as any; const prepare = db.prepare.bind(db); let raced = false;
     db.prepare = (sql: string) => {
-      if (!raced && sql.startsWith("UPDATE entries AS e SET content = ")) {
+      if (!raced && sql.startsWith("UPDATE entries AS e SET write_marker = ") && sql.includes(", content = ")) {
         raced = true;
         sqlite.db.prepare("UPDATE entries SET workspace_id = 'other-workspace' WHERE id = 'old'").run();
       }
@@ -195,19 +195,19 @@ describe("system-write races", () => {
     let now = 400 * day;
     vi.spyOn(Date, "now").mockImplementation(() => now);
     const { sqlite, env } = await setup(0.72, '{"contradicts":true,"conflicting_id":"old","reason":"different"}');
-    sqlite.db.prepare(`UPDATE entries SET tags = '["work"]', source = 'api', actor_id = 'u1' WHERE id = 'old'`).run();
-    for (let i = 0; i < 12; i++) sqlite.seed({ id: `work-${i}`, content: `User work fact ${i}`, tags: ["work"], source: "api", createdAt: 1000 + i });
-    await compressTag("work", env, ctx);
+    sqlite.db.prepare(`UPDATE entries SET tags = '["rocket-project"]', source = 'api', actor_id = 'u1' WHERE id = 'old'`).run();
+    for (let i = 0; i < 12; i++) sqlite.seed({ id: `work-${i}`, content: `User work fact ${i}`, tags: ["rocket-project"], source: "api", createdAt: 1000 + i });
+    await compressTag("rocket-project", env, ctx);
     const first = (await env.DB.prepare("SELECT id, tags FROM entries WHERE source = 'system'").all()).results as any[];
     expect(first).toHaveLength(1);
     expect(JSON.parse(first[0].tags)).toContain("status:draft");
     expect(JSON.parse(first[0].tags)).toContain("conflict-held");
     now += 25 * 3600000;
     (env.VECTORIZE as any).query = vi.fn().mockResolvedValue({ matches: [{ id: first[0].id, score: 0.72, metadata: { parentId: first[0].id } }] });
-    (env.AI as any).run = vi.fn(async (model: string) => model.startsWith("@cf/baai/bge")
-      ? { data: [new Array(384).fill(0.1)] }
+    (env.AI as any).run = vi.fn(async (model: string) => model === "@cf/google/embeddinggemma-300m"
+      ? { data: [new Array(768).fill(0.1)] }
       : stream(JSON.stringify({ contradicts: true, conflicting_id: first[0].id, reason: "different" })));
-    await compressTag("work", env, ctx);
+    await compressTag("rocket-project", env, ctx);
     const sources = (await env.DB.prepare("SELECT tags FROM entries WHERE id LIKE 'work-%'").all()).results as any[];
     const digests = (await env.DB.prepare("SELECT id, tags FROM entries WHERE source = 'system'").all()).results as any[];
     console.log("second cycle", sources.filter(row => JSON.parse(row.tags).includes("rolled-up")).length, digests);

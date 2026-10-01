@@ -204,7 +204,9 @@ describe("every new config key has a RULES entry, and the defaults are the off v
     for (const key of KEYS) {
       const rule = RULES[key];
       const value = DEFAULTS[key] as number | string;
-      if (rule.kind === "string") {
+      if (rule.kind === "fixed") {
+        expect(value, key).toBe(rule.value);
+      } else if (rule.kind === "string") {
         expect(typeof value, key).toBe("string");
       } else {
         expect(typeof value, key).toBe("number");

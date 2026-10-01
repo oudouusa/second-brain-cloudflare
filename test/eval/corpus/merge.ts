@@ -29,4 +29,3 @@ export function mergeData(base: CoreData, partDirs: readonly string[]): CoreData
   const merged = [...needles.filter(n => !n.id.startsWith("n-long-")), ...long];
   return { needles: merged, edges, queries: [...mechanicalQueries(merged), ...others], haystack };
 }
-

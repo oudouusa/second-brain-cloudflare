@@ -52,17 +52,17 @@ describe("capture-visibility precedence", () => {
 
     // Default: inherit (''), so the org default decides — personal.
     expect(member.defaultShare).toBe("");
-    const request = new Request("https://x/", { headers: { Authorization: `Bearer ${token}` } });
-    expect((await resolveIdentity(request, env))?.defaultShare).toBe("");
+    const request = () => new Request("https://x/", { headers: { Authorization: `Bearer ${token}` } });
+    expect((await resolveIdentity(request(), env))?.defaultShare).toBe("");
 
     // Admin pins Ada to company; identity carries it; scope honours it.
     await setMemberDefaultShare(env, member.userId, "company");
-    const resolved = await resolveIdentity(request, env);
+    const resolved = await resolveIdentity(request(), env);
     expect(resolved?.defaultShare).toBe("company");
     expect(scopeWrite(resolved!, effectiveWriteTarget(resolved!, undefined, "personal"))).toBe(resolved!.companyWorkspaceIds[0]);
 
     // "inherit" clears the override back to ''.
     await setMemberDefaultShare(env, member.userId, "inherit");
-    expect((await resolveIdentity(request, env))?.defaultShare).toBe("");
+    expect((await resolveIdentity(request(), env))?.defaultShare).toBe("");
   });
 });

@@ -1,3 +1,6 @@
+import { vi } from "vitest";
+// 上流の固定corpusは候補窓500件向け。これはfixture自体の整合性試験でありforkの順位評価ではない。
+vi.mock("../../../src/constants", async importOriginal => ({ ...await importOriginal<object>(), KEYWORD_CANDIDATE_LIMIT: 500 }));
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";

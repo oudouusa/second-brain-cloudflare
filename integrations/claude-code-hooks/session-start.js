@@ -47,6 +47,7 @@ module.exports = {
   SKIP_SOURCES, SESSION_CACHE_TTL_MS,
   buildRecallPlan: core.buildRecallPlan,
   buildRecallUrl: core.buildRecallUrl,
+  buildRecallBody: core.buildRecallBody,
   buildBriefUrl: core.buildBriefUrl,
   cleanSnippet: core.cleanSnippet,
   frameOutput: core.frameOutput,

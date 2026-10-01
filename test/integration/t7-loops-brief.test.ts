@@ -2,6 +2,7 @@
  * Loops split by direction, decisions in the brief, and standing in the brief
  * (Task 9, T-0089.7.1/.2/.3, Design 5.3, 2.11, C10, C11).
  */
+import { encodeVector } from "../../src/standing/codec";
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import worker from "../../src/index";
 import { makeTestEnv, makeMemoryKV } from "../helpers/make-env";
@@ -24,7 +25,7 @@ const ctx = { waitUntil: (_: Promise<unknown>) => {} };
 beforeEach(async () => {
   resetDatabaseInit();
   sqlite = makeSqliteD1();
-  env = makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV() });
+  env = sqlite.admitEnv(makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV() }));
   await initializeDatabase(env);
   const roots = await ensureTenantBootstrap(env);
   owner = (await resolveIdentityByUserId(env, roots.ownerUserId))!;
@@ -189,14 +190,14 @@ describe("MCP brief: decisions due for review, You owe, Owed to you", () => {
 describe("standing in the brief", () => {
   async function seedStandingCache(workspaceId: string, item: { id: string; projects: string[]; createdAt: number }) {
     const cache = {
-      v: 1, model: "@cf/baai/bge-small-en-v1.5", dim: 384, builtAt: Date.now(),
-      items: [{ id: item.id, projects: item.projects, createdAt: item.createdAt, vecs: ["AACAPwAAAEA="] }],
+      v: 1, model: "@cf/google/embeddinggemma-300m", dim: 128, builtAt: Date.now(),
+      items: [{ id: item.id, projects: item.projects, createdAt: item.createdAt, vecs: [encodeVector(new Array(128).fill(0.1))] }],
     };
     await env.OAUTH_KV.put(standingKvKey(workspaceId), JSON.stringify(cache));
   }
 
   it("only appears when a project is given", async () => {
-    await createProject(env.DB, owner.personalWorkspaceId, { id: "site", name: "Site", aliases: [] });
+    await createProject(env.DB, owner.personalWorkspaceId, { id: "site", name: "Site", aliases: [] }, env);
     sqlite.db.prepare(
       `INSERT INTO entries (id, content, tags, source, created_at, vector_ids, workspace_id, actor_id) VALUES (?, ?, ?, 'api', ?, '[]', ?, ?)`,
     ).bind("s1", "When X, do Y.", JSON.stringify(["standing:active", "project:site"]), 1000, owner.personalWorkspaceId, owner.userId).run();

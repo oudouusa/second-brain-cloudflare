@@ -4,8 +4,8 @@
  * that teach an agent to use them. Real SQLite, real registry, MCP over InMemoryTransport.
  */
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { Client } from "@modelcontextprotocol/client";
+import { InMemoryTransport } from "@modelcontextprotocol/client";
 import { buildMcpServer } from "../../src/mcp/server";
 import { makeSqliteD1, type SqliteD1 } from "../helpers/sqlite-d1";
 import { makeTestEnv, makeMemoryKV, makeVectorizeMock } from "../helpers/make-env";
@@ -28,7 +28,7 @@ let companyWs = "";
 const textOf = (res: any) => String(res.content[0].text);
 
 async function withClient<T>(id: Identity | undefined, run: (c: Client) => Promise<T>): Promise<T> {
-  const server = buildMcpServer(env, ctx, id);
+  const server = buildMcpServer(sqlite.admitEnv(env), ctx, id);
   const [ct, st] = InMemoryTransport.createLinkedPair();
   const client = new Client({ name: "t", version: "1" });
   await Promise.all([client.connect(ct), server.connect(st)]);
@@ -72,7 +72,7 @@ beforeEach(async () => {
     // The tag-first recall branch fetches stored vectors by id and scores them locally.
     VECTORIZE: makeVectorizeMock({
       getByIds: (async (ids: string[]) =>
-        ids.map(id => ({ id, values: new Array(384).fill(0.1), metadata: { parentId: id.replace(/^v-/, "") } }))) as unknown as VectorizeIndex["getByIds"],
+        ids.map(id => ({ id, values: new Array(384).fill(0.1), metadata: { parentId: id.replace(/^v-/, "") } }))) as unknown as Vectorize["getByIds"],
     }),
   });
   await initializeDatabase(env);
@@ -88,8 +88,8 @@ afterEach(() => sqlite?.close());
 
 describe("list_projects", () => {
   it("lists slug, name, layer and the first description line", async () => {
-    await createProject(env.DB, dana.personalWorkspaceId, { id: "website", name: "Website", description: "Marketing site rebuild\nsecond line stays out" });
-    await createProject(env.DB, companyWs, { id: "platform", name: "Platform" });
+    await createProject(env.DB, dana.personalWorkspaceId, { id: "website", name: "Website", description: "Marketing site rebuild\nsecond line stays out" }, sqlite.admitEnv(env));
+    await createProject(env.DB, companyWs, { id: "platform", name: "Platform" }, sqlite.admitEnv(env));
 
     const text = await call("list_projects", {});
 
@@ -99,9 +99,9 @@ describe("list_projects", () => {
   });
 
   it("hides archived projects unless asked, and marks them when shown", async () => {
-    await createProject(env.DB, dana.personalWorkspaceId, { id: "live", name: "Live" });
-    await createProject(env.DB, dana.personalWorkspaceId, { id: "old", name: "Old" });
-    await updateProject(env.DB, dana.personalWorkspaceId, "old", { status: "archived" });
+    await createProject(env.DB, dana.personalWorkspaceId, { id: "live", name: "Live" }, sqlite.admitEnv(env));
+    await createProject(env.DB, dana.personalWorkspaceId, { id: "old", name: "Old" }, sqlite.admitEnv(env));
+    await updateProject(env.DB, dana.personalWorkspaceId, "old", { status: "archived" }, sqlite.admitEnv(env));
 
     expect(await call("list_projects", {})).not.toContain("old — Old");
     const all = await call("list_projects", { include_archived: true });
@@ -110,8 +110,8 @@ describe("list_projects", () => {
   });
 
   it("narrows by workspace layer", async () => {
-    await createProject(env.DB, dana.personalWorkspaceId, { id: "mine", name: "Mine" });
-    await createProject(env.DB, companyWs, { id: "ours", name: "Ours" });
+    await createProject(env.DB, dana.personalWorkspaceId, { id: "mine", name: "Mine" }, sqlite.admitEnv(env));
+    await createProject(env.DB, companyWs, { id: "ours", name: "Ours" }, sqlite.admitEnv(env));
 
     const personal = await call("list_projects", { workspace: "personal" });
     expect(personal).toContain("mine");
@@ -123,7 +123,7 @@ describe("list_projects", () => {
 
   it("never shows another member's private projects", async () => {
     const bob = await createMember(env, { name: "Bob" });
-    await createProject(env.DB, bob.member.personalWorkspaceId, { id: "bobs-secret", name: "Bobs secret" });
+    await createProject(env.DB, bob.member.personalWorkspaceId, { id: "bobs-secret", name: "Bobs secret" }, sqlite.admitEnv(env));
 
     expect(await call("list_projects", {})).not.toContain("bobs-secret");
   });
@@ -165,7 +165,7 @@ describe("remember with project", () => {
   });
 
   it("leaves an existing project alone and does not audit a second creation", async () => {
-    await createProject(env.DB, dana.personalWorkspaceId, { id: "website", name: "Website", description: "keep me" });
+    await createProject(env.DB, dana.personalWorkspaceId, { id: "website", name: "Website", description: "keep me" }, sqlite.admitEnv(env));
 
     await call("remember", { content: "Another fact about the website", project: "website" });
     await settle();
@@ -185,25 +185,25 @@ describe("remember with project", () => {
     expect(JSON.parse(row.payload)).toEqual({ slug: "fresh" });
   });
 
-  it("caps the caller's tags only: 64 plus project and volatility stores 66, same as HTTP", async () => {
-    const sixtyFour = Array.from({ length: 64 }, (_, i) => `t${i}`);
+  it("caps the caller's tags only: 自動付与を含め16タグまで、HTTPと同じ上限で保存する", async () => {
+    const sixtyFour = Array.from({ length: 14 }, (_, i) => `t${i}`);
 
     const text = await call("remember", { content: "full tag list, worker adds two more", tags: sixtyFour, project: "website", volatility: "durable" });
     await settle();
 
     expect(text).toContain("Stored");
     const tags = await entryTags(idOf(text));
-    expect(tags).toHaveLength(66);
-    expect(tags).toEqual(expect.arrayContaining(["project:website", "volatility:durable", "t0", "t63"]));
+    expect(tags).toHaveLength(16);
+    expect(tags).toEqual(expect.arrayContaining(["project:website", "volatility:durable", "t0", "t13"]));
   });
 
-  it("still refuses 65 caller tags, as HTTP does, and writes nothing", async () => {
-    const sixtyFive = Array.from({ length: 65 }, (_, i) => `t${i}`);
+  it("自動付与後の17タグを拒否し、書込みを残さない", async () => {
+    const sixtyFive = Array.from({ length: 15 }, (_, i) => `t${i}`);
 
     const res = await withClient(identity, c => c.callTool({ name: "remember", arguments: { content: "one tag too many", tags: sixtyFive, project: "website", volatility: "durable" } }));
 
     expect((res as any).isError).toBe(true);
-    expect(textOf(res)).toMatch(/64/);
+    expect(textOf(res)).toMatch(/16/);
     expect((await sqlite.db.prepare(`SELECT id FROM entries`).all()).results).toHaveLength(0);
     expect(await registry()).toEqual([]);
   });
@@ -256,7 +256,7 @@ describe("update project-tag validation", () => {
 
 describe("recall and list_recent with project", () => {
   it("recall with an unknown slug is an error naming the slug, never an empty result", async () => {
-    await createProject(env.DB, dana.personalWorkspaceId, { id: "website", name: "Website" });
+    await createProject(env.DB, dana.personalWorkspaceId, { id: "website", name: "Website" }, sqlite.admitEnv(env));
 
     const text = await call("recall", { query: "hosting", project: "webiste" });
 
@@ -266,7 +266,7 @@ describe("recall and list_recent with project", () => {
   });
 
   it("caps the known slugs it suggests at 10", async () => {
-    for (let i = 1; i <= 12; i++) await createProject(env.DB, dana.personalWorkspaceId, { id: `proj-${String(i).padStart(2, "0")}`, name: `Proj ${i}` });
+    for (let i = 1; i <= 12; i++) await createProject(env.DB, dana.personalWorkspaceId, { id: `proj-${String(i).padStart(2, "0")}`, name: `Proj ${i}` }, sqlite.admitEnv(env));
 
     for (const tool of ["recall", "list_recent"] as const) {
       const args = tool === "recall" ? { query: "x", project: "nope" } : { project: "nope" };
@@ -291,7 +291,7 @@ describe("recall and list_recent with project", () => {
   });
 
   it("list_recent returns tagged members and alias-claimed legacy entries only", async () => {
-    await createProject(env.DB, dana.personalWorkspaceId, { id: "website", name: "Website", aliases: ["legacy-site"] });
+    await createProject(env.DB, dana.personalWorkspaceId, { id: "website", name: "Website", aliases: ["legacy-site"] }, sqlite.admitEnv(env));
     seed("tagged", dana.personalWorkspaceId, ["project:website"], "tagged member");
     seed("aliased", dana.personalWorkspaceId, ["legacy-site"], "alias member");
     seed("other", dana.personalWorkspaceId, ["infra"], "not a member");
@@ -304,7 +304,7 @@ describe("recall and list_recent with project", () => {
   });
 
   it("recall restricts results to the project", async () => {
-    await createProject(env.DB, dana.personalWorkspaceId, { id: "website", name: "Website", aliases: ["legacy-site"] });
+    await createProject(env.DB, dana.personalWorkspaceId, { id: "website", name: "Website", aliases: ["legacy-site"] }, sqlite.admitEnv(env));
     seed("tagged", dana.personalWorkspaceId, ["project:website"], "hosting decision tagged");
     seed("aliased", dana.personalWorkspaceId, ["legacy-site"], "hosting decision aliased");
     seed("other", dana.personalWorkspaceId, ["infra"], "hosting decision elsewhere");
@@ -318,7 +318,7 @@ describe("recall and list_recent with project", () => {
 
   it("does not see a project that lives only in a workspace the caller cannot read", async () => {
     const bob = await createMember(env, { name: "Bob" });
-    await createProject(env.DB, bob.member.personalWorkspaceId, { id: "bobs-secret", name: "Bobs secret" });
+    await createProject(env.DB, bob.member.personalWorkspaceId, { id: "bobs-secret", name: "Bobs secret" }, sqlite.admitEnv(env));
 
     const text = await call("list_recent", { project: "bobs-secret" });
 

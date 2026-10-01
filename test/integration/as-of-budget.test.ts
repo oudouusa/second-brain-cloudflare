@@ -42,27 +42,27 @@ describe("as-of's own D1 and KV cost (5.7 items 5 and 8)", () => {
     const kv = makeMemoryKV();
     await kv.put(VERSIONS_SINCE_KV_KEY, String(NOW - 200 * DAY)); // steady state: getVersionsSince costs exactly 1 KV read
     const getSpy = vi.spyOn(kv, "get");
-    const env = makeTestEnv(undefined, {
+    const env = sqlite.admitEnv(makeTestEnv(undefined, {
       DB: sqlite.db as unknown as Env["DB"],
       OAUTH_KV: kv,
       VECTORIZE: makeVectorizeMock({ query: vi.fn().mockResolvedValue({ matches: [{ id: "e1", score: 0.9, metadata: { parentId: "e1" } }] }) }),
-    });
+    }));
 
     // A cold call warms this isolate's own memoized reads (tag vocabulary, distillation's corpus
     // total) so neither call below pays for them — the comparison must be apples to apples, not
     // "second call ever" against "first call ever".
     await recallEntries({ query: "budget review", topK: 10, synthesize: false, hops: 0 }, env, ctx);
 
-    const beforeWithout = sqlite.issued.length;
+    const beforeWithout = sqlite.executions.length;
     const getBeforeWithout = getSpy.mock.calls.length;
     await recallEntries({ query: "budget review", topK: 10, synthesize: false, hops: 0 }, env, ctx);
-    const withoutAsOfDelta = sqlite.issued.length - beforeWithout;
+    const withoutAsOfDelta = sqlite.executions.length - beforeWithout;
     const getWithoutAsOfDelta = getSpy.mock.calls.length - getBeforeWithout;
 
-    const beforeWith = sqlite.issued.length;
+    const beforeWith = sqlite.executions.length;
     const getBeforeWith = getSpy.mock.calls.length;
     await recallEntries({ query: "budget review", topK: 10, synthesize: false, hops: 0 }, env, ctx, undefined, { asOf: NOW - 10 * DAY });
-    const withAsOfDelta = sqlite.issued.length - beforeWith;
+    const withAsOfDelta = sqlite.executions.length - beforeWith;
     const getWithAsOfDelta = getSpy.mock.calls.length - getBeforeWith;
 
     expect(withAsOfDelta - withoutAsOfDelta).toBe(1);

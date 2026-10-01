@@ -34,7 +34,7 @@ describe("maybeLogRecall", () => {
   function setup() {
     sqlite = makeSqliteD1();
     const { kv, counts } = countedKV();
-    const env: Env = makeTestEnv(undefined, { DB: sqlite.db as unknown as D1Database, OAUTH_KV: kv });
+    const env: Env = sqlite.admitEnv(makeTestEnv(undefined, { DB: sqlite.db as unknown as D1Database, OAUTH_KV: kv }));
     return { env, sqlite, kvCounts: counts };
   }
 
@@ -136,7 +136,7 @@ describe("maybeLogRecall", () => {
       await maybeLogRecall(env, cfg, input({ now: 1_000_000 + i }));
     }
     // Each logged recall's insert + purge ride in one D1 batch (one subrequest, two rows).
-    const batches = sqlite.issued.filter(s => s === "BATCH");
+    const batches = sqlite.batches;
     expect(batches).toHaveLength(RECALL_LOG_PER_DAY);
     expect(RECALL_LOG_PER_DAY * 2).toBeLessThanOrEqual(400);
   });
@@ -221,7 +221,7 @@ describe("maybeMarkFollowed", () => {
   function setup() {
     sqlite = makeSqliteD1();
     const { kv, counts } = countedKV();
-    const env: Env = makeTestEnv(undefined, { DB: sqlite.db as unknown as D1Database, OAUTH_KV: kv });
+    const env: Env = sqlite.admitEnv(makeTestEnv(undefined, { DB: sqlite.db as unknown as D1Database, OAUTH_KV: kv }));
     return { env, sqlite, kvCounts: counts };
   }
 
@@ -347,7 +347,7 @@ describe("maybeMarkFollowedMany", () => {
   function setup() {
     sqlite = makeSqliteD1();
     const { kv } = countedKV();
-    const env: Env = makeTestEnv(undefined, { DB: sqlite.db as unknown as D1Database, OAUTH_KV: kv });
+    const env: Env = sqlite.admitEnv(makeTestEnv(undefined, { DB: sqlite.db as unknown as D1Database, OAUTH_KV: kv }));
     return { env, sqlite };
   }
 

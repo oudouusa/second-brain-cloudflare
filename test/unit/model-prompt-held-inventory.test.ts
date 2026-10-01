@@ -40,6 +40,8 @@ interface Site { file: string; line: number }
  * philosophy every other structural guard in this codebase already uses (PROJECTS_CONTENT, for one).
  */
 export function isChatCallSite(lines: string[], i: number): boolean {
+  // provider共通helperに移したpromptも、呼出元のheld境界を列挙する。
+  if (!/\bfunction\s+generateText\b/.test(lines[i]) && /\bgenerateText\(/.test(lines[i])) return true;
   if (!/\.run\(/.test(lines[i])) return false;
   const window = lines.slice(i, i + 6).join("\n");
   return /messages\s*:|contexts\s*:/.test(window);
@@ -61,24 +63,25 @@ function scanChatCalls(): Site[] {
 }
 
 const ACCOUNTED_FOR: { file: string; line: number; why: string }[] = [
+  { file: "src/lib/ai.ts", line: 185, why: "generateTextはprovider共通の通信境界。本文の適格性は列挙したdigest・weekly-insight・recall-summaryの各呼出元で検査する。" },
   {
-    file: "src/capture/classify.ts", line: 42,
+    file: "src/capture/classify.ts", line: 77,
     why: "classifyEntry(content, ...) takes raw content, never a row query. Its callers: entry.ts returns early at decision.hold, before classify ever runs, for the write's own content; the merge-target path only reaches a row duplicate.ts's own excludeHeld-filtered candidateRows offered. mirror.ts classifies fresh provider content before any row exists. admin.ts's /classify-pending scans UNCLASSIFIED_WHERE (tags NOT LIKE '%\"status:%'), which structurally excludes every held row too -- withHold always adds status:draft atomically alongside quarantine:, and applyTagReplacement preserves both as worker-owned across every edit, so no path removes status: while leaving quarantine: in place.",
   },
   {
-    file: "src/capture/duplicate.ts", line: 201,
+    file: "src/capture/duplicate.ts", line: 232,
     why: "merge/replace decision prompt: existingList is built from candidateRows, which the read above filters through excludeHeld before anything else touches it (Codex review class E, T-0089.4.2).",
   },
   {
-    file: "src/capture/duplicate.ts", line: 246,
+    file: "src/capture/duplicate.ts", line: 283,
     why: "contradiction-only prompt: same candidateRows, same excludeHeld filter as the merge/replace prompt above -- one read, one filter, both branches.",
   },
   {
-    file: "src/compression/digest.ts", line: 43,
+    file: "src/compression/digest.ts", line: 46,
     why: "synthesizeDigest's rows argument is the caller's candidate read (compressTag), which now runs excludeHeld on rawEntries before rawEntries.length is even checked (Codex review class E, T-0089.4.2).",
   },
   {
-    file: "src/insight/reason.ts", line: 372,
+    file: "src/insight/reason.ts", line: 395,
     why: "reasonOverPair(a, b, ...) takes two rows its callers already read. src/insight/weekly.ts's draw query and routes/admin.ts's /insights/dry-run preview both now filter a/b through notHeldSqlFor (T-0102 MINOR fix: one NOT LIKE clause per recognized hold reason, alias-qualified) alongside the status:deprecated/valid_until re-checks they already did for the same reason: a candidate accrued clean can be held by the time it is drawn, days later.",
   },
   {
@@ -90,11 +93,11 @@ const ACCOUNTED_FOR: { file: string; line: number; why: string }[] = [
     why: "scoreRerankCandidates' candidates.text comes from search.ts's loadContent, which now re-checks isHeld via d1Tags (already in memory, no extra read) immediately before its own fallback fetch, on top of notHeld() already filtering the candidate ids upstream of rerank.",
   },
   {
-    file: "src/when/pass.ts", line: 269,
+    file: "src/when/pass.ts", line: 315,
     why: "judgeCommitment's prompt is built from candidateSql's own rows, which now adds NOT_HELD_SQL alongside its existing when_at/when_source/openLoopSql predicates (Codex review class E, T-0089.4.2).",
   },
   {
-    file: "src/routes/recall.ts", line: 309,
+    file: "src/routes/recall.ts", line: 480,
     why: "POST /chat's body.memories is opaque client-composed text (see the route's own comment: the shipped client serializes a prior GET /recall response into it), never a server-side row read here -- there is no candidate query at this boundary to filter. The row-read boundary this rule protects is GET /recall and get(), which already exclude/warn on held content before the client ever sees it to compose from.",
   },
 ];

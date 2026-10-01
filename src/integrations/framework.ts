@@ -9,7 +9,10 @@
  *
  * Design notes:
  * - All integration state (token, account info, item↔entry map) lives in
- *   OAUTH_KV under `integrations:<provider>` — one JSON blob per provider. KV
+ *   OAUTH_KV under a D1-generation-scoped
+ *   `integrations:<provider>:<restore-generation>:<provider-generation>` key.
+ *   Pre-generation blobs are read only before the first restore and provider
+ *   retirement. KV
  *   is deliberate: the namespace is already provisioned in every deployment,
  *   so shipping a provider is a pure code deploy with no schema migration, and
  *   the access pattern (read once at sync start, write once at the end) is
@@ -25,8 +28,41 @@
  *   0 — same pattern as POST /vectorize-pending.
  */
 
+import { MemoryWriteLockedError } from "../migration/write-lock";
+
+// SQLite TRIM accepts a character set, not a regex. This is the complete
+// ECMAScript String.prototype.trim whitespace/line-terminator set so D1 source
+// ownership checks agree with payload validation even for legacy/imported rows.
+export const SQLITE_JAVASCRIPT_TRIM_CHARSET = [
+  9, 10, 11, 12, 13, 32, 160, 5760,
+  8192, 8193, 8194, 8195, 8196, 8197, 8198, 8199, 8200, 8201, 8202,
+  8232, 8233, 8239, 8287, 12288, 65279,
+].map(codePoint => `char(${codePoint})`).join(" || ");
+
 export interface IntegrationEnv {
   OAUTH_KV: KVNamespace;
+  DB?: D1Database;
+  WRITE_ADMISSION_TOKEN?: string;
+  INTEGRATION_OPERATION?: IntegrationOperation;
+}
+
+export type IntegrationOperationMode = "connect" | "sync" | "disconnect" | "layer" | "move";
+export interface IntegrationOperation {
+  provider: string;
+  owner: string;
+  mode: IntegrationOperationMode;
+  stateGeneration: string;
+  providerGeneration: string;
+}
+
+const INTEGRATION_OPERATION_LEASE_MS = 17 * 60 * 1000;
+
+export class IntegrationOperationLockedError extends Error {
+  readonly status = 409;
+  constructor() {
+    super("Another operation for this integration is still running; retry shortly");
+    this.name = "IntegrationOperationLockedError";
+  }
 }
 
 // ─── Provider interface ───────────────────────────────────────────────────────
@@ -83,6 +119,10 @@ export interface IntegrationRecord {
   disconnecting?: { purged: number; skipped: number; fromCursor?: string; nextCursor?: string };
   createdAt: number;
   updatedAt: number;
+  /** Strong D1 generation that makes eventually-consistent KV safe to consume. */
+  stateGeneration?: string;
+  /** Provider-local fence; disconnect rotates it so an older sync cannot reconnect itself. */
+  providerGeneration?: string;
 }
 
 // The one narrowing rule for a mirror layer, on both the read and write side:
@@ -97,8 +137,248 @@ export function narrowMirrorLayer(value: unknown): "company" | "personal" {
 // token:/grant:/client: keys in the same namespace.
 const INTEGRATIONS_KEY_PREFIX = "integrations:";
 
-export async function loadIntegration(env: IntegrationEnv, provider: string): Promise<IntegrationRecord | null> {
-  const raw = await env.OAUTH_KV.get(`${INTEGRATIONS_KEY_PREFIX}${provider}`);
+function integrationKey(provider: string, generation?: string, providerGeneration?: string): string {
+  return `${INTEGRATIONS_KEY_PREFIX}${provider}${generation ? `:${generation}` : ""}`
+    + `${providerGeneration ? `:${providerGeneration}` : ""}`;
+}
+
+type IntegrationGeneration = {
+  generation: string;
+  restoreCount: number;
+  providerGeneration: string;
+  providerVersion: number;
+};
+
+/**
+ * Serialize connect/sync/disconnect for one provider. Disconnect purge marks the row
+ * draining between pages; only another disconnect may then acquire it. Side-effecting
+ * mirror primitives renew this lease immediately before their D1/Vectorize mutations.
+ * A fixed expiry still recovers a crashed isolate; the D1 source sweep performed by
+ * disconnect is the compensation path for a mutation that committed before a crash.
+ */
+export async function acquireIntegrationOperation(
+  env: IntegrationEnv,
+  provider: string,
+  mode: IntegrationOperationMode,
+): Promise<IntegrationOperation> {
+  if (!env.DB || !env.WRITE_ADMISSION_TOKEN) throw new IntegrationOperationLockedError();
+  const current = await currentIntegrationMutationGeneration(env, provider);
+  if (!current) throw new IntegrationOperationLockedError();
+  const owner = crypto.randomUUID();
+  const now = Date.now();
+  const result = await env.DB.prepare(
+    `UPDATE integration_provider_generation
+        SET lease_owner = ?, lease_expires_at = ?
+      WHERE provider = ?
+        AND (lease_owner IS NULL OR lease_expires_at IS NULL OR lease_expires_at <= ?)
+        AND (? = 'disconnect' OR draining = 0)`,
+  ).bind(owner, now + INTEGRATION_OPERATION_LEASE_MS, provider, now, mode).run();
+  const changes = Number(result.meta.changes
+    ?? (result.meta as D1Result["meta"] & { rows_written?: number }).rows_written
+    ?? 0);
+  if (changes !== 1) throw new IntegrationOperationLockedError();
+  return {
+    provider,
+    owner,
+    mode,
+    stateGeneration: current.generation,
+    providerGeneration: current.providerGeneration,
+  };
+}
+
+/** Attach the operation capability without mutating the request-scoped Env object. */
+export function withIntegrationOperation<T extends IntegrationEnv>(
+  env: T,
+  operation: IntegrationOperation,
+): T {
+  const scoped = Object.create(env) as T;
+  Object.defineProperty(scoped, "INTEGRATION_OPERATION", {
+    value: operation,
+    enumerable: false,
+    configurable: false,
+    writable: false,
+  });
+  return scoped;
+}
+
+/** Renew only the still-owned provider generation immediately before a side effect. */
+export async function renewIntegrationOperation(env: IntegrationEnv): Promise<void> {
+  const operation = env.INTEGRATION_OPERATION;
+  if (!operation || !env.DB) return;
+  const now = Date.now();
+  const result = await env.DB.prepare(
+    `UPDATE integration_provider_generation
+        SET lease_expires_at = ?
+      WHERE provider = ? AND generation = ? AND lease_owner = ?
+        AND lease_expires_at > ?
+        AND (? = 'disconnect' OR draining = 0)`,
+  ).bind(
+    now + INTEGRATION_OPERATION_LEASE_MS,
+    operation.provider,
+    operation.providerGeneration,
+    operation.owner,
+    now,
+    operation.mode,
+  ).run();
+  const changes = Number(result.meta.changes
+    ?? (result.meta as D1Result["meta"] & { rows_written?: number }).rows_written
+    ?? 0);
+  if (changes !== 1) throw new IntegrationOperationLockedError();
+}
+
+export async function markIntegrationOperationDraining(
+  env: IntegrationEnv,
+  operation: IntegrationOperation,
+): Promise<void> {
+  const result = await env.DB!.prepare(
+    `UPDATE integration_provider_generation SET draining = 1
+      WHERE provider = ? AND generation = ? AND lease_owner = ? AND lease_expires_at > ?`,
+  ).bind(
+    operation.provider,
+    operation.providerGeneration,
+    operation.owner,
+    Date.now(),
+  ).run();
+  const changes = Number(result.meta.changes
+    ?? (result.meta as D1Result["meta"] & { rows_written?: number }).rows_written
+    ?? 0);
+  if (changes !== 1) throw new IntegrationOperationLockedError();
+}
+
+export async function releaseIntegrationOperation(
+  env: IntegrationEnv,
+  operation: IntegrationOperation,
+): Promise<void> {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      await env.DB?.prepare(
+        `UPDATE integration_provider_generation
+            SET lease_owner = NULL, lease_expires_at = NULL
+          WHERE provider = ? AND lease_owner = ?`,
+      ).bind(operation.provider, operation.owner).run();
+      return;
+    } catch {
+      // A successful mutation must not become an ambiguous 500 solely because
+      // best-effort unlock failed. Retry in-isolate, then let the bounded lease
+      // expire fail-closed without logging provider or credential data.
+    }
+  }
+  console.error("Integration operation release failed; lease will expire");
+}
+
+async function currentIntegrationGeneration(
+  env: IntegrationEnv,
+  provider: string,
+): Promise<IntegrationGeneration | null> {
+  if (!env.DB) return null;
+  const read = () => env.DB!.prepare(
+    `SELECT i.generation, i.restore_count,
+            p.generation AS provider_generation, p.version AS provider_version
+       FROM integration_state_generation i
+       LEFT JOIN integration_provider_generation p ON p.provider = ?
+      WHERE i.id = 'current'`,
+  ).bind(provider).first<{
+    generation: string;
+    restore_count: number;
+    provider_generation: string | null;
+    provider_version: number | null;
+  }>();
+  let row = await read();
+  if (!row?.generation) {
+    // Schema convergence can be interrupted after CREATE TABLE but before its
+    // singleton seed. Repair that bounded partial state here and retry once.
+    await env.DB.prepare(
+      `INSERT INTO integration_state_generation (id, generation, restore_count)
+       VALUES ('current', lower(hex(randomblob(16))), 0)
+       ON CONFLICT(id) DO NOTHING`,
+    ).run();
+    row = await read();
+  }
+  if (!row?.generation) throw new Error("Integration state generation is unavailable");
+  if (!row.provider_generation) {
+    await env.DB.prepare(
+      `INSERT INTO integration_provider_generation (provider, generation, version)
+       VALUES (?, lower(hex(randomblob(16))), 0)
+       ON CONFLICT(provider) DO NOTHING`,
+    ).bind(provider).run();
+    row = await read();
+  }
+  if (!row?.provider_generation) throw new Error("Integration provider generation is unavailable");
+  return {
+    generation: row.generation,
+    restoreCount: Number(row.restore_count ?? 0),
+    providerGeneration: row.provider_generation,
+    providerVersion: Number(row.provider_version ?? 0),
+  };
+}
+
+async function currentIntegrationMutationGeneration(
+  env: IntegrationEnv,
+  provider: string,
+): Promise<IntegrationGeneration | null> {
+  if (!env.DB) return null;
+  if (!env.WRITE_ADMISSION_TOKEN) {
+    throw new MemoryWriteLockedError({
+      lockedAt: Date.now(), reason: "integration-write-admission-missing", ownerId: "",
+    });
+  }
+  // This is the last D1 read before KV mutation. If restore starts after this
+  // point, the captured old generation makes the delayed KV write unreachable;
+  // if it already started, the admission/epoch join returns no row.
+  const operation = env.INTEGRATION_OPERATION;
+  const operationClause = operation
+    ? `AND p.generation = ? AND p.lease_owner = ? AND p.lease_expires_at > ?
+       AND (? = 'disconnect' OR p.draining = 0)`
+    : "";
+  const read = () => env.DB!.prepare(
+    `SELECT i.generation, i.restore_count,
+            p.generation AS provider_generation, p.version AS provider_version
+       FROM integration_state_generation i
+       JOIN integration_provider_generation p ON p.provider = ?
+      WHERE i.id = 'current'
+        AND EXISTS (
+          SELECT 1 FROM memory_write_admissions a
+          JOIN memory_write_epoch e ON e.id = 'current' AND e.generation = a.generation
+          WHERE a.token = ? AND a.expires_at > ?
+        )
+        ${operationClause}`,
+  ).bind(
+    provider,
+    env.WRITE_ADMISSION_TOKEN,
+    Date.now(),
+    ...(operation ? [
+      operation.providerGeneration,
+      operation.owner,
+      Date.now(),
+      operation.mode,
+    ] : []),
+  ).first<{
+    generation: string;
+    restore_count: number;
+    provider_generation: string;
+    provider_version: number;
+  }>();
+  let row = await read();
+  if (!row?.generation) {
+    // The normal hot path is exactly one D1 query. Only an interrupted schema
+    // seed takes the bounded repair path; a stale admission still fails below.
+    await currentIntegrationGeneration(env, provider);
+    row = await read();
+  }
+  if (!row?.generation) {
+    throw new MemoryWriteLockedError({
+      lockedAt: Date.now(), reason: "integration-write-admission-expired", ownerId: "",
+    });
+  }
+  return {
+    generation: row.generation,
+    restoreCount: Number(row.restore_count ?? 0),
+    providerGeneration: row.provider_generation,
+    providerVersion: Number(row.provider_version ?? 0),
+  };
+}
+
+function parseIntegrationRecord(raw: string | null): IntegrationRecord | null {
   if (!raw) return null;
   try {
     const record = JSON.parse(raw) as any;
@@ -121,11 +401,63 @@ export async function loadIntegration(env: IntegrationEnv, provider: string): Pr
   }
 }
 
-// Create-or-replace, for connect only — partial updates go through updateIntegration.
-export async function saveIntegration(env: IntegrationEnv, record: IntegrationRecord): Promise<void> {
-  await env.OAUTH_KV.put(`${INTEGRATIONS_KEY_PREFIX}${record.provider}`, JSON.stringify(record));
+export async function loadIntegration(env: IntegrationEnv, provider: string): Promise<IntegrationRecord | null> {
+  const current = await currentIntegrationGeneration(env, provider);
+  if (!current) {
+    return parseIntegrationRecord(await env.OAUTH_KV.get(integrationKey(provider)));
+  }
+  let record = parseIntegrationRecord(
+    await env.OAUTH_KV.get(integrationKey(provider, current.generation, current.providerGeneration)),
+  );
+  if (!record && current.restoreCount === 0 && current.providerVersion === 0) {
+    // One-way compatibility before the first restore. Once a generation-scoped
+    // record is saved it wins; after restore/provider retirement, legacy keys
+    // are never read.
+    record = parseIntegrationRecord(
+      await env.OAUTH_KV.get(integrationKey(provider, current.generation)),
+    ) ?? parseIntegrationRecord(await env.OAUTH_KV.get(integrationKey(provider)));
+  }
+  if (!record) return null;
+  if (record.stateGeneration === undefined && current.restoreCount === 0) {
+    // One-way compatibility for records created before generation fencing shipped.
+    record.stateGeneration = current.generation;
+  } else if (record.stateGeneration !== current.generation) {
+    // A completed D1 restore deliberately disconnects every older KV record.
+    // Returning null makes status/sync fail closed until the owner reconnects;
+    // no credential or cursor is copied into the R2 archive.
+    return null;
+  }
+  if (record.providerGeneration === undefined && current.providerVersion === 0) {
+    record.providerGeneration = current.providerGeneration;
+  } else if (record.providerGeneration !== current.providerGeneration) {
+    return null;
+  }
+  return record;
 }
 
+export async function saveIntegration(env: IntegrationEnv, record: IntegrationRecord): Promise<void> {
+  // Extend the still-owned operation immediately before the D1 admission check and
+  // eventual KV write. This prevents a slow fetch/validation from reaching KV after
+  // its lease was overtaken by a newer connect, sync, or disconnect.
+  await renewIntegrationOperation(env);
+  const current = await currentIntegrationMutationGeneration(env, record.provider);
+  if (current) {
+    if (record.stateGeneration === undefined) record.stateGeneration = current.generation;
+    if (record.providerGeneration === undefined) record.providerGeneration = current.providerGeneration;
+    if (record.stateGeneration !== current.generation) {
+      throw new Error("Integration KV generation changed before save");
+    }
+    if (record.providerGeneration !== current.providerGeneration) {
+      throw new Error("Integration provider generation changed before save");
+    }
+  }
+  await env.OAUTH_KV.put(
+    integrationKey(record.provider, current?.generation, current?.providerGeneration),
+    JSON.stringify(record),
+  );
+}
+
+// D1 世代・provider lease の検査は saveIntegration に残し、部分更新でも必ず通す。
 // The ONLY way to update part of an existing record. Every writer that held a
 // record across awaited work and saved it back clobbered whatever landed in
 // between — a mid-sync layer change most damagingly (#348). Reading fresh at
@@ -186,8 +518,67 @@ export class ItemMapDeltas {
   }
 }
 
-export async function deleteIntegration(env: IntegrationEnv, provider: string): Promise<void> {
-  await env.OAUTH_KV.delete(`${INTEGRATIONS_KEY_PREFIX}${provider}`);
+export async function deleteIntegration(
+  env: IntegrationEnv,
+  recordOrProvider: IntegrationRecord | string,
+  operation?: IntegrationOperation,
+): Promise<void> {
+  const provider = typeof recordOrProvider === "string" ? recordOrProvider : recordOrProvider.provider;
+  const current = await currentIntegrationMutationGeneration(env, provider);
+  if (!current) {
+    await env.OAUTH_KV.delete(integrationKey(provider));
+    return;
+  }
+  const expectedState = typeof recordOrProvider === "string"
+    ? current.generation
+    : recordOrProvider.stateGeneration;
+  const expectedProvider = typeof recordOrProvider === "string"
+    ? current.providerGeneration
+    : recordOrProvider.providerGeneration;
+  if (expectedState !== current.generation || expectedProvider !== current.providerGeneration) {
+    throw new Error("Integration generation changed before disconnect");
+  }
+  const nextGeneration = crypto.randomUUID();
+  const rotated = await env.DB!.prepare(
+    `UPDATE integration_provider_generation
+        SET generation = ?, version = version + 1, draining = 0
+      WHERE provider = ? AND generation = ?
+        AND EXISTS (
+          SELECT 1 FROM integration_state_generation i
+          WHERE i.id = 'current' AND i.generation = ?
+        )
+        AND EXISTS (
+          SELECT 1 FROM memory_write_admissions a
+          JOIN memory_write_epoch e ON e.id = 'current' AND e.generation = a.generation
+          WHERE a.token = ? AND a.expires_at > ?
+        )
+        AND (? IS NULL OR (lease_owner = ? AND lease_expires_at > ?))`,
+  ).bind(
+    nextGeneration,
+    provider,
+    current.providerGeneration,
+    current.generation,
+    env.WRITE_ADMISSION_TOKEN,
+    Date.now(),
+    operation?.owner ?? null,
+    operation?.owner ?? null,
+    Date.now(),
+  ).run();
+  const changes = Number(rotated.meta.changes
+    ?? (rotated.meta as D1Result["meta"] & { rows_written?: number }).rows_written
+    ?? 0);
+  if (changes !== 1) {
+    throw new MemoryWriteLockedError({
+      lockedAt: Date.now(), reason: "integration-generation-changed", ownerId: "",
+    });
+  }
+  await env.OAUTH_KV.delete(
+    integrationKey(provider, current.generation, current.providerGeneration),
+  );
+  if (current.restoreCount === 0 && current.providerVersion === 0) {
+    await env.OAUTH_KV.delete(integrationKey(provider, current.generation));
+    await env.OAUTH_KV.delete(integrationKey(provider));
+  }
 }
 
 // Connection status for the settings UI. Never exposes credentials — the token

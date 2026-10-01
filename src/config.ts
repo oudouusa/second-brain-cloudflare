@@ -13,6 +13,7 @@
  * does nothing.
  */
 import type { Env } from "./env";
+import { EMBEDDING_PROFILE } from "./embedding/profile";
 
 // Prefixed to coexist with workers-oauth-provider's token:/grant:/client: keys
 // and the integrations: blobs in the same namespace.
@@ -26,14 +27,14 @@ export const DEFAULTS = {
   MMR_LAMBDA: 0.7,
 
   // ── Duplicate detection (src/capture/duplicate.ts) ──
-  DUPLICATE_BLOCK_THRESHOLD: 0.95,
-  DUPLICATE_FLAG_THRESHOLD: 0.85,
+  DUPLICATE_BLOCK_THRESHOLD: 0.98,
+  DUPLICATE_FLAG_THRESHOLD: 0.80,
 
   // ── Recall widening (src/recall/search.ts) ──
-  RECALL_WIDEN_THRESHOLD: 0.85,
+  RECALL_WIDEN_THRESHOLD: 0.60,
 
   // ── Keyword arm (src/recall/search.ts) ──
-  KEYWORD_CANDIDATE_LIMIT: 500,
+  KEYWORD_CANDIDATE_LIMIT: 128,
   SUBSTRING_MATCH_WEIGHT: 0.25,
 
   // ── Cross-encoder reranker (src/recall/model-reranker.ts) ──
@@ -102,7 +103,7 @@ export const DEFAULTS = {
 
   // ── Models (src/lib/ai.ts) ──
   LLM_MODEL: "@cf/meta/llama-4-scout-17b-16e-instruct",
-  EMBEDDING_MODEL: "@cf/baai/bge-small-en-v1.5",
+  EMBEDDING_MODEL: "@cf/google/embeddinggemma-300m",
   // Used only by src/insight/reason.ts's pair-reasoning call — everything
   // else above keeps using LLM_MODEL. See the cost comment on
   // constants.INSIGHT_LLM_MODEL for why this is a separate setting.
@@ -195,7 +196,7 @@ export const DEFAULTS = {
   // Dimension of DEFAULTS.EMBEDDING_MODEL's vectors (bge-small-en-v1.5). Threaded explicitly
   // into the standing cache codec/build rather than hard-coded there, so a future embedding
   // model change updates both together.
-  EMBEDDING_DIM: 384,
+  EMBEDDING_DIM: EMBEDDING_PROFILE.dimensions,
 
   // ── Decision ledger (src/decisions/*, Track 7, T-0089.7.2) ──
   // D7.3: a decision's review date when neither review_by nor when is given.
@@ -216,7 +217,8 @@ export type ConfigKey = keyof Config;
 
 type Rule =
   | { kind: "number"; min: number; max: number; integer?: boolean }
-  | { kind: "string" };
+  | { kind: "string" }
+  | { kind: "fixed"; value: string };
 
 /**
  * Accepted shape and range per key. Enforced at resolve time rather than only
@@ -276,7 +278,11 @@ export const RULES: Record<ConfigKey, Rule> = {
   RERANK_MODE: { kind: "string" },
 
   LLM_MODEL: { kind: "string" },
-  EMBEDDING_MODEL: { kind: "string" },
+  // Model, dimensions and prompt version are one immutable vector profile in
+  // this fork. Keeping the key in Config preserves upstream call signatures,
+  // while the fixed rule prevents a model-only override from taking capture
+  // and recall down or producing incomparable vectors.
+  EMBEDDING_MODEL: { kind: "fixed", value: DEFAULTS.EMBEDDING_MODEL },
   INSIGHT_LLM_MODEL: { kind: "string" },
   WHEN_LLM_MODEL: { kind: "string" },
   TEAM_DEFAULT_WORKSPACE: { kind: "string" },
@@ -360,6 +366,12 @@ const INVARIANTS: { keys: ConfigKey[]; holds: (c: Config) => boolean; describe: 
 export function coerce(key: ConfigKey, value: unknown): { value: Config[ConfigKey]; note?: string } {
   const rule = RULES[key];
   const fallback = DEFAULTS[key] as Config[ConfigKey];
+
+  if (rule.kind === "fixed") {
+    return value === rule.value
+      ? { value: rule.value as Config[ConfigKey] }
+      : { value: fallback, note: `${key}: fixed by the active embedding profile` };
+  }
 
   if (rule.kind === "string") {
     // PUSH_CONTACT is the one string setting where EMPTY is the valid,
@@ -475,7 +487,14 @@ export async function readOverrides(env: Env): Promise<Partial<Config>> {
     const parsed = JSON.parse(raw);
     if (!isRecord(parsed)) return {};
     const out: Record<string, unknown> = {};
-    for (const [k, v] of Object.entries(parsed)) if (k in DEFAULTS) out[k] = v;
+    for (const [k, v] of Object.entries(parsed)) {
+      if (!(k in DEFAULTS)) continue;
+      const rule = RULES[k as ConfigKey];
+      // A stale model-only override is not an active override. Omitting it here
+      // also means the next valid PATCH naturally cleans the old blob up.
+      if (rule.kind === "fixed" && v !== rule.value) continue;
+      out[k] = v;
+    }
     return out as Partial<Config>;
   } catch {
     return {};
@@ -486,6 +505,12 @@ export async function readOverrides(env: Env): Promise<Partial<Config>> {
 function validateStrict(key: string, value: unknown): string | null {
   if (!(key in DEFAULTS)) return `${key} is not a known setting`;
   const rule = RULES[key as ConfigKey];
+
+  if (rule.kind === "fixed") {
+    return value === rule.value
+      ? null
+      : `${key} is fixed by the active embedding profile`;
+  }
 
   if (rule.kind === "string") {
     if (key === "PUSH_CONTACT") {

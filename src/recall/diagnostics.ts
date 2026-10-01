@@ -75,7 +75,7 @@ function observeD1(database: D1Database, operations: RecallOperationDiagnostics,
       }
       if (property === "batch") {
         return async (statements: D1PreparedStatement[]) => {
-          operations.d1Statements += 1;
+          operations.d1Statements += statements.length;
           const result = await target.batch(statements.map(statement =>
             (rawStatements.get(statement as object) ?? statement) as D1PreparedStatement,
           ));
@@ -119,27 +119,35 @@ function observeMethods<T extends object>(
  */
 export function observeRecallEnv(env: Env, diagnostics: RecallDiagnostics): Env {
   const operations = initializeOperations(diagnostics);
-  return {
-    ...env,
-    AI: observeMethods(env.AI, {
+  const observedAi = observeMethods(env.AI, {
       run: (_model: unknown, input: unknown) => {
         operations.aiCalls += 1;
         if (input && typeof input === "object" && Array.isArray((input as { text?: unknown }).text)) {
           operations.embeddingCalls += 1;
         }
       },
-    }),
-    VECTORIZE: observeMethods(env.VECTORIZE, {
+    });
+  const observedVectorize = observeMethods(env.VECTORIZE, {
       query: () => { operations.vectorizeQueries += 1; },
       getByIds: () => { operations.vectorizeGets += 1; },
-    }),
-    DB: observeD1(env.DB, operations, diagnostics),
-    OAUTH_KV: observeMethods(env.OAUTH_KV, {
+    });
+  const observedDb = observeD1(env.DB, operations, diagnostics);
+  const observedKv = observeMethods(env.OAUTH_KV, {
       get: () => { operations.kvReads += 1; },
       getWithMetadata: () => { operations.kvReads += 1; },
       list: () => { operations.kvReads += 1; },
       put: () => { operations.kvWrites += 1; },
       delete: () => { operations.kvWrites += 1; },
-    }),
-  } as Env;
+    });
+
+  // Keep platform host bindings on the original request-scoped env object.
+  return new Proxy(Object.create(env) as Env, {
+    get(target, property) {
+      if (property === "AI") return observedAi;
+      if (property === "VECTORIZE") return observedVectorize;
+      if (property === "DB") return observedDb;
+      if (property === "OAUTH_KV") return observedKv;
+      return Reflect.get(target, property, target);
+    },
+  }) as Env;
 }

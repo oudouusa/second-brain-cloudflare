@@ -1,6 +1,7 @@
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { readReferenceSchema } from "../helpers/reference-schema";
 import { makeSqliteD1, splitSchemaStatements, stripSqlComments } from "../helpers/sqlite-d1";
 
 export interface EvalD1 { db: D1Database; kind: "sqlite" | "workerd"; close(): Promise<void> }
@@ -21,7 +22,7 @@ export async function openD1(kind: "sqlite" | "workerd"): Promise<EvalD1> {
     return { db: sqlite.db as unknown as D1Database, kind, close: async () => sqlite.close() };
   }
   // workerd: wrangler's local D1 (real rows_read in meta). Local only: no remote binding, throwaway state dir.
-  const schema = readFileSync(join(root(), "db/schema.sql"), "utf8");
+  const schema = readReferenceSchema(root());
   const compatibility_date = compatibilityDate();
   const { getPlatformProxy } = await import("wrangler");
   const dir = mkdtempSync(join(tmpdir(), "sb-eval-d1-"));

@@ -386,7 +386,7 @@ async function syncIntegration(provider, btn) {
     // Each call processes a bounded batch and reports what's left — loop
     // until the backlog drains (same pattern as runVectorize).
     let remaining = 1, processed = 0, guard = 0
-    while (remaining > 0 && guard < 40) {
+    while (remaining > 0 && guard < 200) {
       guard++
       const res = await fetch(`${WORKER_URL}/integrations/${provider}/sync`, {
         method: 'POST',
@@ -718,6 +718,7 @@ async function moveIntegrationMemories(provider, btn, expectedTarget) {
  */
 async function disconnectIntegration(provider, btn) {
   const info = integrationsInfo.find((i) => i.provider === provider) || {}
+  const itemCount = Number(info.itemCount || 0)
   openDangerConfirm({
     title: t('danger.disconnectTitle'),
     body: t('integrations.disconnectConfirm', { name: info.name || provider }),
@@ -733,8 +734,13 @@ async function disconnectIntegration(provider, btn) {
       btn.textContent = t('integrations.disconnecting')
       try {
         // A purge runs in pages: 202 with done:false hands back next_cursor to continue from.
+        // forkの1件ページに合わせ、既知map件数＋孤児200件＋完了確認の有限枠を確保する。
+        const maxPages = (Number.isSafeInteger(itemCount) && itemCount > 0 ? itemCount : 0) + 201
         let cursor
+        let pages = 0
+        let previousProgress
         for (;;) {
+          if (++pages > maxPages) throw new Error(t('integrations.disconnectFailed'))
           const res = await fetch(`${WORKER_URL}/integrations/${provider}/disconnect`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${AUTH_TOKEN}` },
@@ -743,16 +749,20 @@ async function disconnectIntegration(provider, btn) {
           const data = await res.json()
           if (!res.ok || !data.ok) throw new Error(data.error || t('integrations.disconnectFailed'))
           if (data.done !== false) break
+          if (typeof data.next_cursor !== 'string') throw new Error(t('integrations.disconnectFailed'))
+          const progress = JSON.stringify([data.next_cursor, data.purged, data.skipped])
+          if (progress === previousProgress) throw new Error(t('integrations.disconnectFailed'))
+          previousProgress = progress
           cursor = data.next_cursor
         }
         await loadIntegrations()
         if (purge) refreshAll()
+        done()
       } catch (e) {
         btn.disabled = false
         btn.textContent = t('menu.disconnect')
         showToast(e.message || t('integrations.disconnectFailed'))
       }
-      done()
     },
   })
 }

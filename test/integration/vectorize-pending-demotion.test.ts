@@ -50,4 +50,3 @@ describe("a deferred row that keeps failing does not block the queue", () => {
     expect(raw === null || !("flaky" in JSON.parse(raw))).toBe(true);
   });
 });
-

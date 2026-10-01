@@ -31,7 +31,7 @@ async function migrated(overrides: Record<string, unknown> = {}): Promise<{ env:
   const s = makeSqliteD1();
   sqlite = s;
   resetDatabaseInit();
-  const env = makeTestEnv(undefined, { DB: s.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV(), ...overrides });
+  const env = s.admitEnv(makeTestEnv(undefined, { DB: s.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV(), ...overrides }));
   await initializeDatabase(env);
   const identity = (await ensureTenantBootstrap(env), (await resolveIdentityFromToken("test-token", env))!);
   return { env, identity };

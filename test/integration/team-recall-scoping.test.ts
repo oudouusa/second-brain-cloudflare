@@ -20,6 +20,7 @@ import { makeSqliteD1, type SqliteD1 } from "../helpers/sqlite-d1";
 import { makeTestEnv, makeMemoryKV, makeVectorizeMock } from "../helpers/make-env";
 import type { Identity } from "../../src/lib/identity";
 import type { Env } from "../../src/env";
+import { resetVectorizeFilterState, vectorizeFilterState } from "../../src/vectorize/scope";
 import { DEFAULTS } from "../../src/config";
 
 const memberOf = (personal: string): Identity => ({
@@ -36,7 +37,7 @@ function makeCtx() {
 }
 
 /** Dense arm always fails: the keyword arm's SQL becomes the entire candidate source. */
-function recallEnv(sqlite: SqliteD1, vectorizeOverrides: Partial<VectorizeIndex> = {}): Env {
+function recallEnv(sqlite: SqliteD1, vectorizeOverrides: Partial<Vectorize> = {}): Env {
   return makeTestEnv(undefined, {
     DB: sqlite.db as unknown as Env["DB"],
     OAUTH_KV: makeMemoryKV(),
@@ -65,6 +66,7 @@ describe("recallEntries with an Identity", () => {
   let env: Env;
   beforeEach(async () => {
     resetDatabaseInit();
+    resetVectorizeFilterState();
     sqlite = makeSqliteD1();
     env = recallEnv(sqlite);
     // The final hydration reads updated_at, a runtime-ALTER column: the schema
@@ -86,6 +88,62 @@ describe("recallEntries with an Identity", () => {
     expect(ids).toContain("own");
     expect(ids).toContain("co"); // personal ∪ company: the shared row stays readable
     expect(ids).not.toContain("foreign");
+  });
+
+  it("recovers legacy unstamped dense vectors after a silent empty filter without leaking foreign rows", async () => {
+    // Existing solo-era vectors have no workspace_id metadata. On an index
+    // without that metadata index, Vectorize accepts the workspace filter but
+    // returns an empty set instead of rejecting it. The recall-only probe must
+    // recover those semantic candidates, while D1 remains the hard boundary.
+    sqlite.seed({
+      id: "legacy-own",
+      content: "garment-supported silhouette and individual balance decisions",
+      createdAt: 1000,
+      tags: ["vestaos"],
+    });
+    sqlite.db.prepare(`UPDATE entries SET workspace_id = ? WHERE id = ?`)
+      .bind("ws-a", "legacy-own").run();
+    sqlite.seed({
+      id: "legacy-foreign",
+      content: "private notes from another workspace",
+      createdAt: 1000,
+      tags: ["vestaos"],
+    });
+    sqlite.db.prepare(`UPDATE entries SET workspace_id = ? WHERE id = ?`)
+      .bind("ws-b", "legacy-foreign").run();
+
+    const query = vi.fn().mockImplementation(async (_values: number[], opts: any) => opts?.filter
+      ? { matches: [] }
+      : { matches: [
+        {
+          id: "v-own",
+          score: 0.95,
+          metadata: { parentId: "legacy-own", tags: ["vestaos"] },
+        },
+        {
+          id: "v-foreign",
+          score: 0.9,
+          metadata: { parentId: "legacy-foreign", tags: ["vestaos"] },
+        },
+      ] });
+    const scopedEnv = recallEnv(sqlite, { query: query as never });
+    const { ctx } = makeCtx();
+
+    const res = await recallEntries(
+      { query: "VestaOS", topK: 5, hops: 0, synthesize: false },
+      scopedEnv,
+      ctx,
+      undefined,
+      { identity: memberOf("ws-a") },
+    );
+
+    expect(res.matches.map(match => match.id)).toEqual(["legacy-own"]);
+    expect(scopedEnv.VECTORIZE.query).toHaveBeenCalledTimes(2);
+    expect((scopedEnv.VECTORIZE.query as ReturnType<typeof vi.fn>).mock.calls[0][1]).toEqual(
+      expect.objectContaining({ filter: { workspace_id: { $in: ["ws-a", "ws-co"] } } }),
+    );
+    expect((scopedEnv.VECTORIZE.query as ReturnType<typeof vi.fn>).mock.calls[1][1]).not.toHaveProperty("filter");
+    expect(vectorizeFilterState()).toEqual({ supported: false, degradedQueries: 1 });
   });
 
   it.each([
@@ -148,7 +206,7 @@ describe("recallEntries with an Identity", () => {
     );
   });
 
-  it("scopes every entries read, and leaves the unscoped SQL byte-for-byte alone", async () => {
+  it("直接候補の適格性を含め、全entries読取りのscopeを維持する", async () => {
     seedTriangle(sqlite);
     const { ctx } = makeCtx();
     const keywordSql = () => sqlite.issued.find(s => s.includes("ORDER BY created_at DESC LIMIT"));
@@ -159,7 +217,7 @@ describe("recallEntries with an Identity", () => {
     await recallEntries({ query: "alpha", topK: 10, synthesize: false }, env, ctx);
     // The keyword arm returns match levels, not text (src/recall/keyword-rows.ts): its candidate SELECT is the CTE's body.
     expect(keywordSql()).toContain(
-      `SELECT id, created_at, tags, source, lower(content) AS lc FROM entries WHERE content LIKE ? ESCAPE '\\' AND (valid_until IS NULL OR valid_until > ?) AND tags NOT LIKE '%"quarantine:instruction"%' ESCAPE '\\' AND tags NOT LIKE '%"quarantine:hidden"%' ESCAPE '\\' AND tags NOT LIKE '%"quarantine:burst"%' ESCAPE '\\' AND tags NOT LIKE '%"quarantine:capsule"%' ESCAPE '\\' AND tags NOT LIKE '%"quarantine:too\\_long"%' ESCAPE '\\' ORDER BY created_at DESC LIMIT ?`,
+      `SELECT id, created_at, tags, source, lower(content) AS lc FROM entries WHERE content LIKE ? ESCAPE '\\' AND (valid_until IS NULL OR valid_until > ?) AND tags NOT LIKE '%"quarantine:instruction"%' ESCAPE '\\' AND tags NOT LIKE '%"quarantine:hidden"%' ESCAPE '\\' AND tags NOT LIKE '%"quarantine:burst"%' ESCAPE '\\' AND tags NOT LIKE '%"quarantine:capsule"%' ESCAPE '\\' AND tags NOT LIKE '%"quarantine:too\\_long"%' ESCAPE '\\' AND tags NOT LIKE '%"auto-pattern"%' AND tags NOT LIKE '%"auto-insight"%' AND tags NOT LIKE '%"status:deprecated"%' ORDER BY created_at DESC LIMIT ?`,
     );
     expect(sqlite.issued.some(s => s.includes("FROM entries") && s.includes("workspace_id IN"))).toBe(false);
 
@@ -168,7 +226,7 @@ describe("recallEntries with an Identity", () => {
     await recallEntries({ query: "alpha", topK: 10, synthesize: false }, env, ctx, undefined,
       { identity: memberOf("ws-a") });
     expect(keywordSql()).toContain(
-      `SELECT id, created_at, tags, source, lower(content) AS lc FROM entries WHERE content LIKE ? ESCAPE '\\' AND workspace_id IN (?, ?) AND (valid_until IS NULL OR valid_until > ?) AND tags NOT LIKE '%"quarantine:instruction"%' ESCAPE '\\' AND tags NOT LIKE '%"quarantine:hidden"%' ESCAPE '\\' AND tags NOT LIKE '%"quarantine:burst"%' ESCAPE '\\' AND tags NOT LIKE '%"quarantine:capsule"%' ESCAPE '\\' AND tags NOT LIKE '%"quarantine:too\\_long"%' ESCAPE '\\' ORDER BY created_at DESC LIMIT ?`,
+      `SELECT id, created_at, tags, source, lower(content) AS lc FROM entries WHERE content LIKE ? ESCAPE '\\' AND workspace_id IN (?, ?) AND (valid_until IS NULL OR valid_until > ?) AND tags NOT LIKE '%"quarantine:instruction"%' ESCAPE '\\' AND tags NOT LIKE '%"quarantine:hidden"%' ESCAPE '\\' AND tags NOT LIKE '%"quarantine:burst"%' ESCAPE '\\' AND tags NOT LIKE '%"quarantine:capsule"%' ESCAPE '\\' AND tags NOT LIKE '%"quarantine:too\\_long"%' ESCAPE '\\' AND tags NOT LIKE '%"auto-pattern"%' AND tags NOT LIKE '%"auto-insight"%' AND tags NOT LIKE '%"status:deprecated"%' ORDER BY created_at DESC LIMIT ?`,
     );
     // Both hydration steps carry the clause too — the candidate-signal read is
     // the leak-catcher for unscoped vectorize hits until namespaces land (P3).
@@ -177,7 +235,7 @@ describe("recallEntries with an Identity", () => {
     for (const sql of hydrations) expect(sql).toContain("AND +(workspace_id IN (?, ?))");
     // The recall_count bump stays by-id: those ids came from already-scoped rows.
     expect(sqlite.issued.some(s => s.includes("UPDATE entries SET recall_count") && s.includes("workspace_id")))
-      .toBe(false);
+      .toBe(true);
   });
 
   it("scopes the ?tag= scan too", async () => {
@@ -219,7 +277,7 @@ describe("recallEntries with an Identity", () => {
     await recallEntries({ query: "alpha", topK: 10, synthesize: false }, env, ctx, undefined,
       { identity: memberOf("ws-a"), workspaceFilter: "personal" });
     expect(keywordSql()).toContain(
-      `SELECT id, created_at, tags, source, lower(content) AS lc FROM entries WHERE content LIKE ? ESCAPE '\\' AND workspace_id IN (?) AND (valid_until IS NULL OR valid_until > ?) AND tags NOT LIKE '%"quarantine:instruction"%' ESCAPE '\\' AND tags NOT LIKE '%"quarantine:hidden"%' ESCAPE '\\' AND tags NOT LIKE '%"quarantine:burst"%' ESCAPE '\\' AND tags NOT LIKE '%"quarantine:capsule"%' ESCAPE '\\' AND tags NOT LIKE '%"quarantine:too\\_long"%' ESCAPE '\\' ORDER BY created_at DESC LIMIT ?`,
+      `SELECT id, created_at, tags, source, lower(content) AS lc FROM entries WHERE content LIKE ? ESCAPE '\\' AND workspace_id IN (?) AND (valid_until IS NULL OR valid_until > ?) AND tags NOT LIKE '%"quarantine:instruction"%' ESCAPE '\\' AND tags NOT LIKE '%"quarantine:hidden"%' ESCAPE '\\' AND tags NOT LIKE '%"quarantine:burst"%' ESCAPE '\\' AND tags NOT LIKE '%"quarantine:capsule"%' ESCAPE '\\' AND tags NOT LIKE '%"quarantine:too\\_long"%' ESCAPE '\\' AND tags NOT LIKE '%"auto-pattern"%' AND tags NOT LIKE '%"auto-insight"%' AND tags NOT LIKE '%"status:deprecated"%' ORDER BY created_at DESC LIMIT ?`,
     );
 
     // Team filter: exactly one workspace id, and the result set is that team's row.
@@ -227,7 +285,7 @@ describe("recallEntries with an Identity", () => {
     const res = await recallEntries({ query: "alpha", topK: 10, synthesize: false }, env, ctx, undefined,
       { identity: memberOf("ws-a"), teamId: "ws-co" });
     expect(keywordSql()).toContain(
-      `SELECT id, created_at, tags, source, lower(content) AS lc FROM entries WHERE content LIKE ? ESCAPE '\\' AND workspace_id = ? AND (valid_until IS NULL OR valid_until > ?) AND tags NOT LIKE '%"quarantine:instruction"%' ESCAPE '\\' AND tags NOT LIKE '%"quarantine:hidden"%' ESCAPE '\\' AND tags NOT LIKE '%"quarantine:burst"%' ESCAPE '\\' AND tags NOT LIKE '%"quarantine:capsule"%' ESCAPE '\\' AND tags NOT LIKE '%"quarantine:too\\_long"%' ESCAPE '\\' ORDER BY created_at DESC LIMIT ?`,
+      `SELECT id, created_at, tags, source, lower(content) AS lc FROM entries WHERE content LIKE ? ESCAPE '\\' AND workspace_id = ? AND (valid_until IS NULL OR valid_until > ?) AND tags NOT LIKE '%"quarantine:instruction"%' ESCAPE '\\' AND tags NOT LIKE '%"quarantine:hidden"%' ESCAPE '\\' AND tags NOT LIKE '%"quarantine:burst"%' ESCAPE '\\' AND tags NOT LIKE '%"quarantine:capsule"%' ESCAPE '\\' AND tags NOT LIKE '%"quarantine:too\\_long"%' ESCAPE '\\' AND tags NOT LIKE '%"auto-pattern"%' AND tags NOT LIKE '%"auto-insight"%' AND tags NOT LIKE '%"status:deprecated"%' ORDER BY created_at DESC LIMIT ?`,
     );
     expect(res.matches.map(m => m.id)).toEqual(["co"]);
   });

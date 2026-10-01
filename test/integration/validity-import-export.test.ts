@@ -16,7 +16,7 @@ async function brain() {
   resetDatabaseInit();
   const sqlite = makeSqliteD1();
   open.push(sqlite);
-  const env = makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV() }) as Env;
+  const env = sqlite.admitEnv(makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV() })) as Env;
   await initializeDatabase(env);
   const roots = await ensureTenantBootstrap(env);
   const seed = (id: string, validFrom: number | null, validUntil: number | null) =>

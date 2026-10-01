@@ -37,7 +37,7 @@ beforeEach(async () => {
   resetDatabaseInit();
   deleted = [];
   d1 = makeSqliteD1();
-  env = makeTestEnv(undefined, { DB: d1.db as unknown as D1Database, OAUTH_KV: makeMemoryKV(), VECTORIZE: statefulVectorize(), AI: makeAIMock() });
+  env = d1.admitEnv(makeTestEnv(undefined, { DB: d1.db as unknown as D1Database, OAUTH_KV: makeMemoryKV(), VECTORIZE: statefulVectorize(), AI: makeAIMock() }));
   await initializeDatabase(env);
   const roots = await ensureTenantBootstrap(env);
   wsId = roots.ownerPersonalWorkspaceId;
@@ -59,11 +59,11 @@ function racingEnv(mutate: () => Promise<void>, atRead: number | "every" = 1): E
     ...raw,
     prepare(sql: string) {
       const st = raw.prepare(sql);
-      if (!sql.startsWith("SELECT content, tags, source, vector_ids, workspace_id FROM entries")) return st;
+      if (!sql.startsWith("SELECT content, tags, source, ")) return st;
       return { bind: (...a: unknown[]) => ({ first: async () => { n++; const r = await st.bind(...a).first(); if (atRead === "every" || n === atRead) await mutate(); return r; } }) };
     },
   };
-  return { ...env, DB } as unknown as Env;
+  return { ...env, WRITE_ADMISSION_TOKEN: env.WRITE_ADMISSION_TOKEN, DB } as unknown as Env;
 }
 
 describe("write races: re-embed ordering (T-0089.10)", () => {
@@ -104,10 +104,10 @@ describe("write races: re-embed ordering (T-0089.10)", () => {
     await seed("e1", "same text", ["a"]);
     let embeds = 0;
     const countingAI = { run: vi.fn(async (model: string, opts: any) => {
-      if (model.startsWith("@cf/baai/bge")) { embeds++; return { data: [new Array(384).fill(0.1)] }; }
+      if (model === "@cf/google/embeddinggemma-300m") { embeds++; return { data: [new Array(768).fill(0.1)] }; }
       return new ReadableStream({ start(c) { c.close(); } });
     }) } as unknown as Ai;
-    const countingEnv = { ...env, AI: countingAI } as unknown as Env;
+    const countingEnv = { ...env, WRITE_ADMISSION_TOKEN: env.WRITE_ADMISSION_TOKEN, AI: countingAI } as unknown as Env;
     const racing = { ...racingEnv(async () => {
       await d1.db.prepare(`UPDATE entries SET tags = '["a","b"]' WHERE id = 'e1'`).run();
     }), AI: countingAI } as unknown as Env;
@@ -125,17 +125,17 @@ describe("write races: re-embed ordering (T-0089.10)", () => {
       c.enqueue(new TextEncoder().encode(`data: {"response":${JSON.stringify(text)}}\n\n`));
       c.enqueue(new TextEncoder().encode("data: [DONE]\n\n")); c.close();
     } });
-    const raceEnv = makeTestEnv(undefined, {
+    const raceEnv = d1.admitEnv(makeTestEnv(undefined, {
       DB: d1.db as any, OAUTH_KV: makeMemoryKV(),
       VECTORIZE: makeVectorizeMock({
         query: vi.fn().mockResolvedValue({ matches: [{ id: "old", score: 0.9, metadata: { parentId: "old" } }] }),
         upsert: vi.fn(async (vs: any[]): Promise<any> => { for (const v of vs) store.set(v.id, v); return { mutationId: "m" }; }),
         deleteByIds: vi.fn(async (ids: string[]): Promise<any> => { deleted.push(...ids); return { mutationId: "m" }; }),
       }),
-      AI: { run: vi.fn(async (model: string) => model.startsWith("@cf/baai/bge") ? { data: [new Array(384).fill(0.1)] } : stream(decision)) } as any,
-    }) as Env;
+      AI: { run: vi.fn(async (model: string) => model === "@cf/google/embeddinggemma-300m" ? { data: [new Array(768).fill(0.1)] } : stream(decision)) } as any,
+    })) as Env;
     await d1.db.prepare(
-      `INSERT INTO entries (id, content, tags, source, created_at, updated_at, vector_ids, workspace_id, actor_id) VALUES ('old', 'original', '["work"]', 'api', 1000, NULL, '["old"]', '', 'u1')`,
+      `INSERT INTO entries (id, content, tags, source, created_at, updated_at, vector_ids, workspace_id, actor_id) VALUES ('old', 'original', '["rocket-project"]', 'api', 1000, NULL, '["old"]', '', 'u1')`,
     ).run();
     const db = raceEnv.DB as any;
     const prepare = db.prepare.bind(db);
@@ -143,7 +143,7 @@ describe("write races: re-embed ordering (T-0089.10)", () => {
     db.prepare = (sql: string) => {
       if (!raced && sql.startsWith("INSERT INTO entry_versions")) {
         raced = true;
-        prepare(`UPDATE entries SET content = 'concurrent edit', tags = '["work","user-edited"]' WHERE id = 'old'`).run();
+        prepare(`UPDATE entries SET content = 'concurrent edit', tags = '["rocket-project","user-edited"]' WHERE id = 'old'`).run();
       }
       return prepare(sql);
     };
@@ -168,17 +168,17 @@ describe("write races: re-embed ordering (T-0089.10)", () => {
     } });
     const roots = await ensureTenantBootstrap(env);
     const bob = (await resolveIdentityFromToken((await createMember(env, { name: "Bob" })).token, env))!;
-    await seed("t1", "Team fact about the launch plan", ["work"]);
+    await seed("t1", "Team fact about the launch plan", ["rocket-project"]);
     await d1.db.prepare(`UPDATE entries SET workspace_id = ?, actor_id = ? WHERE id = 't1'`).bind(roots.companyWorkspaceId, bob.userId).run();
-    const raceEnv = makeTestEnv(undefined, {
+    const raceEnv = d1.admitEnv(makeTestEnv(undefined, {
       DB: d1.db as any, OAUTH_KV: makeMemoryKV(),
       VECTORIZE: makeVectorizeMock({
         query: vi.fn().mockResolvedValue({ matches: [{ id: "t1", score: 0.9, metadata: { parentId: "t1" } }] }),
         upsert: vi.fn(async (): Promise<any> => ({ mutationId: "m" })),
         deleteByIds: vi.fn(async (): Promise<any> => ({ mutationId: "m" })),
       }),
-      AI: { run: vi.fn(async (model: string) => model.startsWith("@cf/baai/bge") ? { data: [new Array(384).fill(0.1)] } : stream(decision)) } as any,
-    }) as Env;
+      AI: { run: vi.fn(async (model: string) => model === "@cf/google/embeddinggemma-300m" ? { data: [new Array(768).fill(0.1)] } : stream(decision)) } as any,
+    })) as Env;
     const db = raceEnv.DB as any;
     const prepare = db.prepare.bind(db);
     let raced = false;
@@ -204,9 +204,9 @@ describe("write races: re-embed ordering (T-0089.10)", () => {
     await seed("e3", secret);
     let n = 0;
     const raw = env.DB as any;
-    const racing = { ...env, DB: { ...raw, prepare(sql: string) {
+    const racing = { ...env, WRITE_ADMISSION_TOKEN: env.WRITE_ADMISSION_TOKEN, DB: { ...raw, prepare(sql: string) {
       const st = raw.prepare(sql);
-      if (!sql.startsWith("SELECT content, tags, source, vector_ids, workspace_id FROM entries")) return st;
+      if (!sql.startsWith("SELECT content, tags, source, ")) return st;
       return { bind: (...a: unknown[]) => ({ first: async () => {
         const r = await st.bind(...a).first();
         // The author replaces the text (removing SECRET-PLAN) right after the append read the row.
@@ -218,7 +218,7 @@ describe("write races: re-embed ordering (T-0089.10)", () => {
         return r;
       } }) };
     } } } as unknown as Env;
-    await appendToEntry(racing, "e3", "", "an addition", [], "api", DEFAULTS, undefined,
+    await appendToEntry(racing, "e3", "", "an addition", [], "claude", DEFAULTS, undefined,
       { workspaceId: wsId, actorId: ownerId }, { actorId: ownerId, channel: "rest" }, undefined, wsId);
     const finalRow = await live("e3");
     expect(finalRow.content).toContain("short public text");
@@ -233,11 +233,11 @@ describe("write races: re-embed ordering (T-0089.10)", () => {
     let forgot = false;
     // The user forgets the memory while the append is embedding: its DELETE lands inside the append's
     // own batch, right before the guarded UPDATE, so the CAS misses because the row is gone.
-    const racing = { ...env, DB: { ...raw, prepare(sql: string) {
-      if (!forgot && sql.startsWith("INSERT INTO entry_versions")) { forgot = true; raw.prepare(`DELETE FROM entries WHERE id = 'g1'`).run(); }
+    const racing = { ...env, WRITE_ADMISSION_TOKEN: env.WRITE_ADMISSION_TOKEN, DB: { ...raw, prepare(sql: string) {
+      if (!forgot && sql.startsWith("INSERT INTO entry_versions")) { forgot = true; void d1.deleteFixtureRows(`DELETE FROM entries WHERE id = 'g1'`); }
       return raw.prepare(sql);
     } } } as unknown as Env;
-    await expect(appendToEntry(racing, "g1", "", "more", [], "api", DEFAULTS, undefined,
+    await expect(appendToEntry(racing, "g1", "", "more", [], "claude", DEFAULTS, undefined,
       { workspaceId: wsId, actorId: ownerId }, { actorId: ownerId, channel: "rest" }, undefined, wsId)).rejects.toThrow();
     expect(await live("g1")).toBeNull();
     expect([...store.values()].filter(v => v.metadata?.parentId === "g1")).toEqual([]);
@@ -247,18 +247,18 @@ describe("write races: re-embed ordering (T-0089.10)", () => {
     await seed("o1", "base");
     const wctx = { workspaceId: wsId, actorId: ownerId };
     const appendChange = { actorId: ownerId, channel: "rest" as const };
-    const plain = makeTestEnv(undefined, { DB: d1.db as unknown as D1Database, OAUTH_KV: makeMemoryKV(), VECTORIZE: statefulVectorize(), AI: makeAIMock() });
+    const plain = d1.admitEnv(makeTestEnv(undefined, { DB: d1.db as unknown as D1Database, OAUTH_KV: makeMemoryKV(), VECTORIZE: statefulVectorize(), AI: makeAIMock() }));
     let raced = false;
     // Another client's append commits fully while this one is still embedding its own chunk.
     const slowVectorize = makeVectorizeMock({
       insert: vi.fn(async (vs: any[]) => {
-        if (!raced) { raced = true; await new Promise(r => setTimeout(r, 5)); await appendToEntry(plain, "o1", "", "fast one", [], "api", DEFAULTS, undefined, wctx, appendChange, undefined, wsId); }
+        if (!raced) { raced = true; await new Promise(r => setTimeout(r, 5)); await appendToEntry(plain, "o1", "", "fast one", [], "claude", DEFAULTS, undefined, wctx, appendChange, undefined, wsId); }
         for (const v of vs) store.set(v.id, v);
         return { mutationId: "m" } as any;
       }),
     });
-    const slow = makeTestEnv(undefined, { DB: d1.db as unknown as D1Database, OAUTH_KV: makeMemoryKV(), VECTORIZE: slowVectorize, AI: makeAIMock() });
-    await appendToEntry(slow, "o1", "", "slow one", [], "api", DEFAULTS, undefined, wctx, appendChange, undefined, wsId);
+    const slow = d1.admitEnv(makeTestEnv(undefined, { DB: d1.db as unknown as D1Database, OAUTH_KV: makeMemoryKV(), VECTORIZE: slowVectorize, AI: makeAIMock() }));
+    await appendToEntry(slow, "o1", "", "slow one", [], "claude", DEFAULTS, undefined, wctx, appendChange, undefined, wsId);
     const vs = await versions("o1");
     expect(vs.map((v: any) => v.seq)).toEqual([1, 2]);
     const row = await live("o1");
@@ -296,16 +296,16 @@ describe("write races: stale classify tags (T-0089.10)", () => {
       c.enqueue(new TextEncoder().encode(`data: {"response":${JSON.stringify(text)}}\n\n`));
       c.enqueue(new TextEncoder().encode("data: [DONE]\n\n")); c.close();
     } });
-    const classifyingEnv = makeTestEnv(undefined, {
+    const classifyingEnv = d1.admitEnv(makeTestEnv(undefined, {
       DB: d1.db as any, OAUTH_KV: makeMemoryKV(), VECTORIZE: statefulVectorize(),
-      AI: { run: vi.fn(async (model: string) => model.startsWith("@cf/baai/bge")
-        ? { data: [new Array(384).fill(0.1)] }
+      AI: { run: vi.fn(async (model: string) => model === "@cf/google/embeddinggemma-300m"
+        ? { data: [new Array(768).fill(0.1)] }
         : stream(JSON.stringify({ importance: 3, canonical: true, kind: "semantic" }))) } as any,
-    }) as Env;
+    })) as Env;
     const db = classifyingEnv.DB as any;
     const prepare = db.prepare.bind(db);
     db.prepare = (sql: string) => {
-      if (sql.startsWith("SELECT id, content, tags FROM entries")) {
+      if (sql.startsWith("SELECT id, content, tags, workspace_id FROM entries")) {
         // A status change lands between the SELECT list and the classifier's UPDATE.
         const st = prepare(sql);
         return { all: async () => { const r = await st.all(); d1.db.prepare(`UPDATE entries SET tags = '["status:draft"]' WHERE id = 'e1'`).run(); return r; } };
@@ -314,7 +314,7 @@ describe("write races: stale classify tags (T-0089.10)", () => {
     };
     const res = await worker.fetch(req("POST", "/classify-pending"), classifyingEnv, ctx);
     const body = await res.json() as any;
-    expect(body.skipped).toBe(1);
+    expect(body.failed).toBe(1);
     expect(body.processed).toBe(0);
     // The concurrent status change survived; classification did not overwrite it.
     expect(JSON.parse((await live("e1")).tags)).toEqual(["status:draft"]);

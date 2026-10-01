@@ -41,7 +41,7 @@ async function makeEnv(vectorize: ReturnType<typeof makeVectorizeMock>) {
   resetDatabaseInit();
   await initializeDatabase(env);
   const roots = await ensureTenantBootstrap(env);
-  return { env, roots };
+  return { env: d1.admitEnv(env), roots };
 }
 
 describe("share/unshare re-stamps Vectorize workspace_id", () => {

@@ -33,7 +33,7 @@ function seedIn(id: string, workspaceId: string, content: string, createdAt: num
   sqlite.db.prepare(`UPDATE entries SET workspace_id = ? WHERE id = ?`).bind(workspaceId, id).run();
 }
 
-const issuedSql = () => [...sqlite.issued, ...sqlite.batches.flat()];
+const issuedSql = () => sqlite.issued;
 const searchSql = () => issuedSql().filter(sql => sql.includes("SELECT e.id") && sql.includes("entries_fts MATCH"));
 const likeSql = () => issuedSql().filter(sql => sql.includes("FROM entries WHERE") && sql.includes("content LIKE") && sql.includes("ORDER BY created_at DESC"));
 
@@ -114,9 +114,9 @@ describe("bounded plan: the AND tier is left out when the OR tier holds every ma
     ((await sqlite.db.prepare(`SELECT e.id FROM entries_fts JOIN entries e ON e.rowid = entries_fts.rowid AND e.id = entries_fts.id WHERE entries_fts MATCH ? ${order} LIMIT ?`).bind(match, limit).all()).results as { id: string }[]).map(r => r.id);
 
   it("issues one statement and returns exactly the candidates the two tiers would have", async () => {
-    // garden (3020) is too common to score; invoice (400) fits the limit, and 20 rows carry both
+    // garden (3020) is too common to score; invoice (100) fits the fork limit, and 20 rows carry both
     for (let i = 0; i < 3000; i++) sqlite.seed({ id: `g-${i}`, content: `garden note${i}`, createdAt: i + 1 });
-    for (let i = 0; i < 380; i++) sqlite.seed({ id: `i-${i}`, content: `invoice note${i}`, createdAt: i + 5000 });
+    for (let i = 0; i < 80; i++) sqlite.seed({ id: `i-${i}`, content: `invoice note${i}`, createdAt: i + 5000 });
     for (let i = 0; i < 20; i++) sqlite.seed({ id: `b-${i}`, content: `garden invoice note${i}`, createdAt: i + 9000 });
     const both = new Set([...await ftsIds('"garden" "invoice"', "ORDER BY entries_fts.rowid DESC", 500), ...await ftsIds('"invoice"', "ORDER BY bm25(entries_fts)", 500)]);
     sqlite.batches.length = 0;
@@ -127,7 +127,7 @@ describe("bounded plan: the AND tier is left out when the OR tier holds every ma
     expect(diagnostics.ftsRoute).toBe("fts-bounded");
     expect(searchSql()).toHaveLength(1);
     expect(new Set(diagnostics.keywordIds)).toEqual(both);
-    expect(both.size).toBe(400);
+    expect(both.size).toBe(100);
   });
 
   it("keeps it when the OR tier could truncate", async () => {

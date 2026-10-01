@@ -1,3 +1,4 @@
+import { BodyTooLargeError, readBoundedResponseText } from "../lib/body";
 /**
  * Second Brain — Calendar provider (iCal .ics).
  *
@@ -30,21 +31,39 @@ export const RETENTION_MS = 180 * DAY_MS;    // hard bound on kept history
 // past, so they don't accumulate as low-value memories; one-off past events still
 // keep the full RETENTION_MS as historical memory.
 export const RECURRING_RETENTION_MS: number | null = 0;
-// Create/update ceiling per batch. The budget that binds here is D1's — this
-// codebase's self-imposed ~50 calls per Worker invocation (the platform's
-// real ceiling is 1,000 D1/KV/Vectorize calls, kept far tighter here for cost
-// and 10 ms-CPU reasons) — not the one outbound fetch per sync this used to be
-// justified by, which is how the real cost went unnoticed (#290). Each
-// mirrored occurrence costs the mirror store two D1
-// queries to create (insert, then vector_ids) and three to update (read, content
-// write, vector_ids), on top of its classify, embed and Vectorize calls. So ten
-// items is 20–30 D1 queries: comfortable in an HTTP sync, which owns its whole
-// invocation, and the most the nightly cron can afford in the one it shares with
-// three other jobs (see CRON_SYNC_MAX_BATCHES in mirror.ts).
-export const SYNC_EVENT_BATCH = 10;
-export const MAX_OCCURRENCES_PER_EVENT = 200;
-const MAX_ITER = 100_000;                     // guards pathological RRULEs. Note: ev.iterator() walks from DTSTART, so this budget is also spent reaching the window; 100k covers realistic old/frequent series (e.g. hourly for ~10y, daily for centuries). Sub-hourly rules running many years may exhaust it and yield no occurrences — acceptable.
+// Create/update ceiling per batch. The budget that binds here is D1's — 50
+// queries per Worker invocation on the free plan — not the one outbound fetch
+// per sync this used to be justified by, which is how the real cost went
+// unnoticed (#290). Durable vector cleanup now costs four D1 statements after a
+// create and at least five after an update. Five items leave headroom below the
+// 50-query Free ceiling for admission, schema, integration state and paging.
+// One event keeps the worst-case scheduled create path below D1 Free's 50-query
+// invocation ceiling after provider-operation fencing. The dashboard drains a
+// backlog by repeating sync calls; the hourly cron only needs bounded progress.
+export const SYNC_EVENT_BATCH = 1;
+export const MAX_OCCURRENCES_PER_EVENT = 150;
+const MAX_ITER = 250;
+const MAX_DOCUMENT_RECURRENCE_ITERATIONS = 150;
+const MAX_RECURRENCE_CYCLES_BEFORE_WINDOW = 200;
+// ical.js expands BY* lists into candidate sets before yielding the next
+// occurrence. Keep that hidden per-step work bounded as well as the number of
+// iterator steps: a Cartesian BYHOUR×BYMINUTE×BYSECOND rule can otherwise burn
+// the Free-plan CPU allowance before the document budget can stop it.
+const MAX_RRULE_EXPANSION_FACTOR = 32;
+const MAX_RRULE_LINE_CHARS = 1024;
+const MAX_RRULE_PART_VALUES = 32;
+const MAX_TOTAL_OCCURRENCES = 150;
 const MAX_DESCRIPTION_CHARS = 4000;
+const MAX_DESCRIPTION_SCAN_CHARS = 16_000;
+const MAX_SUMMARY_CHARS = 500;
+const MAX_LOCATION_CHARS = 1000;
+
+class CalendarComplexityError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "CalendarComplexityError";
+  }
+}
 
 // A single concrete calendar occurrence (a non-recurring event, or one expanded
 // instance of a recurring one).
@@ -64,6 +83,18 @@ export interface Occurrence {
 function cleanText(s: unknown): string {
   if (s == null) return "";
   return String(s).replace(/\r\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+
+function eventTextFields(ev: any): Pick<Occurrence, "summary" | "location" | "description"> {
+  // Bound before regex cleanup. A large folded DESCRIPTION is legal ICS, but
+  // scanning all of it for every recurrence wastes CPU on text that will be
+  // truncated from the memory anyway.
+  const summary = cleanText(String(ev.summary ?? "").slice(0, MAX_SUMMARY_CHARS)) || "(no title)";
+  const location = cleanText(String(ev.location ?? "").slice(0, MAX_LOCATION_CHARS));
+  const description = stripConferencingBlock(
+    cleanText(String(ev.description ?? "").slice(0, MAX_DESCRIPTION_SCAN_CHARS)),
+  ).slice(0, MAX_DESCRIPTION_CHARS);
+  return { summary, location, description };
 }
 
 // Where a conferencing block starts.
@@ -124,16 +155,17 @@ function pushSingle(ev: any, startMs: number, endMs: number, out: Occurrence[]):
   const s = ev.startDate.toJSDate().getTime();
   const e = (ev.endDate ?? ev.startDate).toJSDate().getTime();
   if (e < startMs || s > endMs) return; // no overlap with the window
+  const fields = eventTextFields(ev);
   out.push({
     key: ev.uid,
     uid: ev.uid,
     isRecurring: false,
-    summary: cleanText(ev.summary) || "(no title)",
+    summary: fields.summary,
     start: s,
     end: e,
     allDay: ev.startDate.isDate === true,
-    location: cleanText(ev.location),
-    description: stripConferencingBlock(cleanText(ev.description)).slice(0, MAX_DESCRIPTION_CHARS),
+    location: fields.location,
+    description: fields.description,
     version: eventVersion(ev),
   });
 }
@@ -189,14 +221,64 @@ function seriesReachMs(ev: any, exceptions: any[]): number {
   return Math.max(reach, 0) + REACH_DST_SLACK_MS;
 }
 
-function expandRecurring(ev: any, startMs: number, endMs: number, out: Occurrence[], reachMs: number): void {
+function expandRecurring(
+  ev: any,
+  startMs: number,
+  endMs: number,
+  out: Occurrence[],
+  reachMs: number,
+  documentBudget: { remaining: number },
+): void {
   if (!ev.uid) return;
+  // ical.js has no seek operation: its iterator walks from DTSTART. Reject a
+  // series whose base-frequency cycles alone would consume the Free CPU budget
+  // merely reaching the requested window. This is a deliberate degradation for
+  // ancient high-frequency feeds, not an incomplete walk reported as success.
+  const rules = ev.component.getAllProperties("rrule")
+    .map((property: any) => property.getFirstValue?.())
+    .filter(Boolean);
+  for (const rule of rules) {
+    const frequency = String(rule.freq ?? "").toUpperCase();
+    if (frequency === "SECONDLY" || frequency === "MINUTELY" || frequency === "HOURLY") {
+      throw new CalendarComplexityError("Calendar recurrence frequency exceeds the Free-plan CPU budget");
+    }
+    const expansionFactor = Object.entries(rule.parts ?? {}).reduce((factor, [part, values]) => {
+      if (!Array.isArray(values)) return factor;
+      return factor * Math.max(1, values.length);
+    }, 1);
+    if (expansionFactor > MAX_RRULE_EXPANSION_FACTOR) {
+      throw new CalendarComplexityError("Calendar recurrence rule expansion exceeds the Free-plan CPU budget");
+    }
+  }
+  const cycleMs: Record<string, number> = {
+    SECONDLY: 1_000,
+    MINUTELY: 60_000,
+    HOURLY: 3_600_000,
+    DAILY: DAY_MS,
+    WEEKLY: 7 * DAY_MS,
+    MONTHLY: 28 * DAY_MS,
+    YEARLY: 365 * DAY_MS,
+  };
+  const elapsed = Math.max(0, startMs - reachMs - ev.startDate.toJSDate().getTime());
+  if (rules.some((rule: any) => {
+    const base = cycleMs[String(rule.freq ?? "").toUpperCase()];
+    const interval = Math.max(1, Number(rule.interval ?? 1));
+    return base !== undefined && elapsed / (base * interval) > MAX_RECURRENCE_CYCLES_BEFORE_WINDOW;
+  })) throw new CalendarComplexityError("Calendar recurrence is too old and frequent for the Free-plan CPU budget");
   const it = ev.iterator();
+  const textCache = new WeakMap<object, Pick<Occurrence, "summary" | "location" | "description">>();
   let next: any;
   let iter = 0;
   let emitted = 0;
-  while ((next = it.next())) {
-    if (++iter > MAX_ITER) break;
+  while (true) {
+    if (documentBudget.remaining-- <= 0) {
+      throw new CalendarComplexityError("Calendar recurrence document exceeds the Free-plan CPU budget");
+    }
+    next = it.next();
+    if (!next) break;
+    if (++iter > MAX_ITER) {
+      throw new CalendarComplexityError("Calendar recurrence expansion exceeds the Free-plan CPU budget");
+    }
     const occStartMs = next.toJSDate().getTime();
     if (occStartMs > endMs) break; // iterator is chronological — nothing further is in-window
     // Cheap rejection before the expensive one. ev.iterator() walks from DTSTART,
@@ -215,19 +297,29 @@ function expandRecurring(ev: any, startMs: number, endMs: number, out: Occurrenc
     const s = details.startDate.toJSDate().getTime();
     if (s > endMs) continue;
     const startISO = new Date(s).toISOString();
+    const textKey = details.item.component && typeof details.item.component === "object"
+      ? details.item.component
+      : details.item;
+    let fields = textCache.get(textKey);
+    if (!fields) {
+      fields = eventTextFields(details.item);
+      textCache.set(textKey, fields);
+    }
     out.push({
       key: `${ev.uid}::${startISO}`,
       uid: ev.uid,
       isRecurring: true,
-      summary: cleanText(details.item.summary) || "(no title)",
+      summary: fields.summary,
       start: s,
       end: e,
       allDay: details.startDate.isDate === true,
-      location: cleanText(details.item.location),
-      description: stripConferencingBlock(cleanText(details.item.description)).slice(0, MAX_DESCRIPTION_CHARS),
+      location: fields.location,
+      description: fields.description,
       version: `${eventVersion(details.item)}::${startISO}`,
     });
-    if (++emitted >= MAX_OCCURRENCES_PER_EVENT) break;
+    if (++emitted >= MAX_OCCURRENCES_PER_EVENT) {
+      throw new CalendarComplexityError("Calendar recurrence produces too many in-window occurrences");
+    }
   }
 }
 
@@ -349,6 +441,10 @@ function parseIcsDocument(icsText: string): any {
 // [windowStartMs, windowEndMs]. Registers embedded VTIMEZONEs so TZID-based
 // times resolve to the right absolute instants.
 export function parseAndExpand(icsText: string, windowStartMs: number, windowEndMs: number): Occurrence[] {
+  if (new TextEncoder().encode(icsText).byteLength > MAX_ICS_BYTES) {
+    throw new Error("Calendar response is too large");
+  }
+  assertIcsComplexity(icsText);
   const root = parseIcsDocument(icsText);
 
   for (const vtz of root.getAllSubcomponents("vtimezone")) {
@@ -375,12 +471,23 @@ export function parseAndExpand(icsText: string, windowStartMs: number, windowEnd
   }
 
   const out: Occurrence[] = [];
+  const recurrenceBudget = { remaining: MAX_DOCUMENT_RECURRENCE_ITERATIONS };
   for (const g of groups.values()) {
+    if (out.length >= MAX_TOTAL_OCCURRENCES) {
+      throw new CalendarComplexityError("Calendar expansion produces too many occurrences");
+    }
     try {
       if (g.master) {
         const ev = new ICAL.Event(g.master, { exceptions: g.exceptions });
         if (ev.isRecurring()) {
-          expandRecurring(ev, windowStartMs, windowEndMs, out, seriesReachMs(ev, g.exceptions));
+          expandRecurring(
+            ev,
+            windowStartMs,
+            windowEndMs,
+            out,
+            seriesReachMs(ev, g.exceptions),
+            recurrenceBudget,
+          );
         } else pushSingle(ev, windowStartMs, windowEndMs, out);
       } else {
         // No master in the feed (e.g. Google exports only the modified instances
@@ -391,6 +498,7 @@ export function parseAndExpand(icsText: string, windowStartMs: number, windowEnd
         }
       }
     } catch (e) {
+      if (e instanceof CalendarComplexityError) throw e;
       console.error(`Calendar: skipped a malformed event group (non-fatal):`, e);
     }
   }
@@ -489,6 +597,44 @@ const ICS_FETCH_HEADERS = {
   Accept: "text/calendar, text/plain, */*",
   "User-Agent": "CalendarAgent/1.0 SecondBrain/2",
 };
+export const MAX_ICS_BYTES = 32 * 1024;
+export const MAX_ICS_EVENTS = 24;
+
+function assertIcsComplexity(text: string): void {
+  let events = 0;
+  const marker = /BEGIN:VEVENT/gi;
+  while (marker.exec(text) !== null) {
+    if (++events > MAX_ICS_EVENTS) throw new CalendarComplexityError("Calendar contains too many events");
+  }
+  // Reject adversarial folded RRULEs before ical.js parses large BY* arrays.
+  // BYSETPOS is included: even though it filters rather than expands output,
+  // ical.js still iterates the attacker-controlled list while constructing a step.
+  const unfolded = text.replace(/\r?\n[ \t]/g, "");
+  for (const line of unfolded.split(/\r?\n/)) {
+    if (!/^RRULE[;:]/i.test(line)) continue;
+    if (line.length > MAX_RRULE_LINE_CHARS) {
+      throw new CalendarComplexityError("Calendar recurrence rule exceeds the Free-plan CPU budget");
+    }
+    for (const part of line.slice(line.indexOf(":") + 1).split(";")) {
+      const [name, values = ""] = part.split("=", 2);
+      if (/^BY/i.test(name) && values.split(",").length > MAX_RRULE_PART_VALUES) {
+        throw new CalendarComplexityError("Calendar recurrence rule exceeds the Free-plan CPU budget");
+      }
+    }
+  }
+}
+
+async function readIcsBody(res: Response): Promise<string> {
+  let text: string;
+  try {
+    text = await readBoundedResponseText(res, MAX_ICS_BYTES);
+  } catch (error) {
+    if (error instanceof BodyTooLargeError) throw new Error("Calendar response is too large");
+    throw error;
+  }
+  assertIcsComplexity(text);
+  return text;
+}
 
 function normalizeUrl(raw: string): string {
   const swapped = raw.trim().replace(/^webcal:\/\//i, "https://");
@@ -516,7 +662,7 @@ async function getIcsOnce(url: string): Promise<{ ok: boolean; status: number; b
     redirect: "follow",
     headers: ICS_FETCH_HEADERS,
   });
-  const body = stripBom(await res.text());
+  const body = stripBom(await readIcsBody(res));
   return { ok: res.ok, status: res.status, body };
 }
 
@@ -651,13 +797,18 @@ async function runCalendarSync(env: IntegrationEnv, store: MirrorStore, provider
     toDelete.add(key);
   }
 
+  // Create/update and delete share one Free-plan D1 mutation budget. If a
+  // changed occurrence consumed it, deletion resumes on the next caller loop.
+  const deleteBatch = batch.length === 0 ? [...toDelete].slice(0, 1) : [];
   let deleted = 0;
-  for (const key of toDelete) {
+  let processedDeletes = 0;
+  for (const key of deleteBatch) {
     const mapped = delta.get(key);
     try {
       if (mapped) await store.deleteEntry(mapped.entryId);
       delta.delete(key);
       delete meta[key];
+      processedDeletes++;
       if (mapped) deleted++;
     } catch (e) {
       console.error(`Calendar mirror delete failed for ${key} (non-fatal):`, e);
@@ -680,7 +831,7 @@ async function runCalendarSync(env: IntegrationEnv, store: MirrorStore, provider
     updated,
     deleted,
     failed,
-    remaining: creatable.length - batch.length,
+    remaining: (creatable.length - created - updated) + (toDelete.size - processedDeletes),
     total: occurrences.length,
   };
 }

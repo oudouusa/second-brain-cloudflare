@@ -178,4 +178,3 @@ describe("secret redaction, second line of defense", () => {
     expect(claudeEnd.redactSecrets(text, "local-test-token")).toBe(core.redactSecrets(text, "local-test-token"));
   });
 });
-

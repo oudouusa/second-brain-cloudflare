@@ -14,12 +14,18 @@ export default defineConfig({
     // per worktree — the counts multiply, and in-progress work in a sibling branch
     // reports as a failure of the branch you are actually on. Excluded rather than
     // relocated because the ignore rule already establishes the location.
-    exclude: [...configDefaults.exclude, ".worktrees/**"],
+    exclude: [...configDefaults.exclude, ".worktrees/**", "experiments/**"],
     coverage: {
       provider: "v8",
       include: ["src/**/*.ts", "public/utils.js"],
       reporter: ["text", "html", "json-summary", "json"],
       reportsDirectory: "coverage",
+      thresholds: {
+        statements: 86,
+        branches: 78,
+        functions: 88,
+        lines: 87,
+      },
     },
   },
 });

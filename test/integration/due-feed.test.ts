@@ -294,18 +294,21 @@ describe("GET /due — timezone-anchored overdue boundary", () => {
 
   it("is NOT overdue just before midnight in the configured zone, and IS overdue just after", async () => {
     sq = await migrated();
-    const parsed = parseExplicitWhen("2026-09-23", undefined, undefined, "America/New_York");
+    // SQLite's admission fence uses its real clock, so choose a future year
+    // before replacing Date.now in the Worker under test.
+    const year = new Date().getUTCFullYear() + 1;
+    const parsed = parseExplicitWhen(`${year}-09-23`, undefined, undefined, "America/New_York");
     expect(parsed.error).toBeUndefined();
     seedWhen(sq, "e1", "File the report", parsed.value!.at);
 
     // 2026-09-23T01:00Z is 2026-09-22T21:00 Eastern (EDT, UTC-4) — 9pm the
     // evening before, not yet due.
-    vi.spyOn(Date, "now").mockReturnValue(Date.UTC(2026, 8, 23, 1, 0));
+    vi.spyOn(Date, "now").mockReturnValue(Date.UTC(year, 8, 23, 1, 0));
     const notYet = await (await worker.fetch(req("GET", "/due"), envOf(sq), ctx)).json() as any;
     expect(notYet.overdue.map((r: any) => r.id)).not.toContain("e1");
 
     // 2026-09-23T05:01Z is 2026-09-23T01:01 Eastern — just past local midnight.
-    vi.spyOn(Date, "now").mockReturnValue(Date.UTC(2026, 8, 23, 5, 1));
+    vi.spyOn(Date, "now").mockReturnValue(Date.UTC(year, 8, 23, 5, 1));
     const overdue = await (await worker.fetch(req("GET", "/due"), envOf(sq), ctx)).json() as any;
     expect(overdue.overdue.map((r: any) => r.id)).toContain("e1");
   });

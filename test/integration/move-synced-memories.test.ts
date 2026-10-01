@@ -69,11 +69,12 @@ function makeGatedVectorizeMock() {
 
 async function makeEnv(vectorize: ReturnType<typeof makeVectorizeMock>) {
   const d1 = makeSqliteD1();
-  const env = { ...makeTestEnv(d1.db as unknown as D1Mock, { VECTORIZE: vectorize, OAUTH_KV: makeMemoryKV() }), AUTH_TOKEN: "test-token" } as Env;
+  let env = { ...makeTestEnv(d1.db as unknown as D1Mock, { VECTORIZE: vectorize, OAUTH_KV: makeMemoryKV() }), AUTH_TOKEN: "test-token" } as Env;
   resetDatabaseInit();
   await initializeDatabase(env);
+  env = d1.admitEnv(env);
   const roots = await ensureTenantBootstrap(env);
-  return { env, roots };
+  return { env: d1.admitEnv(env), roots };
 }
 
 /** Mirrors N entries into the owner's personal workspace, as a real sync would. */
@@ -285,9 +286,9 @@ describe("#347 move already-synced integration memories", () => {
     const first = await worker.fetch(moveRequest(), env, makeCtx().ctx);
     expect(first.status).toBe(200);
     const firstData = await first.json() as any;
-    // Batch size 10 (locked decision 5) against 25 items.
-    expect(firstData.moved).toBe(10);
-    expect(firstData.remaining).toBe(15);
+    // フォークは排他制御を含め4件ずつ進める。
+    expect(firstData.moved).toBe(4);
+    expect(firstData.remaining).toBe(21);
     expect(firstData.cursor).toBeTruthy();
 
     let cursor = firstData.cursor as string;
@@ -304,7 +305,7 @@ describe("#347 move already-synced integration memories", () => {
     }
 
     expect(totalMoved).toBe(25);
-    expect(calls).toBe(3); // 10 + 10 + 5
+    expect(calls).toBe(7); // 4件ずつ25件を移動
 
     for (const id of ids) {
       const row = await env.DB.prepare(`SELECT workspace_id FROM entries WHERE id = ?`).bind(id).first<{ workspace_id: string }>();
@@ -380,7 +381,7 @@ describe("#347 move already-synced integration memories", () => {
     await initializeDatabase(env);
     const roots = await ensureTenantBootstrap(env);
     const helper = makeCtx();
-    const ids = await seedMirrored(env, roots, helper, 3);
+    const ids = await seedMirrored(d1.admitEnv(env), roots, helper, 3);
 
     // One entry's own SELECT throws (errored); one re-stamp upsert rejects
     // (vectorFailures). Armed after seeding so capture's own upserts succeed.
@@ -432,9 +433,10 @@ describe("#347 move already-synced integration memories", () => {
     const d1 = makeSqliteD1();
     const { vectorize } = makeStatefulVectorizeMock();
     const kv = makeMemoryKV();
-    const env = { ...makeTestEnv(d1.db as unknown as D1Mock, { VECTORIZE: vectorize, OAUTH_KV: kv }), AUTH_TOKEN: "test-token" } as Env;
+    let env = { ...makeTestEnv(d1.db as unknown as D1Mock, { VECTORIZE: vectorize, OAUTH_KV: kv }), AUTH_TOKEN: "test-token" } as Env;
     resetDatabaseInit();
     await initializeDatabase(env);
+  env = d1.admitEnv(env);
     const roots = await ensureTenantBootstrap(env);
     const helper = makeCtx();
     const ids = await seedMirrored(env, roots, helper, 3);
@@ -465,9 +467,10 @@ describe("#347 move already-synced integration memories", () => {
     const d1 = makeSqliteD1();
     const { vectorize } = makeStatefulVectorizeMock();
     const kv = makeMemoryKV();
-    const env = { ...makeTestEnv(d1.db as unknown as D1Mock, { VECTORIZE: vectorize, OAUTH_KV: kv }), AUTH_TOKEN: "test-token" } as Env;
+    let env = { ...makeTestEnv(d1.db as unknown as D1Mock, { VECTORIZE: vectorize, OAUTH_KV: kv }), AUTH_TOKEN: "test-token" } as Env;
     resetDatabaseInit();
     await initializeDatabase(env);
+  env = d1.admitEnv(env);
     const roots = await ensureTenantBootstrap(env);
     const helper = makeCtx();
     const ids = await seedMirrored(env, roots, helper, 2);
@@ -529,14 +532,14 @@ describe("#347 move already-synced integration memories", () => {
     const { vectorize } = makeStatefulVectorizeMock();
     const { env, roots } = await makeEnv(vectorize);
     const helper = makeCtx();
-    const ids = await seedMirrored(env, roots, helper, 12); // more than one batch (10)
+    const ids = await seedMirrored(env, roots, helper, 7); // 5件の移動ページを超える
     await connectNotion(env, itemMapFor(ids), "company");
 
     const first = await worker.fetch(moveRequest(), env, makeCtx().ctx);
     expect(first.status).toBe(200);
     const firstData = await first.json() as any;
-    expect(firstData.moved).toBe(10);
-    expect(firstData.remaining).toBe(2);
+    expect(firstData.moved).toBe(4);
+    expect(firstData.remaining).toBe(3);
     const cursor = firstData.cursor as string;
     expect(cursor).toBeTruthy();
 
@@ -553,7 +556,7 @@ describe("#347 move already-synced integration memories", () => {
     // Today's bug: keys.indexOf(cursor) === -1 restarts at 0, re-processing
     // the 9 already-moved entries (as spurious alreadyThere) instead of
     // continuing with the 2 that were never touched.
-    expect(secondData.moved).toBe(2);
+    expect(secondData.moved).toBe(3);
     expect(secondData.alreadyThere).toBe(0);
     expect(secondData.remaining).toBe(0);
     expect(secondData.cursor).toBeNull();
@@ -574,7 +577,7 @@ describe("#347 move already-synced integration memories", () => {
     const first = await worker.fetch(moveRequestWithBody({ expectedTarget: "company" }), env, makeCtx().ctx);
     expect(first.status).toBe(200);
     const firstData = await first.json() as any;
-    expect(firstData.moved).toBe(10);
+    expect(firstData.moved).toBe(4);
     const cursor = firstData.cursor as string;
 
     // The layer changes mid-drain (#346's own route, or a direct KV edit —
@@ -592,6 +595,6 @@ describe("#347 move already-synced integration memories", () => {
     // The two remaining entries must be untouched — not moved into personal.
     const { results } = await env.DB.prepare(`SELECT id, workspace_id FROM entries WHERE source = 'notion'`).all<{ id: string; workspace_id: string }>();
     const untouched = results.filter((r) => r.workspace_id === roots.ownerPersonalWorkspaceId);
-    expect(untouched.length).toBe(2);
+    expect(untouched.length).toBe(8);
   });
 });

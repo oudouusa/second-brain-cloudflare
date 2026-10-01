@@ -24,7 +24,7 @@ function makeTrackingAI(calls: string[]): Ai {
   return {
     run: vi.fn().mockImplementation(async (model: string) => {
       calls.push(model);
-      if (model === "@cf/baai/bge-small-en-v1.5") return { data: [new Array(384).fill(0.1)] };
+      if (model === "@cf/google/embeddinggemma-300m") return { data: [new Array(768).fill(0.1)] };
       return new ReadableStream({
         start(c) {
           c.enqueue(new TextEncoder().encode(`data: {"response":"an insight about the memories"}\n\n`));
@@ -57,14 +57,14 @@ describe("GET /recall synthesize opt-out", () => {
   });
 
   it("by default still calls the synthesis model and returns an insight (unchanged)", async () => {
-    const res = await worker.fetch(req("GET", "/recall?query=the+topic"), env, ctx);
+    const res = await worker.fetch(req("POST", "/recall?query=the+topic"), env, ctx);
     const data = await res.json() as any;
     expect(calls).toContain(LLM_MODEL);
     expect(data.insight).toBeTruthy();
   });
 
   it("synthesize=false makes no synthesis model call", async () => {
-    const res = await worker.fetch(req("GET", "/recall?query=the+topic&synthesize=false"), env, ctx);
+    const res = await worker.fetch(req("POST", "/recall", { body: { query: "the topic", synthesize: false } }), env, ctx);
     const data = await res.json() as any;
     expect(calls).not.toContain(LLM_MODEL);
     expect(data.insight).toBeFalsy();
@@ -72,17 +72,17 @@ describe("GET /recall synthesize opt-out", () => {
     expect(data.results).toHaveLength(2);
   });
 
-  it("synthesize=0 makes no synthesis model call", async () => {
-    const res = await worker.fetch(req("GET", "/recall?query=the+topic&synthesize=0"), env, ctx);
+  it("explicit false keeps synthesis disabled", async () => {
+    const res = await worker.fetch(req("POST", "/recall", { body: { query: "the topic", synthesize: false } }), env, ctx);
     const data = await res.json() as any;
     expect(calls).not.toContain(LLM_MODEL);
     expect(data.insight).toBeFalsy();
   });
 
-  it("a truthy-looking but unrecognized value keeps the default (synthesizes)", async () => {
-    const res = await worker.fetch(req("GET", "/recall?query=the+topic&synthesize=nope"), env, ctx);
+  it("a string synthesize value is rejected", async () => {
+    const res = await worker.fetch(req("POST", "/recall", { body: { query: "the topic", synthesize: "nope" } }), env, ctx);
     const data = await res.json() as any;
-    expect(calls).toContain(LLM_MODEL);
-    expect(data.insight).toBeTruthy();
+    expect(res.status).toBe(400);
+    expect(calls).not.toContain(LLM_MODEL);
   });
 });

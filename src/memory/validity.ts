@@ -1,3 +1,4 @@
+import { assertMemoryWritesAllowed, memoryWriteMarker } from "../migration/write-lock";
 /**
  * Validity windows (Track 2, T-0089.2.1; spec 14-t2-time-spec.md 5.3 and 5.4).
  *
@@ -47,7 +48,7 @@ export function currentValidityAt(alias: string, nowSql: string): string {
  * (STALE_REVIEW_SQL). julianday works on every SQLite D1 runs; request paths that have a clock of
  * their own bind it through currentValiditySql instead, so a frozen test or eval clock still applies.
  */
-export const SQL_NOW_MS = `CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)`;
+export { SQL_NOW_MS } from "../constants";
 
 /** Current at `now`, bound through Params. */
 export function currentValiditySql(p: Params, alias: string, now: number): string {
@@ -166,17 +167,17 @@ export function supersedeStatements(
   const up = new Params();
   // versioning: snapshot
   // scope-exempt: by-id: the conflict row read pinned to the writer's workspace; the CAS re-pins it
-  const updateSql = `UPDATE entries AS e SET valid_until = ${up.add(at)} WHERE e.id = ${up.add(target.id)} AND ${cas(up)}`;
+  const updateSql = `UPDATE entries AS e SET write_marker = ${up.add(memoryWriteMarker(env))}, valid_until = ${up.add(at)} WHERE e.id = ${up.add(target.id)} AND ${cas(up)}`;
 
   const ep = new Params();
   const edgeValues = [crypto.randomUUID(), closer.id, target.id, "supersedes", 1.0, "system", "{}", Date.now(), Date.now(), target.workspaceId].map(v => ep.add(v));
   const sameWorkspace = JSON.stringify([target.workspaceId]);
   const edgeSql =
     // scope-exempt: by-id: both endpoints pinned to the closed row's workspace; lands only if the window closed
-    `INSERT INTO edges (id, source_id, target_id, type, weight, provenance, metadata, created_at, updated_at, workspace_id)
-     SELECT ${edgeValues.join(", ")}
+    `INSERT INTO edges (id, source_id, target_id, type, weight, provenance, metadata, created_at, updated_at, workspace_id, write_marker)
+     SELECT ${edgeValues.join(", ")}, ${ep.add(memoryWriteMarker(env))}
       WHERE ${edgeEndpointsReadableSql(ep.add(closer.id), ep.add(target.id), ep.add(sameWorkspace))} AND ${windowClosedSql(ep, target.id, at)}
-     ON CONFLICT(source_id, target_id, type) DO UPDATE SET weight = max(weight, excluded.weight), updated_at = excluded.updated_at`;
+     ON CONFLICT(source_id, target_id, type) DO UPDATE SET weight = max(weight, excluded.weight), updated_at = excluded.updated_at, write_marker = excluded.write_marker`;
 
   return [
     snapshotStatement(env, {
@@ -297,6 +298,7 @@ export function retractionHook(
          AND (${landed(p)})
        ORDER BY x.id LIMIT 1)`;
   const snapshot = buildDerivedSnapshot({
+    writeMarker: memoryWriteMarker(env),
     reason: "validity", change, now,
     meta: p => { const pairs = p.add(pairsJson); return `json_object('cause', 'retraction', 'retracted', ${closer(p, pairs)}, 'nonce', ${p.add(nonce)})`; },
     where: p => { const pairs = p.add(pairsJson); return `WHERE e.id IN ${closedBy(p, pairs)} AND ${closer(p, pairs)} IS NOT NULL`; },
@@ -306,7 +308,7 @@ export function retractionHook(
   const up = new Params();
   // versioning: snapshot
   // scope-checked: only rows whose newest version is this hook's own (nonce), found through the authorized pairs
-  const updateSql = `UPDATE entries AS e SET valid_until = (SELECT x.valid_until FROM entries x WHERE x.id = json_extract(${NEWEST_META("e")}, '$.retracted'))
+  const updateSql = `UPDATE entries AS e SET write_marker = ${up.add(memoryWriteMarker(env))}, valid_until = (SELECT x.valid_until FROM entries x WHERE x.id = json_extract(${NEWEST_META("e")}, '$.retracted'))
      WHERE ${mine(up, "e")}
      RETURNING id, substr(content, 1, 60) AS preview, json_extract(${NEWEST_META("entries")}, '$.retracted') AS by_id, valid_until AS until_ms`;
 
@@ -323,8 +325,8 @@ export function retractionHook(
                      ORDER BY z2.id LIMIT 1)`;
   const edgeSql =
     // scope-exempt: by-id: see inheritFrom; both endpoints re-checked readable in y's workspace
-    `INSERT INTO edges (id, source_id, target_id, type, weight, provenance, metadata, created_at, updated_at, workspace_id)
-     SELECT lower(hex(randomblob(16))), z.id, y.id, 'supersedes', 1.0, 'system', '{}', ${at}, ${at}, y.workspace_id
+    `INSERT INTO edges (id, source_id, target_id, type, weight, provenance, metadata, created_at, updated_at, workspace_id, write_marker)
+     SELECT lower(hex(randomblob(16))), z.id, y.id, 'supersedes', 1.0, 'system', '{}', ${at}, ${at}, y.workspace_id, ${ep.add(memoryWriteMarker(env))}
        ${inheritFrom} AND ${edgeEndpointsReadableSql("z.id", "y.id", "json_array(y.workspace_id)")}
      ON CONFLICT(source_id, target_id, type) DO NOTHING`;
 
@@ -350,6 +352,7 @@ export function retractionHook(
 function flagStatements(env: Env, pairsJson: string, landed: LandedGuard, change: ChangeContext, cfg: Readonly<Config>, now: number): D1PreparedStatement[] {
   const nonce = crypto.randomUUID();
   const snapshot = buildDerivedSnapshot({
+    writeMarker: memoryWriteMarker(env),
     reason: "status", change, now,
     meta: p => {
       const pairs = p.add(pairsJson);
@@ -375,7 +378,7 @@ function flagStatements(env: Env, pairsJson: string, landed: LandedGuard, change
                       UNION ALL SELECT 'status:draft' UNION ALL SELECT '${RETRACTED_SOURCE_TAG}'))`;
   // versioning: snapshot
   // scope-checked: only rows whose newest version is this cascade's own (nonce), found through the authorized pairs
-  const updateSql = `UPDATE entries AS e SET tags = CASE
+  const updateSql = `UPDATE entries AS e SET write_marker = ${up.add(memoryWriteMarker(env))}, tags = CASE
          WHEN json_extract(${NEWEST_META("e")}, '$.demoted') = 1 THEN ${drafted}
          WHEN e.tags LIKE '%"${RETRACTED_SOURCE_TAG}"%' THEN e.tags
          ELSE ${flagged} END
@@ -411,6 +414,7 @@ export function unretractionHook(
          AND (${landed(p)})
        ORDER BY x.id LIMIT 1)`;
   const snapshot = buildDerivedSnapshot({
+    writeMarker: memoryWriteMarker(env),
     reason: "validity", change, now,
     meta: p => { const pairs = p.add(pairsJson); return `json_object('cause', 'unretraction', 'by', ${retractedBy(p, pairs)}, 'nonce', ${p.add(nonce)})`; },
     where: p => { const pairs = p.add(pairsJson); return `WHERE e.id IN ${closedBy(p, pairs)} AND ${retractedBy(p, pairs)} IS NOT NULL`; },
@@ -418,7 +422,7 @@ export function unretractionHook(
   const up = new Params();
   // versioning: snapshot
   // scope-checked: only rows whose newest version is this hook's own (nonce), found through the authorized pairs
-  const updateSql = `UPDATE entries AS e SET valid_until = (SELECT COALESCE(x.valid_from, x.created_at) FROM entries x WHERE x.id = json_extract(${NEWEST_META("e")}, '$.by'))
+  const updateSql = `UPDATE entries AS e SET write_marker = ${up.add(memoryWriteMarker(env))}, valid_until = (SELECT COALESCE(x.valid_from, x.created_at) FROM entries x WHERE x.id = json_extract(${NEWEST_META("e")}, '$.by'))
      WHERE e.id IN ${closedBy(up, up.add(pairsJson))} AND json_extract(${NEWEST_META("e")}, '$.nonce') = ${up.add(nonce)}
      RETURNING id, substr(content, 1, 60) AS preview, json_extract(${NEWEST_META("entries")}, '$.by') AS by_id, valid_until AS until_ms`;
   const unflag = opts.cascade ? unflagStatements(env, pairsJson, landed, change, cfg, now) : null;
@@ -442,6 +446,7 @@ export function unretractionHook(
 function unflagStatements(env: Env, pairsJson: string, landed: LandedGuard, change: ChangeContext, cfg: Readonly<Config>, now: number): D1PreparedStatement[] {
   const nonce = crypto.randomUUID();
   const snapshot = buildDerivedSnapshot({
+    writeMarker: memoryWriteMarker(env),
     reason: "status", change, now,
     meta: p => { const pairs = p.add(pairsJson); return `json_object('cause', 'unretraction', 'by', ${builtOn(p, pairs, "e", landed)}, 'nonce', ${p.add(nonce)})`; },
     where: p => {
@@ -462,7 +467,7 @@ function unflagStatements(env: Env, pairsJson: string, landed: LandedGuard, chan
   const restoreStatus = `(e.tags LIKE '%"status:draft"%' AND COALESCE(${priorStatus}, '') <> 'status:draft')`;
   // versioning: snapshot
   // scope-checked: only rows whose newest version is this unflag's own (nonce), found through the authorized pairs
-  const updateSql = `UPDATE entries AS e SET tags = (SELECT json_group_array(value) FROM (
+  const updateSql = `UPDATE entries AS e SET write_marker = ${up.add(memoryWriteMarker(env))}, tags = (SELECT json_group_array(value) FROM (
          SELECT value FROM json_each(e.tags) WHERE value <> '${RETRACTED_SOURCE_TAG}' AND NOT (${restoreStatus} AND value LIKE 'status:%')
          UNION ALL SELECT ${priorStatus} WHERE ${restoreStatus} AND ${priorStatus} IS NOT NULL))
      WHERE e.id IN ${dependentsOf(pairs)} AND json_extract(${NEWEST_META("e")}, '$.nonce') = ${up.add(nonce)}
@@ -478,6 +483,7 @@ function unflagStatements(env: Env, pairsJson: string, landed: LandedGuard, chan
 function hookPrune(env: Env, candidates: (p: Params, pairs: string) => string, pairsJson: string, nonce: string, cfg: Readonly<Config>): D1PreparedStatement {
   const p = new Params();
   // scope-exempt: by-id: rows this hook's own versions name (nonce), found through the caller's authorized pairs
+    // write-fence: parent-capability=entry_versions（同batchのsnapshot・認可済み記憶をtriggerで検証）
   const sql = `DELETE FROM entry_versions WHERE entry_id IN (
        SELECT v.entry_id FROM entry_versions v WHERE v.entry_id IN ${candidates(p, p.add(pairsJson))} AND json_extract(v.meta, '$.nonce') = ${p.add(nonce)})
      AND seq <= (SELECT MAX(w.seq) FROM entry_versions w WHERE w.entry_id = entry_versions.entry_id) - ${p.add(cfg.VERSION_KEEP)}`;
@@ -622,7 +628,7 @@ export async function updateEntryValidity(
   const up = new Params();
   // versioning: snapshot
   // scope-exempt: by-id: the row the caller's scoped read authorized; the CAS re-pins its workspace
-  const updateSql = `UPDATE entries AS e SET valid_from = ${up.add(validFrom)}, valid_until = ${up.add(validUntil)} WHERE e.id = ${up.add(id)} AND ${cas(up)}`;
+  const updateSql = `UPDATE entries AS e SET write_marker = ${up.add(memoryWriteMarker(env))}, valid_from = ${up.add(validFrom)}, valid_until = ${up.add(validUntil)} WHERE e.id = ${up.add(id)} AND ${cas(up)}`;
   const statements: D1PreparedStatement[] = [
     snapshotStatement(env, {
       entryId: id, reason: "validity", change, content: { kind: "unchanged" }, nextTags: "unchanged",
@@ -640,7 +646,7 @@ export async function updateEntryValidity(
     const pp = new Params();
     // versioning: snapshot
     // scope-exempt: by-id: a row this one replaced, read above in the same workspace; the guard re-pins it
-    const sql = `UPDATE entries AS e SET valid_until = ${pp.add(effectiveFrom)} WHERE e.id = ${pp.add(r.id)} AND ${guard(pp)}`;
+    const sql = `UPDATE entries AS e SET write_marker = ${pp.add(memoryWriteMarker(env))}, valid_until = ${pp.add(effectiveFrom)} WHERE e.id = ${pp.add(r.id)} AND ${guard(pp)}`;
     statements.push(
       snapshotStatement(env, {
         entryId: r.id, reason: "validity", change, content: { kind: "unchanged" }, nextTags: "unchanged",

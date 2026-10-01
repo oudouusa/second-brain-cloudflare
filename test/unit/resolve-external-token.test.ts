@@ -29,7 +29,7 @@ describe("resolveExternalToken", () => {
   it("resolves a member's own token with via: token", async () => {
     resetDatabaseInit();
     sqlite = makeSqliteD1();
-    const env: Env = makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV() });
+    const env: Env = sqlite.admitEnv(makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV() }));
     await initializeDatabase(env);
     await ensureTenantBootstrap(env);
     const bob = await createMember(env, { name: "Bob" });

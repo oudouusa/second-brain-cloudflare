@@ -18,7 +18,7 @@ const change = { actorId: "u1", channel: "rest" as const };
 beforeEach(async () => {
   resetDatabaseInit();
   d1 = makeSqliteD1();
-  env = makeTestEnv(undefined, { DB: d1.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV() });
+  env = d1.admitEnv(makeTestEnv(undefined, { DB: d1.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV() }));
   await initializeDatabase(env);
 });
 afterEach(() => d1.close());

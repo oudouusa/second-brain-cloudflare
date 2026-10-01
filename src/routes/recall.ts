@@ -1,21 +1,69 @@
+import { readProjectParam } from "./project-param";
+import { chatGptEnvForWorkspaces, isChatGptOperationEnabled, runChatGptGenerationAnswerStream } from "../lib/chatgpt";
 import type { Env } from "../env";
 import { resolveConfig } from "../config";
 import { RECALL_MAX_TOP_K, LLM_MODEL, SEMANTIC_UNAVAILABLE_DETAIL } from "../constants";
+import { CORS_HEADERS, intParam, json, readJsonBody, readTeamQueryParam, readWorkspaceParam } from "../lib/http";
 import { buildEntryFilterQuery } from "../capture/entry";
 import { compressTag } from "../compression/digest";
-import { CORS_HEADERS, intParam, json, readWorkspaceParam, readTeamQueryParam } from "../lib/http";
 import { requireIdentity, type Identity } from "../lib/identity";
 import { assertCanMutateEntry } from "../lib/entry-access";
-import { layerOf, scopeWhereForRead, readScopeWorkspaces } from "../lib/scope";
+import { layerOf, readScopeWorkspaces, readTeamParam, scopeWhereForRead } from "../lib/scope";
 import { lookupActorLabels, resolveActorFilter, resolveActorLabel } from "../lib/actors";
 import { KIND_VALUES, type MemoryKind } from "../memory/kind";
 import { recallEntries } from "../recall/search";
 import type { StandingFire } from "../recall/types";
-import { readProjectParam } from "./project-param";
 import { allowanceFor, snippetOf } from "../recall/snippet";
 import { editedCanonicalAt } from "../quarantine/tags";
 import { parseSupersededBy, validitySummary } from "../recall/validity-view";
 import { parseValidityDate } from "../memory/validity";
+import { recallSnippet } from "../recall/render";
+import { workersAiQuotaRetryMessage } from "../lib/ai";
+import type { RecallSearchResult } from "../recall/types";
+
+type RecallRequestBody = {
+  project?: unknown;
+  explain?: unknown;
+  as_of?: unknown;
+  query?: unknown;
+  topK?: unknown;
+  tag?: unknown;
+  after?: unknown;
+  before?: unknown;
+  kind?: unknown;
+  hops?: unknown;
+  full?: unknown;
+  synthesize?: unknown;
+  workspace?: unknown;
+  team?: unknown;
+};
+
+function semanticUnavailableMessage(
+  reason: RecallSearchResult["semanticUnavailableReason"],
+  retryAt?: number,
+): string {
+  if (reason === "workers_ai_quota_exhausted" && retryAt) {
+    return `Semantic search is temporarily unavailable; keyword matches are still returned. ${workersAiQuotaRetryMessage(retryAt)}`;
+  }
+  if (reason === "embedding_unavailable") {
+    return "Semantic search is temporarily unavailable because query embedding failed; keyword matches are still returned. Please retry later.";
+  }
+  return `Semantic search was unavailable or incomplete for this query, so only keyword and tag matches were considered. ${SEMANTIC_UNAVAILABLE_DETAIL}`;
+}
+
+function bodyInteger(
+  body: RecallRequestBody,
+  name: keyof RecallRequestBody,
+  opts: { fallback?: number; min?: number; max?: number } = {},
+): number | undefined | Response {
+  const raw = body[name];
+  if (raw === undefined) return opts.fallback;
+  if (typeof raw !== "number" || !Number.isSafeInteger(raw)) {
+    return json({ ok: false, error: `${name} must be an integer` }, 400);
+  }
+  const floored = opts.min === undefined ? raw : Math.max(opts.min, raw);
+  return opts.max === undefined ? floored : Math.min(opts.max, floored);
+}
 
 /**
  * Add the caller's workspace predicate before ORDER BY and LIMIT.
@@ -61,42 +109,93 @@ export async function handleRecallRoutes(
   env: Env,
   ctx: ExecutionContext,
 ): Promise<Response | null> {
-  // GET /list
-  if (url.pathname === "/list" && request.method === "GET") {
+  // GET /list permits only numeric pagination. A private tag belongs in POST JSON.
+  if (url.pathname === "/list" && (request.method === "GET" || request.method === "POST")) {
     const auth = await requireIdentity(request, env);
     if (auth instanceof Response) return auth;
     const identity = auth;
-    // Floor of 0 as well as the cap: SQLite reads a negative LIMIT as no limit
-    // at all, so `?n=-1` used to return the whole entries table.
-    const n = intParam(url, "n", { fallback: 20, min: 0, max: 100 });
-    if (n instanceof Response) return n;
-    const tag = url.searchParams.get("tag")?.trim() || undefined;
-    const after = intParam(url, "after");
-    if (after instanceof Response) return after;
-    const before = intParam(url, "before");
-    if (before instanceof Response) return before;
-    const workspace = readWorkspaceParam(url);
-    if (workspace instanceof Response) return workspace;
-    const team = readTeamQueryParam(url, identity, workspace);
-    if (team instanceof Response) return team;
-    // Who wrote it, as a filter. Resolved here rather than in the builder
-    // because resolution needs the caller's identity: the value that reaches
-    // SQL is always a user id from the caller's own roster, so `?actor=` can
-    // narrow the scoped listing and can never reach outside it.
-    const actorParam = url.searchParams.get("actor")?.trim();
+    let n: number;
+    let tag: string | undefined;
+    let after: number | undefined;
+    let before: number | undefined;
+    let workspace: "personal" | "company" | undefined;
+    let team: string | undefined;
+    let projectValue: unknown = url.searchParams.get("project");
+    let actorParam: string | undefined;
+    if (request.method === "POST") {
+      const parsed = await readJsonBody<{
+        n?: unknown;
+        tag?: unknown;
+        after?: unknown;
+        before?: unknown;
+        workspace?: unknown;
+        team?: unknown;
+        actor?: unknown;
+        project?: unknown;
+      }>(request, 8 * 1024);
+      if (!parsed.ok) return parsed.response;
+      const values = parsed.value;
+      projectValue = values.project;
+      for (const name of ["n", "after", "before"] as const) {
+        if (values[name] !== undefined
+          && (typeof values[name] !== "number" || !Number.isSafeInteger(values[name]))) {
+          return json({ ok: false, error: `${name} must be an integer` }, 400);
+        }
+      }
+      n = Math.min(100, Math.max(0, typeof values.n === "number" ? values.n : 20));
+      tag = typeof values.tag === "string" ? values.tag.trim() || undefined : undefined;
+      after = typeof values.after === "number" ? values.after : undefined;
+      before = typeof values.before === "number" ? values.before : undefined;
+      if (values.workspace !== undefined
+        && values.workspace !== "personal"
+        && values.workspace !== "company") {
+        return json({ ok: false, error: 'workspace must be "personal" or "company"' }, 400);
+      }
+      workspace = values.workspace as "personal" | "company" | undefined;
+      const teamRead = readTeamParam(values.team, identity, workspace);
+      if (teamRead.error) return json({ ok: false, error: teamRead.error }, 400);
+      team = teamRead.teamId;
+      if (values.actor !== undefined && typeof values.actor !== "string") {
+        return json({ ok: false, error: "actor must be a string" }, 400);
+      }
+      actorParam = typeof values.actor === "string" ? values.actor.trim() || undefined : undefined;
+    } else {
+      if (url.searchParams.has("tag")) {
+        return json({ ok: false, error: "Use POST /list for a private tag" }, 405);
+      }
+      // Floor of 0 as well as the cap: SQLite reads a negative LIMIT as no limit.
+      const parsedN = intParam(url, "n", { fallback: 20, min: 0, max: 100 });
+      if (parsedN instanceof Response) return parsedN;
+      n = parsedN;
+      const parsedAfter = intParam(url, "after");
+      if (parsedAfter instanceof Response) return parsedAfter;
+      after = parsedAfter;
+      const parsedBefore = intParam(url, "before");
+      if (parsedBefore instanceof Response) return parsedBefore;
+      before = parsedBefore;
+      const parsedWorkspace = readWorkspaceParam(url);
+      if (parsedWorkspace instanceof Response) return parsedWorkspace;
+      workspace = parsedWorkspace;
+      const parsedTeam = readTeamQueryParam(url, identity, workspace);
+      if (parsedTeam instanceof Response) return parsedTeam;
+      team = parsedTeam;
+      actorParam = url.searchParams.get("actor")?.trim() || undefined;
+    }
+
     let actor: string | undefined;
     if (actorParam) {
       const resolved = await resolveActorFilter(env, identity, actorParam);
       if (!resolved.ok) return json({ ok: false, error: resolved.error }, 400);
       actor = resolved.actorId;
     }
-
-    // Resolved among the same workspaces the entry read may see, so a slug that only
-    // exists in a colleague's personal workspace is unknown here, never a silent empty list.
-    const project = await readProjectParam(env, identity, url, { layer: workspace, teamId: team });
+    const project = await readProjectParam(env, identity, url, { layer: workspace, teamId: team }, projectValue);
     if (project instanceof Response) return project;
-
-    const { sql, bindings } = scopeEntryFilterQuery(identity, buildEntryFilterQuery({ n, tag, after, before, actor, project }), workspace, team);
+    const { sql, bindings } = scopeEntryFilterQuery(
+      identity,
+      buildEntryFilterQuery({ n, tag, after, before, actor, project }),
+      workspace,
+      team,
+    );
     const { results } = await env.DB.prepare(sql).bind(...bindings).all();
     const rows = results as Record<string, unknown>[];
     // Each row reports its layer so the dashboard can badge cards and offer
@@ -152,70 +251,112 @@ export async function handleRecallRoutes(
     }));
   }
 
-  // GET /recall — semantic search, mirrors the MCP `recall` tool
+  // Recall text is private memory. It belongs in a JSON request body, never a URL that
+  // can be copied into browser history, proxies, analytics, or real-time tail output.
   if (url.pathname === "/recall" && request.method === "GET") {
+    return new Response(JSON.stringify({ ok: false, error: "Use POST /recall with a JSON body" }), {
+      status: 405,
+      headers: { "Content-Type": "application/json", "Allow": "POST", "Cache-Control": "no-store", ...CORS_HEADERS },
+    });
+  }
+
+  // POST /recall — semantic search, mirrors the MCP `recall` tool
+  if (url.pathname === "/recall" && request.method === "POST") {
     const auth = await requireIdentity(request, env);
     if (auth instanceof Response) return auth;
     const identity = auth;
 
-    const query = url.searchParams.get("query")?.trim();
+    const parsedBody = await readJsonBody<RecallRequestBody>(request, 32 * 1024);
+    if (!parsedBody.ok) return parsedBody.response;
+    const body = parsedBody.value;
+    const query = typeof body.query === "string" ? body.query.trim() : "";
     if (!query) return json({ ok: false, error: "query is required" }, 400);
 
-    const topK = intParam(url, "topK", { fallback: 5, min: 1, max: RECALL_MAX_TOP_K });
+    const topK = bodyInteger(body, "topK", { fallback: 5, min: 1, max: RECALL_MAX_TOP_K });
     if (topK instanceof Response) return topK;
-    const tag = url.searchParams.get("tag")?.trim() || undefined;
-    const after = intParam(url, "after");
+    const tag = typeof body.tag === "string" ? body.tag.trim() || undefined : undefined;
+    const after = bodyInteger(body, "after");
     if (after instanceof Response) return after;
-    const before = intParam(url, "before");
+    const before = bodyInteger(body, "before");
     if (before instanceof Response) return before;
-    const kindParam = url.searchParams.get("kind")?.trim();
+    const kindParam = typeof body.kind === "string" ? body.kind.trim() : undefined;
     const kind = kindParam && (KIND_VALUES as readonly string[]).includes(kindParam) ? kindParam as MemoryKind : undefined;
-    const hops = intParam(url, "hops", { fallback: 0, min: 0, max: 3 });
+    const hops = bodyInteger(body, "hops", { fallback: 0, min: 0, max: 3 });
     if (hops instanceof Response) return hops;
-    const workspace = readWorkspaceParam(url);
-    if (workspace instanceof Response) return workspace;
-    const team = readTeamQueryParam(url, identity, workspace);
-    if (team instanceof Response) return team;
+    if (body.synthesize !== undefined && typeof body.synthesize !== "boolean") {
+      return json({ ok: false, error: "synthesize must be a boolean" }, 400);
+    }
+    const synthesize = typeof body.synthesize === "boolean" ? body.synthesize : undefined;
+    if (body.workspace !== undefined
+      && body.workspace !== "personal"
+      && body.workspace !== "company") {
+      return json({ ok: false, error: 'workspace must be "personal" or "company"' }, 400);
+    }
+    const workspace = body.workspace as "personal" | "company" | undefined;
+    const teamRead = readTeamParam(body.team, identity, workspace);
+    if (teamRead.error) return json({ ok: false, error: teamRead.error }, 400);
     // Long memories are shortened by default so API/CLI consumers get a bounded
     // payload. Renderers that show the whole memory (the dashboard) pass full=1.
-    const full = ["1", "true", "yes"].includes((url.searchParams.get("full") ?? "").toLowerCase());
+    const full = body.full === true;
 
-    // Off by default: `why` adds a structured trace to every result.
-    const explain = ["1", "true", "yes"].includes((url.searchParams.get("explain") ?? "").toLowerCase());
-
-    // Opt-out only: recallEntries already defaults synthesize to true (src/recall/search.ts), so
-    // omitting this or passing anything else keeps every existing caller byte-identical. Hooks
-    // that want recall without an LLM synthesis call (e.g. Cursor's per-prompt recall, R1 in
-    // 20-free-tier-ledger.md) pass synthesize=false or synthesize=0.
-    const synthesizeParam = url.searchParams.get("synthesize");
-    const synthesize = synthesizeParam === "false" || synthesizeParam === "0" ? false : undefined;
-
-    const project = await readProjectParam(env, identity, url, { layer: workspace, teamId: team });
+    const project = await readProjectParam(env, identity, url, { layer: workspace, teamId: teamRead.teamId }, body.project);
     if (project instanceof Response) return project;
 
     const cfg = await resolveConfig(env);
-    const asOfParam = url.searchParams.get("as_of")?.trim();
+    const explain = body.explain === true;
+    const asOfParam = typeof body.as_of === "string" ? body.as_of.trim() : undefined;
     let asOf: number | undefined;
+    if (body.as_of !== undefined && typeof body.as_of !== "string") return json({ ok: false, error: "as_of must be a string" }, 400);
     if (asOfParam) {
       if (after !== undefined || before !== undefined) return json({ ok: false, error: "Pass as_of, or after/before, not both." }, 400);
       const parsed = parseValidityDate(asOfParam, Date.now(), cfg.TIMEZONE, "end");
       if (typeof parsed !== "number") return json({ ok: false, error: parsed.error }, 400);
       asOf = parsed;
     }
-    const { matches, insight, semanticUnavailable, queryUsed, queryTokens, compoundStale, asOf: asOfHeader, standing, receipt } = await recallEntries({ query, topK, tag, after, before, kind, hops, project, explain, synthesize, channel: "rest" }, env, ctx, cfg, { identity, workspaceFilter: workspace, teamId: team, asOf });
+    const {
+      matches, asOf: asOfHeader, standing, receipt,
+      insight,
+      semanticUnavailable,
+      semanticUnavailableReason,
+      semanticRetryAt,
+      querySignalCacheHit,
+      queryUsed,
+      queryTokens,
+      currentQueryTokens,
+      compoundStale,
+      graphContribution,
+    } = await recallEntries({
+      query,
+      topK: topK ?? 5,
+      tag,
+      after,
+      before,
+      kind,
+      hops: hops ?? 0,
+      synthesize, explain, channel: "rest",
+      project,
+    }, env, ctx, cfg, {
+      identity,
+      workspaceFilter: workspace,
+      teamId: teamRead.teamId, asOf,
+    });
 
     if (!matches.length) {
       return json({
         ok: true,
         results: [],
         query_used: queryUsed,
+        graph_contribution: graphContribution,
         semantic_unavailable: semanticUnavailable,
+        semantic_unavailable_reason: semanticUnavailableReason ?? null,
+        semantic_retry_at: semanticRetryAt ?? null,
+        query_signal_cache_hit: querySignalCacheHit,
         receipt,
         ...(asOfHeader ? { as_of: { at: asOfHeader.at, not_recorded_before: asOfHeader.notRecordedBefore } } : {}),
         // A standing instruction can fire above zero results (spec 15 2.8 step 5).
         ...(standing?.length ? { standing: standing.map(standingJson) } : {}),
         message: semanticUnavailable
-          ? `Semantic search was unavailable or incomplete for this query, so only keyword and tag matches were considered. ${SEMANTIC_UNAVAILABLE_DETAIL}`
+          ? semanticUnavailableMessage(semanticUnavailableReason, semanticRetryAt)
           : "Nothing found matching that query.",
       });
     }
@@ -230,7 +371,7 @@ export async function handleRecallRoutes(
       results: matches.map((m, i) => {
         const s = full
           ? { text: m.content, truncated: false, fullLength: (m.content ?? "").length }
-          : snippetOf(m.content, allowanceFor(i, m.score, cfg), { queryTokens });
+          : recallSnippet(m, i, { queryTokens, currentQueryTokens, config: cfg });
         return {
           id: m.id,
           content: s.text,
@@ -250,6 +391,9 @@ export async function handleRecallRoutes(
           via_type: m.viaType ?? null,
           linked_at: m.viaLinkedAt ?? null,
           related_to: m.viaFrom ?? null,
+          via_source_id: m.viaSourceId ?? null,
+          via_target_id: m.viaTargetId ?? null,
+          via_direction: m.viaDirection ?? null,
           similar: m.similar?.map(s => ({ id: s.id, created_at: s.createdAt })) ?? [],
           edited_canonical_at: editedCanonicalAt(m.tags),
           valid_from: m.validFrom,
@@ -268,7 +412,11 @@ export async function handleRecallRoutes(
         };
       }),
       insight: insight || null,
+      graph_contribution: graphContribution,
       semantic_unavailable: semanticUnavailable,
+      semantic_unavailable_reason: semanticUnavailableReason ?? null,
+      semantic_retry_at: semanticRetryAt ?? null,
+      query_signal_cache_hit: querySignalCacheHit,
     });
   }
 
@@ -277,9 +425,17 @@ export async function handleRecallRoutes(
     const auth = await requireIdentity(request, env);
     if (auth instanceof Response) return auth;
 
-    let body: { query?: string; memories?: string };
-    try { body = await request.json(); } catch { return json({ ok: false, error: "Invalid JSON" }, 400); }
-    if (!body.query?.trim()) return json({ ok: false, error: "query is required" }, 400);
+    const parsedBody = await readJsonBody<{ query?: unknown; memories?: unknown; workspace?: unknown }>(request, 256 * 1024);
+    if (!parsedBody.ok) return parsedBody.response;
+    const body = parsedBody.value;
+    if (typeof body.query !== "string" || !body.query.trim()) return json({ ok: false, error: "query is required" }, 400);
+    if (body.memories !== undefined && typeof body.memories !== "string") return json({ ok: false, error: "memories must be a string" }, 400);
+    if (body.workspace !== undefined && body.workspace !== "personal" && body.workspace !== "company") {
+      return json({ ok: false, error: 'workspace must be "personal" or "company"' }, 400);
+    }
+    // 本文はclient作成なので、範囲未指定は個人領域と推測しない。
+    // memberのpersonalWorkspaceIdは所有者の設定・資格情報束縛と一致しない。
+    env = chatGptEnvForWorkspaces(env, body.workspace === "personal" ? [auth.personalWorkspaceId] : []);
 
     // The memories arrive numbered, dated and attributed (see the client's
     // serializer in public/js/recall.js and the MCP tool's mirror of it), so
@@ -305,6 +461,21 @@ Be specific and complete. Concision means leaving out filler, never leaving out 
     const userMessage = `Question: ${body.query}\n\nRelevant memories:\n${body.memories}`;
     const cfg = await resolveConfig(env);
 
+    if (isChatGptOperationEnabled(env, "answer")) {
+      try {
+        const stream = await runChatGptGenerationAnswerStream(env, [
+          { role: "system", content: systemPrompt },
+          { role: "user", content: userMessage },
+        ]);
+        return new Response(stream, {
+          headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-store", ...CORS_HEADERS,
+            "X-Second-Brain-AI-Provider": "chatgpt", "Access-Control-Expose-Headers": "X-Second-Brain-AI-Provider" },
+        });
+      } catch {
+        return json({ ok: false, error: "Answer generation is temporarily unavailable" }, 503);
+      }
+    }
+
     // Workers AI requires `as any` here — the SDK types don't cover all models
     const stream = await env.AI.run(cfg.LLM_MODEL as any, {
       messages: [
@@ -319,46 +490,43 @@ Be specific and complete. Concision means leaving out filler, never leaving out 
     });
   }
 
-  // GET /digest
   if (url.pathname === "/digest" && request.method === "GET") {
+    return new Response(JSON.stringify({ ok: false, error: "Use POST /digest with a JSON body" }), {
+      status: 405,
+      headers: { "Content-Type": "application/json", "Allow": "POST", ...CORS_HEADERS },
+    });
+  }
+
+  // POST /digest
+  if (url.pathname === "/digest" && request.method === "POST") {
     const auth = await requireIdentity(request, env);
     if (auth instanceof Response) return auth;
-    const identity = auth;
-    const tag = url.searchParams.get("tag")?.trim() || undefined;
-    const projectParam = url.searchParams.get("project")?.trim() || undefined;
-    if (tag && projectParam) return json({ ok: false, error: "pass either tag or project, not both" }, 400);
+    const parsed = await readJsonBody<{ tag?: unknown; project?: unknown; workspace?: unknown; team?: unknown }>(request, 8 * 1024);
+    if (!parsed.ok) return parsed.response;
+    const tag = typeof parsed.value.tag === "string" ? parsed.value.tag.trim() : "";
+    const projectParam = parsed.value.project;
     if (!tag && !projectParam) return json({ ok: false, error: "tag or project parameter is required" }, 400);
-    const workspaceFilter = readWorkspaceParam(url);
-    if (workspaceFilter instanceof Response) return workspaceFilter;
-    const team = readTeamQueryParam(url, identity, workspaceFilter);
-    if (team instanceof Response) return team;
-
-    if (projectParam) {
-      const rows = await readProjectParam(env, identity, url, { layer: workspaceFilter, teamId: team });
-      if (rows instanceof Response) return rows;
-      if (!rows) return json({ ok: false, error: "tag or project parameter is required" }, 400);
-      const slug = rows[0].id;
-      // Only workspaces that actually hold the project are rolled up: the registry is
-      // workspace-bound, so a slug tagged elsewhere is not this project.
-      const projectResult = await compressTag(`project:${slug}`, env, ctx, {
-        workspaceIds: [...new Set(rows.map(r => r.workspace_id))],
-        project: rows,
-      });
-      if (!projectResult.synthesizedId) {
-        return json({ project: slug, error: "Could not create digest: the project may have fewer than 10 eligible entries, or it was recently compressed.", source_count: projectResult.entriesUsed });
-      }
-      return json({ project: slug, synthesis: projectResult.text, entry_id: projectResult.synthesizedId, source_count: projectResult.entriesUsed });
+    if (tag && projectParam) return json({ ok: false, error: "pass either tag or project, not both" }, 400);
+    const workspace = parsed.value.workspace;
+    if (workspace !== undefined && workspace !== "personal" && workspace !== "company") {
+      return json({ ok: false, error: 'workspace must be "personal" or "company"' }, 400);
     }
+    const layer = workspace as "personal" | "company" | undefined;
+    const teamRead = readTeamParam(parsed.value.team, auth, layer);
+    if (teamRead.error) return json({ ok: false, error: teamRead.error }, 400);
 
-    const result = await compressTag(tag!, env, ctx, {
-      workspaceIds: readScopeWorkspaces(identity, { layer: workspaceFilter, teamId: team }),
+    const project = await readProjectParam(env, auth, url, { layer, teamId: teamRead.teamId }, projectParam);
+    if (project instanceof Response) return project;
+    const result = await compressTag(project ? `project:${project[0].id}` : tag, env, ctx, {
+      workspaceIds: project ? [...new Set(project.map(r => r.workspace_id))] : readScopeWorkspaces(auth, { layer, teamId: teamRead.teamId }),
+      project,
     });
 
     if (!result.synthesizedId) {
-      return json({ tag, error: "Could not create digest: the tag may have fewer than 10 eligible entries, or it was recently compressed.", source_count: result.entriesUsed });
+      return json({ ...(project ? { project: project[0].id } : { tag }), error: `Could not create digest: the ${project ? "project" : "tag"} may have fewer than 10 eligible entries or was recently compressed`, source_count: result.entriesUsed });
     }
 
-    return json({ tag, synthesis: result.text, entry_id: result.synthesizedId, source_count: result.entriesUsed });
+    return json({ ...(project ? { project: project[0].id } : { tag }), synthesis: result.text, entry_id: result.synthesizedId, source_count: result.entriesUsed });
   }
 
   return null;

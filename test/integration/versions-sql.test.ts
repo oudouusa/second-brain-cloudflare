@@ -42,8 +42,9 @@ async function driverTruncatesNul(): Promise<boolean> {
 beforeEach(async () => {
   resetDatabaseInit();
   d1 = makeSqliteD1();
-  env = makeTestEnv(undefined, { DB: d1.db as unknown as D1Database, OAUTH_KV: makeMemoryKV() });
+  env = d1.admitEnv(makeTestEnv(undefined, { DB: d1.db as unknown as D1Database, OAUTH_KV: makeMemoryKV() }));
   await initializeDatabase(env); // schema.sql alone lacks the ALTER-added columns
+  env = d1.admitEnv(env);
 });
 afterEach(() => d1.close());
 
@@ -55,7 +56,8 @@ async function seedRow(id: string, content: string, over: { tags?: string[]; cre
 const versions = async (id: string) =>
   (await d1.db.prepare(`SELECT * FROM entry_versions WHERE entry_id = ? ORDER BY seq`).bind(id).all()).results as any[];
 const row = async (id: string) => (await d1.db.prepare(`SELECT * FROM entries WHERE id = ?`).bind(id).first()) as any;
-const changes = (r: any) => r.meta.changes ?? r.meta.rows_written;
+// sourceの行数と、FTS等を含むD1 changesの合計を区別する。
+const changes = (r: any) => r.meta.rows_written ?? r.meta.changes;
 
 interface Edit {
   id: string; next: string; tags?: string[]; now?: number; keep?: number; reason?: VersionReason;

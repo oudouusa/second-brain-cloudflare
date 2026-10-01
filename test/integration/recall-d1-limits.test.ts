@@ -26,6 +26,9 @@ import { makeSqliteD1, type SqliteD1 } from "../helpers/sqlite-d1";
 import { makeTestEnv, makeVectorizeMock } from "../helpers/make-env";
 import { req } from "../helpers/make-request";
 import type { Env } from "../../src/env";
+import type { Identity } from "../../src/lib/identity";
+import { D1_MAX_LIKE_PATTERN_BYTES } from "../../src/constants";
+import { likeContainsPattern, tokenizeQueryDetailed } from "../../src/text/lexical-query";
 import { RECALL_SEED_TOPK, graphSeedLimit } from "../../src/recall/neighborhood";
 
 // The dense arm's graph seats: fixed by RECALL_SEED_TOPK, not by the topK a caller asks for.
@@ -42,6 +45,10 @@ const ctx = { waitUntil: (_: Promise<any>) => {} } as any;
 // stopword, so the token count is exactly the word count. A real 120-word
 // question lands on the same 100 tokens once stopwords are stripped.
 const LONG_QUERY = Array.from({ length: 120 }, (_, i) => `topic${i}`).join(" ");
+const LONG_MIXED_QUERY = "ユーザーはsecond-brain-cfに保存済みのEmbeddingGemma関連メモをquota枯渇中でも読み取れるか本番確認したい。どんな内容が記録されているか。";
+const LONG_COMPAT_QUERY = Array.from({ length: 20 }, (_, i) =>
+  `topic${i}`.replace(/[!-~]/g, char => String.fromCharCode(char.charCodeAt(0) + 0xfee0))
+).join(" ");
 
 interface Executed { sql: string; params: unknown[] }
 
@@ -68,6 +75,14 @@ function withD1Limits(
     if (params.length > D1_MAX_BOUND_PARAMS) {
       throw new Error("D1_ERROR: too many SQL variables: SQLITE_ERROR");
     }
+    for (const param of params) {
+      if (typeof param === "string"
+        && param.startsWith("%")
+        && param.endsWith("%")
+        && new TextEncoder().encode(param).byteLength > D1_MAX_LIKE_PATTERN_BYTES) {
+        throw new Error("D1_ERROR: LIKE or GLOB pattern too complex: SQLITE_ERROR");
+      }
+    }
   };
   const wrap = (sql: string, stmt: any, params: unknown[]): any => ({
     bind: (...args: unknown[]) => wrap(sql, stmt.bind(...args), args),
@@ -77,10 +92,12 @@ function withD1Limits(
   });
   return {
     prepare: (sql: string) => wrap(sql, inner.prepare(sql), []),
-    // Identity resolution runs the schema init and tenant bootstrap on the
-    // request path; pass both through to the facade underneath.
     exec: (sql: string) => inner.exec(sql),
-    batch: (stmts: never[]) => inner.batch(stmts),
+    batch: async (statements: { run(): Promise<unknown> }[]) => {
+      const results = [];
+      for (const statement of statements) results.push(await statement.run());
+      return results;
+    },
   };
 }
 
@@ -105,13 +122,9 @@ describe("recall stays inside D1's statement limits", () => {
   beforeEach(async () => {
     sqlite = makeSqliteD1();
     executed = [];
-    // `updated_at`, `valid_from` and `valid_until` are columns src/db/init.ts
-    // adds by ALTER at runtime rather than in schema.sql, and that path goes
-    // through `exec`, which this facade does not implement. Recall's
-    // hydration selects all three, and the validity predicate reads valid_until.
-    await sqlite.db.prepare(`ALTER TABLE entries ADD COLUMN updated_at INTEGER`).run();
-    await sqlite.db.prepare(`ALTER TABLE entries ADD COLUMN valid_from INTEGER`).run();
-    await sqlite.db.prepare(`ALTER TABLE entries ADD COLUMN valid_until INTEGER`).run();
+    // `updated_at` is one of the columns src/db/init.ts adds by ALTER at
+    // runtime rather than in schema.sql, and that path goes through `exec`,
+    // which this facade does not implement. Recall's hydration selects it.
   });
 
   afterEach(() => sqlite.close());
@@ -146,15 +159,13 @@ describe("recall stays inside D1's statement limits", () => {
       expect(frequency?.sql).toContain("WHERE created_at >= ? AND created_at < ?");
       expect(keyword.sql).toContain("AND created_at >= ? AND created_at < ?");
       expect(frequency?.params.slice(-2)).toEqual([day, day + 86400000]);
-      // the current-validity bound (T-0089.2.1) sits between the time filter
-      // and the limit, which is followed by the terms the statement scores (bound once each)
-      const terms = (keyword.sql.match(/ AS p\d+/g) ?? []).length;
-      expect(keyword.params.slice(-4 - terms, -2 - terms)).toEqual([day, day + 86400000]);
+      const whereProbes = (keyword.sql.split(" ORDER BY ")[0].match(/content LIKE \?/g) ?? []).length;
+      expect(keyword.params.slice(whereProbes, whereProbes + 2)).toEqual([day, day + 86400000]);
     });
 
     it("answers a 120-word query with no memories stored", async () => {
       const res = await worker.fetch(
-        req("GET", `/recall?query=${encodeURIComponent(LONG_QUERY)}`),
+        req("POST", "/recall", { body: { query: LONG_QUERY } }),
         envWith(),
         ctx,
       );
@@ -171,6 +182,73 @@ describe("recall stays inside D1's statement limits", () => {
       expect(exprDepth(keyword.sql)).toBeLessThanOrEqual(D1_MAX_EXPR_DEPTH);
     });
 
+    it("keeps 16 raw NFKC compatibility probes inside the same D1 limits", async () => {
+      const res = await worker.fetch(
+        req("POST", "/recall", { body: { query: LONG_COMPAT_QUERY } }),
+        envWith(),
+        ctx,
+      );
+
+      expect(res.status).toBe(200);
+      const [keyword] = keywordStatements(executed);
+      expect(keyword).toBeDefined();
+      expect(keyword.params.length).toBe(69); // validity + 16 normalized + 16 raw, each in WHERE and ORDER, + 3 scope + LIMIT
+      expect(keyword.params.length).toBeLessThanOrEqual(D1_MAX_BOUND_PARAMS);
+      expect(exprDepth(keyword.sql)).toBeLessThanOrEqual(D1_MAX_EXPR_DEPTH);
+    });
+
+    it("keeps all WHERE probes before spending remaining binds on ORDER", async () => {
+      const identity: Identity = {
+        userId: "many-teams",
+        role: "member",
+        personalWorkspaceId: "personal",
+        companyWorkspaceIds: Array.from({ length: 80 }, (_, i) => `company-${i}`),
+        defaultShare: "",
+      };
+      await recallEntries(
+        { query: LONG_QUERY, topK: 5, hops: 0, synthesize: false },
+        envWith(), ctx, undefined, { identity },
+      );
+
+      const [keyword] = keywordStatements(executed);
+      expect(keyword).toBeDefined();
+      expect(keyword.params).toHaveLength(D1_MAX_BOUND_PARAMS);
+      expect((keyword.sql.split(" ORDER BY ")[0].match(/content LIKE \?/g) ?? [])).toHaveLength(16);
+      expect((keyword.sql.split(" ORDER BY ")[1].match(/CASE WHEN content LIKE \?/g) ?? [])).toHaveLength(1);
+      expect(keyword.params.slice(16, 97)).toEqual(["personal", ...identity.companyWorkspaceIds]);
+      expect(keyword.params.slice(98, 99)).toEqual(keyword.params.slice(0, 1));
+      expect(keyword.params.at(-1)).toBe(128);
+    });
+
+    it("preserves primary-then-raw WHERE probes when no bind remains for ORDER", async () => {
+      const identity: Identity = {
+        userId: "many-teams",
+        role: "member",
+        personalWorkspaceId: "personal",
+        companyWorkspaceIds: Array.from({ length: 80 }, (_, i) => `company-${i}`),
+        defaultShare: "",
+      };
+      await recallEntries(
+        { query: LONG_COMPAT_QUERY, topK: 5, hops: 0, synthesize: false },
+        envWith(), ctx, undefined, { identity },
+      );
+
+      const [keyword] = keywordStatements(executed);
+      const terms = tokenizeQueryDetailed(LONG_COMPAT_QUERY).slice(0, 16);
+      const originalWhere = [
+        ...terms.map(term => term.probes[0]),
+        ...terms.flatMap(term => term.probes.slice(1)),
+      ].slice(0, 17).map(likeContainsPattern);
+      expect(originalWhere).toHaveLength(17);
+      expect(originalWhere.slice(16)).toEqual(["%ｔｏｐｉｃ０%"]);
+      expect(keyword.params.slice(0, 17)).toEqual(originalWhere);
+      expect(keyword.params.slice(17, 98)).toEqual(["personal", ...identity.companyWorkspaceIds]);
+      expect(keyword.sql.split(" ORDER BY ")[0].match(/content LIKE \?/g)).toHaveLength(17);
+      expect(keyword.sql).toContain("ORDER BY created_at DESC LIMIT ?");
+      expect(keyword.params).toHaveLength(D1_MAX_BOUND_PARAMS);
+      expect(keyword.params.at(-1)).toBe(128);
+    });
+
     it("answers a 120-word query when the frequency scan itself fails", async () => {
       // The other exit that returns the query uncapped, and the reason the cap
       // lives where the clause is built rather than at one distillation exit:
@@ -179,7 +257,7 @@ describe("recall stays inside D1's statement limits", () => {
       const scanFailed = (sql: string) => sql.includes("SUM(CASE WHEN content LIKE");
 
       const res = await worker.fetch(
-        req("GET", `/recall?query=${encodeURIComponent(LONG_QUERY)}`),
+        req("POST", "/recall", { body: { query: LONG_QUERY } }),
         envWith(scanFailed),
         ctx,
       );
@@ -199,7 +277,7 @@ describe("recall stays inside D1's statement limits", () => {
       const env = envWith();
 
       const long = await worker.fetch(
-        req("GET", `/recall?query=${encodeURIComponent(LONG_QUERY)}`),
+        req("POST", "/recall", { body: { query: LONG_QUERY } }),
         env,
         ctx,
       );
@@ -215,10 +293,39 @@ describe("recall stays inside D1's statement limits", () => {
       expect(keywordStatements(executed)[0].params.length).toBe(37);
 
       executed.length = 0;
-      const short = await worker.fetch(req("GET", "/recall?query=topic0"), env, ctx);
+      const short = await worker.fetch(req("POST", "/recall", { body: { query: "topic0" } }), env, ctx);
       expect(short.status).toBe(200);
       const data = await short.json() as any;
       expect(data.results.map((r: any) => r.id)).toEqual(["e1"]);
+    });
+
+    it("keeps long mixed Japanese queries readable during Workers AI quota fallback", async () => {
+      sqlite.seed({ id: "e1", content: "EmbeddingGemmaの推論閾値と再索引の記録", createdAt: 1000 });
+      const env = envWith(undefined, {
+        AI: {
+          run: vi.fn().mockRejectedValue(new Error(
+            "4006: you have used up your daily free allocation of 10,000 neurons",
+          )),
+        } as unknown as Ai,
+      });
+
+      const res = await worker.fetch(
+        req("POST", "/recall", { body: { query: LONG_MIXED_QUERY } }),
+        env,
+        ctx,
+      );
+
+      expect(res.status).toBe(200);
+      const data = await res.json() as any;
+      expect(data.results.map((r: any) => r.id)).toContain("e1");
+      expect(data.semantic_unavailable).toBe(true);
+      expect(data.semantic_unavailable_reason).toBe("workers_ai_quota_exhausted");
+      const patterns = executed.flatMap(entry => entry.params)
+        .filter((param): param is string => typeof param === "string" && param.startsWith("%") && param.endsWith("%"));
+      expect(patterns.length).toBeGreaterThan(0);
+      expect(patterns.every(pattern =>
+        new TextEncoder().encode(pattern).byteLength <= D1_MAX_LIKE_PATTERN_BYTES
+      )).toBe(true);
     });
   });
 
@@ -314,7 +421,7 @@ describe("recall stays inside D1's statement limits", () => {
         VECTORIZE: makeVectorizeMock({
           getByIds: vi.fn(async (ids: string[]) => ids.map(id => ({
             id,
-            values: new Array(384).fill(0.1),
+            values: new Array(128).fill(0.1),
             metadata: { parentId: id.replace(/^v-/, "") },
           }))),
         }),
@@ -332,7 +439,7 @@ describe("recall stays inside D1's statement limits", () => {
       expect(hydration.length).toBeGreaterThan(0);
       expect(hydration.every(h => h.params.includes('%"work"%'))).toBe(true);
       expect(Math.max(...hydration.map(h => h.params.length))).toBeLessThanOrEqual(D1_MAX_BOUND_PARAMS);
-      expect(executed.length).toBeLessThanOrEqual(30);
+      expect(executed.length).toBeLessThanOrEqual(32);
     });
 
     // expandGraph's edge scan binds every seed TWICE (source_id IN (…) OR target_id

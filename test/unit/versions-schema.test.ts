@@ -36,7 +36,7 @@ describe("entry_versions and entries_trash schema", () => {
   });
 
   it("creates them on a brain that predates them (init adds only what is missing)", async () => {
-    await d1.db.exec(`DROP TABLE entry_versions; DROP TABLE entries_trash`);
+    await d1.db.exec(`DELETE FROM schema_meta; DROP TABLE entry_versions; DROP TABLE entries_trash`);
     expect(await objectNames()).not.toContain("entry_versions");
     await initializeDatabase(envFor(d1));
     const names = await objectNames();
@@ -47,7 +47,7 @@ describe("entry_versions and entries_trash schema", () => {
     // A dev brain that ran init on a commit before prior_length_utf16 shipped: entry_versions
     // exists, but narrower than db/schema.sql declares today (frozen shape, matching
     // test/unit/schema-upgrade-completeness.test.ts's LEGACY_SHAPES.entry_versions).
-    await d1.db.exec(`DROP TABLE entry_versions`);
+    await d1.db.exec(`DELETE FROM schema_meta; DROP TABLE entry_versions`);
     await d1.db.exec(
       `CREATE TABLE entry_versions (id INTEGER PRIMARY KEY, entry_id TEXT NOT NULL, workspace_id TEXT NOT NULL DEFAULT '', seq INTEGER NOT NULL, content TEXT, prior_length INTEGER, tags TEXT NOT NULL, state TEXT NOT NULL DEFAULT '{}', actor_id TEXT NOT NULL DEFAULT '', channel TEXT NOT NULL DEFAULT '', reason TEXT NOT NULL, meta TEXT NOT NULL DEFAULT '{}', valid_from INTEGER, created_at INTEGER NOT NULL, CHECK ((content IS NULL) <> (prior_length IS NULL)))`,
     );
@@ -66,7 +66,7 @@ describe("entry_versions and entries_trash schema", () => {
     d1.issued.length = 0;
     await initializeDatabase(envFor(d1));
     expect(d1.issued).toHaveLength(1);
-    expect(d1.issued[0]).toMatch(/^SELECT type AS kind, name, sql AS definition FROM sqlite_master\b/);
+    expect(d1.issued[0]).toMatch(/^SELECT version\b/);
   });
 
   it("entry_versions rejects a duplicate (entry_id, seq)", async () => {
@@ -131,7 +131,7 @@ describe("versions:since", () => {
     resetDatabaseInit();
     d1.close();
     d1 = makeSqliteD1();
-    await d1.db.exec(`DROP TABLE entry_versions; DROP TABLE entries_trash`);
+    await d1.db.exec(`DELETE FROM schema_meta; DROP TABLE entry_versions; DROP TABLE entries_trash`);
     kv = makeMemoryKV();
     await initializeDatabase(envFor(d1, kv));
     expect(Number(await kv.get(VERSIONS_SINCE_KV_KEY))).toBeGreaterThan(0);
@@ -139,9 +139,10 @@ describe("versions:since", () => {
 
   it("a failed probe never writes versions:since", async () => {
     const kv = makeMemoryKV();
+    await d1.db.exec(`DELETE FROM schema_meta`);
     const failingProbe = {
       ...d1.db,
-      prepare: (sql: string) => /FROM sqlite_master/.test(sql)
+      prepare: (sql: string) => /^WITH schema_groups/.test(sql)
         ? { all: async () => { throw new Error("probe down"); } }
         : d1.db.prepare(sql),
     };
@@ -154,6 +155,6 @@ describe("versions:since", () => {
     d1 = makeSqliteD1({ schema: false });
     const kv = makeMemoryKV();
     kv.put = async () => { throw new Error("kv down"); };
-    await expect(initializeDatabase(envFor(d1, kv))).resolves.toBeUndefined();
+    await expect(initializeDatabase(envFor(d1, kv))).resolves.toMatchObject({ changed: true });
   });
 });

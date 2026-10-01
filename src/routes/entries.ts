@@ -1,11 +1,11 @@
 import type { Env } from "../env";
 import { importExportPayload, parseImportBody, parseImportLimit, parseImportOffset } from "../entries/import";
 import { initializeDatabase } from "../db/init";
-import { json } from "../lib/http";
+import { CORS_HEADERS, json, readJsonBody } from "../lib/http";
 import { requireIdentity } from "../lib/identity";
 import { assertCanMutateEntry, getReadableEntry, FORBIDDEN_MSG } from "../lib/entry-access";
 import { layerOf, scopeWhere, readTeamParam } from "../lib/scope";
-import { readEntryTimeline } from "../memory/history";
+import { readEntryTimeline, listMemoryHistory, MEMORY_HISTORY_MAX_RESULTS } from "../memory/history";
 import { loadHistory } from "../memory/versions";
 import { buildEntryHistoryFromReads, readEntryVersion } from "../memory/history-view";
 import { lookupActorLabels, resolveActorLabel } from "../lib/actors";
@@ -21,11 +21,21 @@ import { resolveConfig } from "../config";
 import { STATUS_VALUES, type MemoryStatus } from "../memory/status";
 import { parseSupersededBy, validitySummary } from "../recall/validity-view";
 import { getTagVocabulary } from "../tags/vocabulary";
-import { projectRowsOf } from "../projects/registry";
+import {
+  getHotContext,
+  isMemoryTier,
+  MEMORY_TIERS,
+  setMemoryPinned,
+  setMemoryTier,
+} from "../memory/tier";
+import {
+  assertExportWithinMemoryLimit, buildExportBundle, buildPagedExportBundle,
+  ExportError, parseExportPageLimit, serializeExportWithinMemoryLimit,
+} from "../entries/export";
 import { supersededBySql } from "../memory/validity";
 
-/** Most entries GET /tags?counts=1 reads; matches the /projects counts cap. */
 const TAG_COUNTS_SCAN_LIMIT = 5000;
+const MAX_MANUAL_IMPORT_BYTES = 1024 * 1024;
 
 export async function handleEntriesRoutes(
   request: Request,
@@ -39,6 +49,7 @@ export async function handleEntriesRoutes(
     if (auth instanceof Response) return auth;
     const scope = scopeWhere(auth);
     const row = await env.DB.prepare(
+      // validity: any: 所有者の件数・タグ集計には過去の記憶も含める。
       `SELECT COUNT(*) as count FROM entries WHERE ${scope.clause}`
     ).bind(...scope.bindings).first() as Record<string, any> | null;
     return json({ count: (row?.count as number) ?? 0 });
@@ -61,6 +72,7 @@ export async function handleEntriesRoutes(
     // A capped scan undercounts, so it says so in a header rather than the body shape.
     const scope = scopeWhere(auth);
     const { results } = await env.DB.prepare(
+      // validity: any: 所有者の件数・タグ集計には過去の記憶も含める。
       `SELECT tags FROM entries WHERE ${scope.clause} LIMIT ${TAG_COUNTS_SCAN_LIMIT}`
     ).bind(...scope.bindings).all<{ tags: string }>();
     const tally = new Map<string, number>();
@@ -77,69 +89,43 @@ export async function handleEntriesRoutes(
     return response;
   }
 
-  // GET /export — complete backup, entries oldest first: a restore inserts in this order and
-  // rowids should follow time (the keyword AND tier reads the index newest-rowid-first).
-  // POST /import re-sorts anyway, so files taken before this order still restore correctly.
-  // Complete backup: every entry plus the edges and projects tables. Single
-  // unbounded SELECTs are acceptable here: D1 handles tens of thousands of rows in
-  // one read and this route runs on explicit user action only. If response size
-  // ever becomes a problem, add ?after= cursor support then, not now.
+  // GET /export — bounded complete export for backward compatibility, or a
+  // positionally paged export when paging parameters are present.
   if (url.pathname === "/export" && request.method === "GET") {
     const auth = await requireIdentity(request, env);
     if (auth instanceof Response) return auth;
     // A member's backup is their readable set — personal plus company — not the
     // whole deployment. Same unbounded-SELECT budget note as below applies.
-    const scope = scopeWhere(auth);
-
-    const { results: entryRows } = await env.DB.prepare(
-      `SELECT id, content, tags, source, created_at, COALESCE(updated_at, created_at) AS last_updated, recall_count, importance_score, contradiction_wins, contradiction_losses, valid_from, valid_until FROM entries WHERE ${scope.clause} ORDER BY created_at ASC`
-    ).bind(...scope.bindings).all() as { results: Record<string, any>[] };
-    const { results: edgeRows } = await env.DB.prepare(
-      `SELECT source_id, target_id, type, weight, provenance, created_at FROM edges WHERE ${scope.clause}`
-    ).bind(...scope.bindings).all() as { results: Record<string, any>[] };
-    const { results: projectRows } = await env.DB.prepare(
-      `SELECT id, workspace_id, name, description, aliases, status, created_at, updated_at FROM projects WHERE ${scope.clause} ORDER BY created_at ASC, workspace_id ASC, id ASC`
-    ).bind(...scope.bindings).all();
-
-    // vector_ids are deliberately excluded — they're deployment-specific and an
-    // import tool re-embeds anyway. Tags are parsed so the file holds real arrays.
-    //
-    // updated_at is carried because it is load-bearing on the way back in, not for
-    // display: recall reads it as the entry's age (src/recall/search.ts) and the
-    // staleness pass selects on it (src/staleness/pass.ts). Without it a restore
-    // silently rewrites every entry's last-touched time to its creation time, so
-    // anything edited long after it was written comes back looking untouched —
-    // ranked staler than it is, and eligible for a staleness verdict sooner.
-    // Coalesced in SQL because rows written before that column existed hold NULL, and
-    // the export should carry a number the importer can use directly. Aliased to
-    // `last_updated` rather than `updated_at` so the projection is not itself a bare
-    // read of the column — see test/unit/updated-at-coalesced.test.ts.
-    const entries = entryRows.map(r => ({
-      id: r.id,
-      content: r.content,
-      tags: JSON.parse(r.tags ?? "[]"),
-      source: r.source,
-      created_at: r.created_at,
-      updated_at: r.last_updated ?? r.created_at,
-      recall_count: r.recall_count ?? 0,
-      importance_score: r.importance_score ?? 0,
-      contradiction_wins: r.contradiction_wins ?? 0,
-      contradiction_losses: r.contradiction_losses ?? 0,
-      // T-0089.2.1: the raw columns, so a restore tells a stated start from "since created_at".
-      valid_from: r.valid_from ?? null,
-      valid_until: r.valid_until ?? null,
-    }));
-    const edges = edgeRows.map(r => ({
-      source_id: r.source_id,
-      target_id: r.target_id,
-      type: r.type,
-      weight: r.weight,
-      provenance: r.provenance,
-      created_at: r.created_at,
-    }));
-    // Like entries and edges, no workspace_id: a restore lands in the caller's own workspace.
-    const projects = projectRowsOf(projectRows).map(({ workspace_id: _workspace, ...project }) => project);
-    return json({ ok: true, exported_at: Date.now(), version: 3, entries, edges, projects });
+    try {
+      const paged = url.searchParams.get("paged") === "1"
+        || url.searchParams.has("offset")
+        || url.searchParams.has("edge_offset")
+        || url.searchParams.has("project_offset")
+        || url.searchParams.has("limit");
+      if (paged) {
+        return json(await buildPagedExportBundle(
+          env,
+          parseImportOffset(url.searchParams.get("offset")),
+          parseImportOffset(url.searchParams.get("edge_offset")),
+          parseExportPageLimit(url.searchParams.get("limit")),
+          auth,
+          parseImportOffset(url.searchParams.get("project_offset")),
+        ));
+      }
+      await assertExportWithinMemoryLimit(env, auth);
+      const serialized = serializeExportWithinMemoryLimit(await buildExportBundle(env, auth));
+      return new Response(serialized, {
+        headers: { "Content-Type": "application/json", ...CORS_HEADERS },
+      });
+    } catch (error) {
+      if (error instanceof ExportError) {
+        const message = error.status === 413
+          ? `${error.message}; retry with ?paged=1 and follow pagination cursors`
+          : error.message;
+        return json({ ok: false, error: message }, error.status);
+      }
+      throw error;
+    }
   }
 
   // POST /import — round-trip counterpart to GET /export (issue #217). Inserts by
@@ -148,12 +134,10 @@ export async function handleEntriesRoutes(
   // burning the Workers AI quota in one request. Does NOT go through /capture.
   //
   // Paged positionally: one call examines entries[offset .. offset+limit), then —
-  // once entries are exhausted — edges[edge_offset .. edge_offset+limit) and
-  // projects[project_offset .. project_offset+limit). Clients resend the same file
-  // with the next_offset/next_edge_offset/next_project_offset from the previous
-  // response until all three remaining counts are 0. See importExportPayload for why
-  // this is what keeps a large restore inside this codebase's self-imposed D1
-  // query budget (well under the platform's real per-invocation ceiling).
+  // once entries are exhausted — edges[edge_offset .. edge_offset+limit). Clients
+  // resend the same file with the next_offset/next_edge_offset from the previous
+  // response until both remaining counts are 0. See importExportPayload for why
+  // this is what keeps a large restore inside the D1 free-plan query budget.
   if (url.pathname === "/import" && request.method === "POST") {
     const auth = await requireIdentity(request, env);
     if (auth instanceof Response) return auth;
@@ -162,10 +146,20 @@ export async function handleEntriesRoutes(
     // deployed brain's first request, which is exactly when the schema ALTERs have
     // not run yet and every insert would fail on a missing column. Latched after
     // the first call, so this costs nothing in the steady state.
-    await initializeDatabase(env);
+    const initialized = await initializeDatabase(env);
+    if (initialized.changed) {
+      return json({
+        ok: false,
+        retry: true,
+        error: "Database schema initialized; retry the same import request",
+      }, 202);
+    }
 
-    let body: unknown;
-    try { body = await request.json(); } catch { return json({ ok: false, error: "Invalid JSON" }, 400); }
+    // JSON can expand by tens of times when millions of tiny objects are parsed. Keep
+    // this convenience route conservative; larger recovery uses the bounded R2 path.
+    const importedBody = await readJsonBody<unknown>(request, MAX_MANUAL_IMPORT_BYTES);
+    if (!importedBody.ok) return importedBody.response;
+    const body = importedBody.value;
 
     const parsed = parseImportBody(body);
     if (!parsed.ok) return json({ ok: false, error: parsed.error }, 400);
@@ -173,12 +167,15 @@ export async function handleEntriesRoutes(
     const limit = parseImportLimit(url.searchParams.get("limit"));
     const offset = parseImportOffset(url.searchParams.get("offset"));
     const edgeOffset = parseImportOffset(url.searchParams.get("edge_offset"));
-    const projectOffset = parseImportOffset(url.searchParams.get("project_offset"));
-    // Import always lands in the caller's own personal workspace, never the
-    // company layer: a restore is not a share, and the company layer is only
-    // ever reached through POST /share ("move, not copy").
-    const writeCtx = { workspaceId: auth.personalWorkspaceId, actorId: auth.userId };
-    const summary = await importExportPayload(env, parsed.payload, { limit, offset, edgeOffset, projectOffset, writeCtx, ctx });
+    const summary = await importExportPayload(env, parsed.payload, {
+      limit,
+      offset,
+      edgeOffset,
+      projectOffset: parseImportOffset(url.searchParams.get("project_offset")),
+      enforceIndexLimits: true,
+      ctx,
+      writeCtx: { workspaceId: auth.personalWorkspaceId, actorId: auth.userId },
+    });
     return json(summary);
   }
 
@@ -190,7 +187,7 @@ export async function handleEntriesRoutes(
     if (auth instanceof Response) return auth;
 
     let body: { id?: string; permanent?: unknown; confirm?: unknown; nonce?: unknown };
-    try { body = await request.json(); } catch { return json({ ok: false, error: "Invalid JSON" }, 400); }
+    try { body = await request.json() as typeof body; } catch { return json({ ok: false, error: "Invalid JSON" }, 400); }
     if (!body.id?.trim()) return json({ ok: false, error: "id is required" }, 400);
     const id = body.id.trim();
 
@@ -242,7 +239,7 @@ export async function handleEntriesRoutes(
     if (auth instanceof Response) return auth;
 
     let body: { id?: string; nonce?: unknown };
-    try { body = await request.json(); } catch { return json({ ok: false, error: "Invalid JSON" }, 400); }
+    try { body = await request.json() as typeof body; } catch { return json({ ok: false, error: "Invalid JSON" }, 400); }
     if (!body.id?.trim()) return json({ ok: false, error: "id is required" }, 400);
     const id = body.id.trim();
     const nonce = optionalNonce(body);
@@ -308,7 +305,7 @@ export async function handleEntriesRoutes(
     if (auth instanceof Response) return auth;
 
     let body: { id?: string; to_version?: unknown; nonce?: unknown; group?: unknown };
-    try { body = await request.json(); } catch { return json({ ok: false, error: "Invalid JSON" }, 400); }
+    try { body = await request.json() as typeof body; } catch { return json({ ok: false, error: "Invalid JSON" }, 400); }
     // Reviewer MAJOR (server.ts's MCP undo had the same gap): a body naming both a single id and
     // a group is ambiguous about which write the caller wants; refused before any read.
     if (body.group !== undefined) return json({ ok: false, error: "Pass either id or group (POST /undo/group), not both." }, 400);
@@ -389,7 +386,7 @@ export async function handleEntriesRoutes(
     if (auth instanceof Response) return auth;
 
     let body: { group?: unknown; id?: unknown };
-    try { body = await request.json(); } catch { return json({ ok: false, error: "Invalid JSON" }, 400); }
+    try { body = await request.json() as typeof body; } catch { return json({ ok: false, error: "Invalid JSON" }, 400); }
     if (body.id !== undefined) return json({ ok: false, error: "Pass either id (POST /undo) or group, not both." }, 400);
     if (typeof body.group !== "string" || !body.group.trim()) return json({ ok: false, error: "group is required" }, 400);
 
@@ -400,14 +397,23 @@ export async function handleEntriesRoutes(
     return json({ ok: true, results: result.results, done: result.done, remaining: result.remaining, group: result.group });
   }
 
-  // GET /entry — one full row by id, for the dashboard graph view's tap-to-open
+  if (url.pathname === "/entry" && request.method === "GET") {
+    return new Response(JSON.stringify({ ok: false, error: "Use POST /entry with a JSON body" }), {
+      status: 405,
+      headers: { "Content-Type": "application/json", "Allow": "POST" },
+    });
+  }
+
+  // POST /entry — one full row by id, for the dashboard graph view's tap-to-open
   // (/graph ships 80-char labels only; fattening it with full content would bloat
   // every graph load to serve a per-tap need). Dashboard-only, no MCP twin.
-  if (url.pathname === "/entry" && request.method === "GET") {
+  if (url.pathname === "/entry" && request.method === "POST") {
     const auth = await requireIdentity(request, env);
     if (auth instanceof Response) return auth;
 
-    const id = url.searchParams.get("id")?.trim();
+    const parsed = await readJsonBody<{ id?: unknown }>(request, 8 * 1024);
+    if (!parsed.ok) return parsed.response;
+    const id = typeof parsed.value.id === "string" ? parsed.value.id.trim() : "";
     if (!id) return json({ ok: false, error: "id is required" }, 400);
 
     // Everything the brain knows about one memory, in the one row read it was
@@ -421,7 +427,7 @@ export async function handleEntriesRoutes(
     // scope-checked: the superseded_by subquery pins its closer `s` to entries.workspace_id — the outer row's own, already scoped by the caller's clause above
     const row = await env.DB.prepare(
       `SELECT id, content, tags, source, created_at, COALESCE(updated_at, created_at) AS last_updated,
-              importance_score, recall_count, contradiction_wins, contradiction_losses, vector_ids,
+              importance_score, recall_count, contradiction_wins, contradiction_losses, memory_tier, pinned, last_recalled_at, vector_ids,
               workspace_id, actor_id, when_at, when_kind, when_source, valid_from, valid_until,
               ${supersededBySql("entries")} AS superseded_by_json
        FROM entries WHERE id = ? AND ${scope.clause}`
@@ -473,6 +479,9 @@ export async function handleEntriesRoutes(
         recall_count: row.recall_count ?? 0,
         contradiction_wins: row.contradiction_wins ?? 0,
         contradiction_losses: row.contradiction_losses ?? 0,
+        memory_tier: row.memory_tier ?? "warm",
+        pinned: Number(row.pinned ?? 0) === 1,
+        last_recalled_at: row.last_recalled_at ?? null,
         // Whether recall can see it at all — the dashboard already surfaces
         // "not indexed" in lists, and the detail view should agree.
         indexed: Array.isArray(vectorIds) && vectorIds.length > 0,
@@ -500,21 +509,27 @@ export async function handleEntriesRoutes(
         }) === null,
         timeline,
         history,
+        legacyVersions: await listMemoryHistory(env, id, MEMORY_HISTORY_MAX_RESULTS, auth),
       },
     });
   }
 
-  // GET /entry/version — the full text, tags and status of one visible version, for the
-  // dashboard's "Show all" on a history row (contract 4.2, BE-8, T-0101.1.1).
+  // 履歴本文も記憶IDをURLへ載せず、JSON本文で取得する。
   if (url.pathname === "/entry/version" && request.method === "GET") {
+    return new Response(JSON.stringify({ ok: false, error: "Use POST /entry/version with a JSON body" }), {
+      status: 405, headers: { "Content-Type": "application/json", "Allow": "POST" },
+    });
+  }
+  if (url.pathname === "/entry/version" && request.method === "POST") {
     const auth = await requireIdentity(request, env);
     if (auth instanceof Response) return auth;
-
-    const id = url.searchParams.get("id")?.trim();
+    const parsed = await readJsonBody<{ id?: unknown; seq?: unknown }>(request, 8 * 1024);
+    if (!parsed.ok) return parsed.response;
+    if (!parsed.value || typeof parsed.value !== "object" || Array.isArray(parsed.value)) return json({ ok: false, error: "JSON本文はオブジェクトにしてください" }, 400);
+    const id = typeof parsed.value.id === "string" ? parsed.value.id.trim() : "";
     if (!id) return json({ ok: false, error: "id is required" }, 400);
-    const seqParam = url.searchParams.get("seq");
-    const seq = seqParam === null ? NaN : Number(seqParam);
-    if (!Number.isInteger(seq) || seq < 1) return json({ ok: false, error: "seq must be a positive integer" }, 400);
+    const seq = parsed.value.seq;
+    if (typeof seq !== "number" || !Number.isInteger(seq) || seq < 1) return json({ ok: false, error: "seq must be a positive integer" }, 400);
 
     const config = await resolveConfig(env);
     const result = await readEntryVersion(env, auth, id, seq, config);
@@ -544,7 +559,7 @@ export async function handleEntriesRoutes(
     if (auth instanceof Response) return auth;
 
     let body: { id?: string; workspace?: string; team?: unknown };
-    try { body = await request.json(); } catch { return json({ ok: false, error: "Invalid JSON" }, 400); }
+    try { body = await request.json() as typeof body; } catch { return json({ ok: false, error: "Invalid JSON" }, 400); }
     if (!body.id?.trim()) return json({ ok: false, error: "id is required" }, 400);
     if (body.workspace !== undefined && body.workspace !== "personal" && body.workspace !== "company") {
       return json({ ok: false, error: 'workspace must be "personal" or "company"' }, 400);
@@ -582,7 +597,7 @@ export async function handleEntriesRoutes(
     if (auth instanceof Response) return auth;
 
     let body: { id?: string; status?: string };
-    try { body = await request.json(); } catch { return json({ ok: false, error: "Invalid JSON" }, 400); }
+    try { body = await request.json() as typeof body; } catch { return json({ ok: false, error: "Invalid JSON" }, 400); }
     if (!body.id?.trim()) return json({ ok: false, error: "id is required" }, 400);
     if (!(STATUS_VALUES as readonly string[]).includes(body.status ?? "")) {
       return json({ ok: false, error: `status must be one of: ${STATUS_VALUES.join(", ")}` }, 400);
@@ -606,6 +621,56 @@ export async function handleEntriesRoutes(
 
     auditEvent(env, ctx, { id: result.eventId, entryId: id, actorId: auth.userId, event: "status_changed", payload: { status, channel: "rest" } });
     return json({ ok: true, id, status, indexed: result.indexed, validity: result.validity });
+  }
+
+  if (url.pathname === "/memory/tier" && request.method === "POST") {
+    const auth = await requireIdentity(request, env);
+    if (auth instanceof Response) return auth;
+    let body: { id?: unknown; tier?: unknown };
+    try { body = await request.json() as typeof body; } catch { return json({ ok: false, error: "Invalid JSON" }, 400); }
+    if (typeof body.id !== "string" || !body.id.trim()) {
+      return json({ ok: false, error: "id is required" }, 400);
+    }
+    if (!isMemoryTier(body.tier)) {
+      return json({ ok: false, error: `tier must be one of: ${MEMORY_TIERS.join(", ")}` }, 400);
+    }
+    const id = body.id.trim();
+    const row = await getReadableEntry(env, auth, id);
+    if (!row) return json({ ok: false, error: `No entry found with ID: ${id}` }, 404);
+    const denied = assertCanMutateEntry(auth, row);
+    if (denied) return json({ ok: false, error: denied.message }, 403);
+    if (!(await setMemoryTier(env, id, body.tier))) {
+      return json({ ok: false, error: `No entry found with ID: ${id}` }, 404);
+    }
+    return json({ ok: true, id, tier: body.tier });
+  }
+
+  if (url.pathname === "/memory/pin" && request.method === "POST") {
+    const auth = await requireIdentity(request, env);
+    if (auth instanceof Response) return auth;
+    let body: { id?: unknown; pinned?: unknown };
+    try { body = await request.json() as typeof body; } catch { return json({ ok: false, error: "Invalid JSON" }, 400); }
+    if (typeof body.id !== "string" || !body.id.trim()) {
+      return json({ ok: false, error: "id is required" }, 400);
+    }
+    if (typeof body.pinned !== "boolean") {
+      return json({ ok: false, error: "pinned must be a boolean" }, 400);
+    }
+    const id = body.id.trim();
+    const row = await getReadableEntry(env, auth, id);
+    if (!row) return json({ ok: false, error: `No entry found with ID: ${id}` }, 404);
+    const denied = assertCanMutateEntry(auth, row);
+    if (denied) return json({ ok: false, error: denied.message }, 403);
+    if (!(await setMemoryPinned(env, id, body.pinned))) {
+      return json({ ok: false, error: `No entry found with ID: ${id}` }, 404);
+    }
+    return json({ ok: true, id, pinned: body.pinned });
+  }
+
+  if (url.pathname === "/hot-context" && request.method === "GET") {
+    const auth = await requireIdentity(request, env);
+    if (auth instanceof Response) return auth;
+    return json({ ok: true, ...(await getHotContext(env, auth)) });
   }
 
   return null;

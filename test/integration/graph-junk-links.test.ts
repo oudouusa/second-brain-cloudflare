@@ -155,17 +155,17 @@ describe("junk-link suppression", () => {
     beforeEach(async () => {
       resetDatabaseInit();
       sqlite = makeSqliteD1();
-      env = makeTestEnv(undefined, {
+      env = sqlite.admitEnv(makeTestEnv(undefined, {
         DB: sqlite.db as unknown as Env["DB"],
         OAUTH_KV: makeMemoryKV(),
         // Any candidate at all: the point is which entries are OFFERED to
         // inference, not what the index returns for them.
-        VECTORIZE: {
+        VECTORIZE: makeVectorizeMock({
           query: async () => ({ matches: [{ id: "partner", score: 0.95, metadata: {} }] }),
           insert: async () => ({}), upsert: async () => ({}), deleteByIds: async () => ({}),
           getByIds: async () => [],
-        } as any,
-      });
+        } as any),
+      }));
       await initializeDatabase(env);
     });
 
@@ -186,14 +186,14 @@ describe("junk-link suppression", () => {
       const t = Date.now();
       sqlite.seed({ id: "first", content: "the earlier thought", createdAt: t - 5 * 60_000, tags: ["kind:episodic"] });
       sqlite.seed({ id: "second", content: "the thought that follows", createdAt: t, tags: ["kind:episodic"] });
-      const pairEnv = makeTestEnv(undefined, {
+      const pairEnv = sqlite.admitEnv(makeTestEnv(undefined, {
         DB: sqlite.db as unknown as Env["DB"],
         OAUTH_KV: makeMemoryKV(),
-        VECTORIZE: {
+        VECTORIZE: makeVectorizeMock({
           query: async () => ({ matches: [{ id: "first", score: 0.9, metadata: { parentId: "first" } }] }),
           insert: async () => ({}), upsert: async () => ({}), deleteByIds: async () => ({}), getByIds: async () => [],
-        } as any,
-      });
+        } as any),
+      }));
 
       await runGraphPass(pairEnv, passCtx);
 
@@ -243,14 +243,14 @@ describe("junk-link suppression", () => {
     beforeEach(async () => {
       resetDatabaseInit();
       sqlite = makeSqliteD1();
-      env = makeTestEnv(undefined, {
+      env = sqlite.admitEnv(makeTestEnv(undefined, {
         DB: sqlite.db as unknown as Env["DB"],
         OAUTH_KV: makeMemoryKV(),
-        VECTORIZE: {
+        VECTORIZE: makeVectorizeMock({
           query: async () => ({ matches: [] }),
           insert: async () => ({}), upsert: async () => ({}), deleteByIds: async () => ({}), getByIds: async () => [],
-        } as any,
-      });
+        } as any),
+      }));
       await initializeDatabase(env);
     });
 
@@ -264,11 +264,18 @@ describe("junk-link suppression", () => {
     const MONDAY = Date.UTC(2026, 0, 5, 1, 0, 0);
     const onDay = (t: number) => vi.spyOn(Date, "now").mockReturnValue(t);
 
-    function edge(id: string, source: string, target: string, provenance: string): void {
-      sqlite.db.prepare(
+    async function edge(id: string, source: string, target: string, provenance: string): Promise<void> {
+      // Historical-corruption fixture only: production rejects missing endpoints.
+      const guard: any = await sqlite.db.prepare("SELECT sql FROM sqlite_master WHERE name = 'trg_edges_endpoint_guard_v1'").first();
+      await sqlite.db.exec("DROP TRIGGER trg_edges_endpoint_guard_v1");
+      try {
+      await sqlite.db.prepare(
         `INSERT INTO edges (id, source_id, target_id, type, weight, provenance, metadata, created_at, updated_at, workspace_id)
-         VALUES (?, ?, ?, 'relates_to', 0.9, ?, '{}', 0, 0, '')`,
+         VALUES (?, ?, ?, 'relates_to', 0.9, ?, '{"inference_policy":"embeddinggemma-mrl128-v2"}', 0, 0, '')`,
       ).bind(id, source, target, provenance).run();
+      } finally {
+        await sqlite.db.exec(guard.sql);
+      }
     }
 
     const remaining = async (): Promise<string[]> =>
@@ -295,14 +302,14 @@ describe("junk-link suppression", () => {
      */
     it("does not recreate an edge to a vector whose entry is gone, run after run", async () => {
       sqlite.seed({ id: "alive", content: "an entry whose neighbour vector is stale", createdAt: 1000 });
-      const ghostEnv = makeTestEnv(undefined, {
+      const ghostEnv = sqlite.admitEnv(makeTestEnv(undefined, {
         DB: sqlite.db as unknown as Env["DB"],
         OAUTH_KV: makeMemoryKV(),
-        VECTORIZE: {
+        VECTORIZE: makeVectorizeMock({
           query: async () => ({ matches: [{ id: "ghost", score: 0.9, metadata: { parentId: "ghost" } }] }),
           insert: async () => ({}), upsert: async () => ({}), deleteByIds: async () => ({}), getByIds: async () => [],
-        } as any,
-      });
+        } as any),
+      }));
 
       await runGraphPass(ghostEnv, passCtx);
       const afterFirst = await remaining();
@@ -332,7 +339,7 @@ describe("junk-link suppression", () => {
     it("does not sweep on other days of the week", async () => {
       onDay(MONDAY);
       sqlite.seed({ id: "alive", content: "still here", createdAt: 1000 });
-      edge("dead-target", "alive", "forgotten", "inferred");
+      await edge("dead-target", "alive", "forgotten", "inferred");
 
       await runGraphPass(env, passCtx);
 
@@ -342,7 +349,7 @@ describe("junk-link suppression", () => {
     it("drops an inferred edge whose target no longer exists", async () => {
       onDay(SUNDAY);
       sqlite.seed({ id: "alive", content: "still here", createdAt: 1000 });
-      edge("dead-target", "alive", "forgotten", "inferred");
+      await edge("dead-target", "alive", "forgotten", "inferred");
 
       await runGraphPass(env, passCtx);
 
@@ -352,7 +359,7 @@ describe("junk-link suppression", () => {
     it("drops an inferred edge whose source no longer exists", async () => {
       onDay(SUNDAY);
       sqlite.seed({ id: "alive", content: "still here", createdAt: 1000 });
-      edge("dead-source", "forgotten", "alive", "inferred");
+      await edge("dead-source", "forgotten", "alive", "inferred");
 
       await runGraphPass(env, passCtx);
 
@@ -362,7 +369,7 @@ describe("junk-link suppression", () => {
     it("keeps a dangling edge the user drew themselves", async () => {
       onDay(SUNDAY);
       sqlite.seed({ id: "alive", content: "still here", createdAt: 1000 });
-      edge("mine", "alive", "forgotten", "explicit");
+      await edge("mine", "alive", "forgotten", "explicit");
 
       await runGraphPass(env, passCtx);
 
@@ -373,7 +380,7 @@ describe("junk-link suppression", () => {
       onDay(SUNDAY);
       sqlite.seed({ id: "one", content: "a", createdAt: 1000 });
       sqlite.seed({ id: "two", content: "b", createdAt: 1001 });
-      edge("healthy", "one", "two", "inferred");
+      await edge("healthy", "one", "two", "inferred");
 
       await runGraphPass(env, passCtx);
 

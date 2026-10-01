@@ -1,5 +1,11 @@
 import type { Env } from "../env";
 import { FTS_BACKFILL_CURSOR_KV_KEY, FTS_READY_KV_KEY, VERSIONS_SINCE_KV_KEY } from "../constants";
+import {
+  INSIGHT_CANDIDATE_COLUMNS, MIGRATION_CONTROL_COLUMNS, OBSOLETE_WRITE_FENCE_TRIGGERS,
+  RESTORE_STATE_COLUMNS, VECTOR_CLEANUP_COLUMNS, WRITE_ADMISSION_COLUMNS,
+  WRITE_FENCE_TRIGGERS, WRITE_PROTECTION_TABLES_AFTER_OAUTH,
+  WRITE_PROTECTION_TABLES_BEFORE_OAUTH,
+} from "./write-protection-schema";
 
 // The schema work below is idempotent but not free. All four nightly jobs run inside a
 // single scheduled() invocation and therefore share one subrequest budget, and each of
@@ -10,33 +16,85 @@ import { FTS_BACKFILL_CURSOR_KV_KEY, FTS_READY_KV_KEY, VERSIONS_SINCE_KV_KEY } f
 // Deliberately not routed through ensureDbReady (src/runtime/state.ts) — that fires under
 // ctx.waitUntil *without* awaiting, and the nightly jobs must not begin querying before
 // the schema exists. They await this directly and must keep doing so.
-let initPromise: Promise<void> | null = null;
+export interface DatabaseInitResult {
+  /** True when this invocation issued schema DDL and must not continue a D1-heavy job. */
+  changed: boolean;
+  /** Internal signal: the FTS creation is retried after KV recovers. */
+  ftsDeferred?: boolean;
+}
 
-export async function initializeDatabase(env: Env): Promise<void> {
-  if (!initPromise) {
-    initPromise = applySchema(env).then(
-      (ftsDeferred) => {
-        // The memo keys on FULLY DONE, not on completion. FTS creation can
-        // defer non-fatally (a populated brain whose ready-flag/cursor
-        // invalidation KV calls failed — see applySchema) — the request
-        // this call is part of must still proceed (auth, saves, and every
-        // other awaited caller), so this resolves either way. But a
-        // deferred pass is not memoized as done, or a populated brain stuck
-        // behind a KV outage would go without FTS forever, even after KV
-        // recovers, because no later call would ever retry the creation.
-        if (ftsDeferred) initPromise = null;
-      },
-      (e) => {
-        // The memo keys on SUCCESS, not on completion. Clearing it here is what makes a
-        // failed or half-applied schema retryable: latching a resolved promise would leave
-        // every later caller in this isolate doing nothing against a database that was
-        // never migrated. Before memoisation each nightly job re-ran the DDL and repaired
-        // the previous one's transient failure; this preserves that.
-        initPromise = null;
-        throw e;
-      },
-    );
+// Bump whenever SCHEMA_OBJECTS, a column migration, or a trigger generation changes.
+// A deployed brain pays one single-row read per cold isolate and only runs the catalogue
+// probe when this version is absent or stale.
+export const DATABASE_SCHEMA_VERSION = 9;
+
+let initPromise: Promise<DatabaseInitResult> | null = null;
+
+async function readSchemaVersion(env: Env): Promise<number | null> {
+  try {
+    const { results } = await env.DB.prepare(
+      `SELECT version, (SELECT json_group_object(name, sql) FROM sqlite_master
+        WHERE name IN ('idx_entries_capsule', 'prompt_capsule_entry_insert',
+          'prompt_capsule_entry_update', 'prompt_capsule_entry_delete',
+          'prompt_capsule_workspace_delete')) AS capsule_definitions
+       FROM schema_meta WHERE id = 'current'`,
+    ).all<{ version: number; capsule_definitions: string }>();
+    const row = results[0];
+    if (row?.version === DATABASE_SCHEMA_VERSION) {
+      const definitions = JSON.parse(row.capsule_definitions) as Record<string, string>;
+      const normalize = (sql: string) => sql.replace(/IF NOT EXISTS\s+/i, "")
+        .replace(/;\s*$/, "").match(/'(?:''|[^'])*'|"(?:""|[^"])*"|[a-zA-Z_]\w*|\d+|[^\s]/g)?.join(" ") ?? "";
+      for (const [name, ddl] of Object.entries(POST_COLUMN_OBJECTS)) {
+        if (name !== "idx_entries_capsule" && !name.startsWith("prompt_capsule_")) continue;
+        if (normalize(definitions[name] ?? "") !== normalize(ddl)) return null;
+      }
+    }
+    return typeof row?.version === "number" ? row.version : null;
+  } catch (error) {
+    // This is the expected one-time upgrade path for every existing installation.
+    if (/no such table(?::|\s).*schema_meta/i.test(String((error as { message?: string })?.message ?? error))) {
+      return null;
+    }
+    throw error;
   }
+}
+
+async function initializeDatabaseOnce(env: Env): Promise<DatabaseInitResult> {
+  const version = await readSchemaVersion(env);
+  if (version === DATABASE_SCHEMA_VERSION) return { changed: false };
+  if (version !== null && version > DATABASE_SCHEMA_VERSION) {
+    throw new Error(`Database schema version ${version} is newer than this Worker supports`);
+  }
+
+  const applied = await applySchema(env);
+  if (applied.ftsDeferred) return { changed: applied.changed, ftsDeferred: true };
+  await env.DB.prepare(
+    `INSERT INTO schema_meta (id, version, applied_at)
+     VALUES ('current', ?, ?)
+     ON CONFLICT(id) DO UPDATE SET version = excluded.version, applied_at = excluded.applied_at`,
+  ).bind(DATABASE_SCHEMA_VERSION, Date.now()).run();
+  return { changed: true };
+}
+
+export async function initializeDatabase(env: Env): Promise<DatabaseInitResult> {
+  if (initPromise) {
+    await initPromise;
+    return { changed: false };
+  }
+  initPromise = initializeDatabaseOnce(env).then((result) => {
+    // A populated brain can defer FTS creation while KV invalidation is
+    // unavailable. The version stays old, so a later request must retry.
+    if (result.ftsDeferred) initPromise = null;
+    return result;
+  }).catch((e) => {
+      // The memo keys on SUCCESS, not on completion. Clearing it here is what makes a
+      // failed or half-applied schema retryable: latching a resolved promise would leave
+      // every later caller in this isolate doing nothing against a database that was
+      // never migrated. Before memoisation each nightly job re-ran the DDL and repaired
+      // the previous one's transient failure; this preserves that.
+      initPromise = null;
+      throw e;
+  });
   return initPromise;
 }
 
@@ -116,15 +174,17 @@ export const ENTRY_COUNTS_DELETE_TRIGGER_DDL = `CREATE TRIGGER IF NOT EXISTS ent
  * Declaration order is apply order: a table has to exist before its indexes and triggers.
  */
 const SCHEMA_OBJECTS: Record<string, string> = {
-  entries: `CREATE TABLE IF NOT EXISTS entries (id TEXT PRIMARY KEY, content TEXT NOT NULL, tags TEXT NOT NULL DEFAULT '[]', source TEXT NOT NULL DEFAULT 'api', created_at INTEGER NOT NULL, vector_ids TEXT NOT NULL DEFAULT '[]', workspace_id TEXT NOT NULL DEFAULT '', actor_id TEXT NOT NULL DEFAULT '')`,
+  schema_meta: `CREATE TABLE IF NOT EXISTS schema_meta (id TEXT PRIMARY KEY, version INTEGER NOT NULL, applied_at INTEGER NOT NULL)`,
+  entries: `CREATE TABLE IF NOT EXISTS entries (id TEXT PRIMARY KEY, content TEXT NOT NULL, tags TEXT NOT NULL DEFAULT '[]', source TEXT NOT NULL DEFAULT 'api', created_at INTEGER NOT NULL, vector_ids TEXT NOT NULL DEFAULT '[]', recall_count INTEGER DEFAULT 0, importance_score INTEGER DEFAULT 0, contradiction_wins INTEGER DEFAULT 0, contradiction_losses INTEGER DEFAULT 0, updated_at INTEGER, staleness_checked_at INTEGER, memory_tier TEXT DEFAULT 'warm', pinned INTEGER DEFAULT 0, last_recalled_at INTEGER, restore_lease_owner TEXT, migration_lease_owner TEXT, write_marker TEXT, workspace_id TEXT NOT NULL DEFAULT '', actor_id TEXT NOT NULL DEFAULT '', pending_append_passages TEXT NOT NULL DEFAULT '[]', when_at INTEGER, when_kind TEXT, when_source TEXT, when_label TEXT, valid_from INTEGER, valid_until INTEGER)`,
   idx_entries_created_at: `CREATE INDEX IF NOT EXISTS idx_entries_created_at ON entries(created_at DESC)`,
   idx_entries_source: `CREATE INDEX IF NOT EXISTS idx_entries_source ON entries(source)`,
   // Relationship graph (issue #16). One additive table — never touches existing
   // rows/queries, so old code ignores it and rollback is a no-op. Designed to never
   // need an ALTER: type/provenance are free TEXT validated in code, and metadata is
   // a JSON escape-hatch for any future per-edge attribute.
-  edges: `CREATE TABLE IF NOT EXISTS edges (id TEXT PRIMARY KEY, source_id TEXT NOT NULL, target_id TEXT NOT NULL, type TEXT NOT NULL DEFAULT 'relates_to', weight REAL NOT NULL DEFAULT 0.5, provenance TEXT NOT NULL DEFAULT 'inferred', metadata TEXT NOT NULL DEFAULT '{}', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, workspace_id TEXT NOT NULL DEFAULT '', UNIQUE(source_id, target_id, type))`,
-  idx_edges_source: `CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source_id)`,
+  edges: `CREATE TABLE IF NOT EXISTS edges (id TEXT PRIMARY KEY, source_id TEXT NOT NULL, target_id TEXT NOT NULL, type TEXT NOT NULL DEFAULT 'relates_to', weight REAL NOT NULL DEFAULT 0.5, provenance TEXT NOT NULL DEFAULT 'inferred', metadata TEXT NOT NULL DEFAULT '{}', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, restore_lease_owner TEXT, write_marker TEXT, workspace_id TEXT NOT NULL DEFAULT '', UNIQUE(source_id, target_id, type))`,
+  // UNIQUE(source_id, target_id, type) already creates an index whose leading column is
+  // source_id, so a second source-only index would duplicate both reads and write cost.
   idx_edges_target: `CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_id)`,
   // The graph view picks the strongest edges (ORDER BY weight DESC LIMIT n). Without an
   // ordered path to weight SQLite reads the whole table into a temp b-tree and applies the
@@ -164,40 +224,24 @@ const SCHEMA_OBJECTS: Record<string, string> = {
   // what makes a pair enter once rather than twice in opposite orders. Together
   // with the `rejected` status it is also the dedupe: a candidate the model has
   // already declined is never re-proposed, and never paid for twice.
-  insight_candidates: `CREATE TABLE IF NOT EXISTS insight_candidates (id TEXT PRIMARY KEY, a_id TEXT NOT NULL, b_id TEXT NOT NULL, similarity REAL NOT NULL, gap_ms INTEGER NOT NULL, score REAL NOT NULL, signal TEXT NOT NULL DEFAULT 'vector', status TEXT NOT NULL DEFAULT 'pending', created_at INTEGER NOT NULL, UNIQUE(a_id, b_id))`,
+  insight_candidates: `CREATE TABLE IF NOT EXISTS insight_candidates (id TEXT PRIMARY KEY, a_id TEXT NOT NULL, b_id TEXT NOT NULL, similarity REAL NOT NULL, gap_ms INTEGER NOT NULL, score REAL NOT NULL, signal TEXT NOT NULL DEFAULT 'vector', status TEXT NOT NULL DEFAULT 'pending', created_at INTEGER NOT NULL, write_marker TEXT, UNIQUE(a_id, b_id))`,
   // The weekly read is `WHERE status='pending' ORDER BY score DESC LIMIT n`.
   // Without an ordered path to score SQLite builds a temp b-tree over the whole
   // table before applying the LIMIT, the same shape idx_edges_weight exists to
   // avoid on the graph read path.
   idx_insight_candidates_queue: `CREATE INDEX IF NOT EXISTS idx_insight_candidates_queue ON insight_candidates(status, score DESC)`,
-  // Team edition tenancy (v3). Additive: single-user brains never read these and
-  // rollback is a no-op.
   workspaces: `CREATE TABLE IF NOT EXISTS workspaces (id TEXT PRIMARY KEY, kind TEXT NOT NULL DEFAULT 'personal', name TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL)`,
   prompt_capsule_revisions: `CREATE TABLE IF NOT EXISTS prompt_capsule_revisions (workspace_id TEXT PRIMARY KEY, revision TEXT NOT NULL)`,
   idx_workspaces_kind: `CREATE INDEX IF NOT EXISTS idx_workspaces_kind ON workspaces(kind)`,
-  users: `CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, name TEXT NOT NULL DEFAULT '', email TEXT, role TEXT NOT NULL DEFAULT 'member', token_hash TEXT NOT NULL, suspended INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL)`,
-  // Token lookup is the hottest new read (every request resolves identity); UNIQUE
-  // gives it the index for free.
-  idx_users_token_hash: `CREATE UNIQUE INDEX IF NOT EXISTS idx_users_token_hash ON users(token_hash)`,
+  // The inline token constraint supplies the lookup index too; a separate named UNIQUE
+  // index would be redundant. Existing brains may harmlessly retain the old named copy.
+  users: `CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, name TEXT NOT NULL DEFAULT '', email TEXT, role TEXT NOT NULL DEFAULT 'member', token_hash TEXT NOT NULL UNIQUE, suspended INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, default_share TEXT NOT NULL DEFAULT '', removed_at INTEGER, last_used_at INTEGER)`,
   memberships: `CREATE TABLE IF NOT EXISTS memberships (user_id TEXT NOT NULL, workspace_id TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'member', created_at INTEGER NOT NULL, PRIMARY KEY (user_id, workspace_id))`,
   // listTeamWorkspaces (GET /team/roster) joins memberships on workspace_id; the
   // composite PK only serves user_id-first lookups.
   idx_memberships_workspace: `CREATE INDEX IF NOT EXISTS idx_memberships_workspace ON memberships(workspace_id)`,
   entry_events: `CREATE TABLE IF NOT EXISTS entry_events (id TEXT PRIMARY KEY, entry_id TEXT NOT NULL, actor_id TEXT NOT NULL DEFAULT '', event TEXT NOT NULL, payload TEXT NOT NULL DEFAULT '{}', created_at INTEGER NOT NULL)`,
   idx_entry_events_entry: `CREATE INDEX IF NOT EXISTS idx_entry_events_entry ON entry_events(entry_id, created_at DESC)`,
-  // The compliance feed (GET /team/activity) reads this table the other way
-  // round: the whole trail ordered by created_at, with no entry_id to give the
-  // index above a leading column to seek on. Without this, SQLite scans
-  // entry_events and builds a temp b-tree over all of it to return fifty rows —
-  // measured at 200k events on real SQLite, 40ms and a full sort against 3ms
-  // and a last-term sort. entry_events is the busiest table in the schema
-  // (a row per capture, edit, append, delete and status change), so this is the
-  // one audit table where the scan actually grows. admin_events has carried the
-  // same index since it shipped; this is the pair completing.
-  //
-  // In SCHEMA_OBJECTS rather than POST_COLUMN_OBJECTS deliberately: created_at
-  // is in entry_events' original CREATE, so it is present on every brain that
-  // has the table at all and there is no ALTER to sequence behind.
   idx_entry_events_created: `CREATE INDEX IF NOT EXISTS idx_entry_events_created ON entry_events(created_at DESC)`,
   // Cloud re-review MINOR (T-0102, on top of 0b970baa's R22 fix): brief/changes.ts's raw scan of
   // this table is capped BEFORE any workspace/visibility filter can run (no workspace column to
@@ -221,11 +265,13 @@ const SCHEMA_OBJECTS: Record<string, string> = {
   // application code only ever INSERTs here. Consumed by Phase 4.2.
   admin_events: `CREATE TABLE IF NOT EXISTS admin_events (id TEXT PRIMARY KEY, actor_id TEXT NOT NULL DEFAULT '', target_user_id TEXT NOT NULL DEFAULT '', workspace_id TEXT NOT NULL DEFAULT '', event TEXT NOT NULL, payload TEXT NOT NULL DEFAULT '{}', created_at INTEGER NOT NULL)`,
   idx_admin_events_created: `CREATE INDEX IF NOT EXISTS idx_admin_events_created ON admin_events(created_at DESC)`,
-  // Single-row table driving the nightly round-robin over workspaces.
   maintenance_cursor: `CREATE TABLE IF NOT EXISTS maintenance_cursor (id INTEGER PRIMARY KEY CHECK (id = 1), workspace_id TEXT NOT NULL DEFAULT '', advanced_at INTEGER NOT NULL DEFAULT 0)`,
-  // Project registry. Additive: membership lives in entries.tags as project:<slug>, so old
-  // code ignores this table and rollback is a no-op. Never backfilled.
-  projects: `CREATE TABLE IF NOT EXISTS projects (id TEXT NOT NULL, workspace_id TEXT NOT NULL, name TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', aliases TEXT NOT NULL DEFAULT '[]', status TEXT NOT NULL DEFAULT 'active', created_at INTEGER NOT NULL, updated_at INTEGER, PRIMARY KEY (workspace_id, id))`,
+  ...WRITE_PROTECTION_TABLES_BEFORE_OAUTH,
+  oauth_registration_quota: `CREATE TABLE IF NOT EXISTS oauth_registration_quota (id TEXT PRIMARY KEY, window_start INTEGER NOT NULL, registration_count INTEGER NOT NULL)`,
+  ...WRITE_PROTECTION_TABLES_AFTER_OAUTH,
+  // Projectsは追加schema。membershipはentries.tagsに保持し、既存記憶のbackfillはしない。
+  // schema version 6への更新後は旧Workerへの単純なdowngradeを許可しない。
+  projects: `CREATE TABLE IF NOT EXISTS projects (id TEXT NOT NULL, workspace_id TEXT NOT NULL, name TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', aliases TEXT NOT NULL DEFAULT '[]', status TEXT NOT NULL DEFAULT 'active', created_at INTEGER NOT NULL, updated_at INTEGER, restore_lease_owner TEXT, write_marker TEXT, PRIMARY KEY (workspace_id, id))`,
   idx_projects_workspace: `CREATE INDEX IF NOT EXISTS idx_projects_workspace ON projects(workspace_id, status)`,
   // Web Push subscriptions. Additive, like projects above: old code never
   // reads this table and rollback is a no-op. One row per subscribed
@@ -236,13 +282,13 @@ const SCHEMA_OBJECTS: Record<string, string> = {
   // Sampled recall log (T-0089.5.2 Part A). Additive, like push_subscriptions above: old
   // code never reads this table and rollback is a no-op. Opt-in and sampled, so a brain
   // that never turns RECALL_LOG on never writes a row here.
-  recall_log: `CREATE TABLE IF NOT EXISTS recall_log (id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, created_at INTEGER NOT NULL, channel TEXT NOT NULL, query TEXT NOT NULL, params TEXT NOT NULL, returned_ids TEXT NOT NULL, followed_ids TEXT NOT NULL DEFAULT '[]')`,
+  recall_log: `CREATE TABLE IF NOT EXISTS recall_log (id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, created_at INTEGER NOT NULL, channel TEXT NOT NULL, query TEXT NOT NULL, params TEXT NOT NULL, returned_ids TEXT NOT NULL, followed_ids TEXT NOT NULL DEFAULT '[]', write_marker TEXT, restore_lease_owner TEXT)`,
   idx_recall_log_ws: `CREATE INDEX IF NOT EXISTS idx_recall_log_ws ON recall_log(workspace_id, created_at DESC)`,
   // Content history and soft delete (4.0). Additive: old code never reads either table,
   // so rollback is a no-op. Never backfilled.
-  entry_versions: `CREATE TABLE IF NOT EXISTS entry_versions (id INTEGER PRIMARY KEY, entry_id TEXT NOT NULL, workspace_id TEXT NOT NULL DEFAULT '', seq INTEGER NOT NULL, content TEXT, prior_length INTEGER, prior_length_utf16 INTEGER, tags TEXT NOT NULL, state TEXT NOT NULL DEFAULT '{}', actor_id TEXT NOT NULL DEFAULT '', channel TEXT NOT NULL DEFAULT '', reason TEXT NOT NULL, meta TEXT NOT NULL DEFAULT '{}', valid_from INTEGER, created_at INTEGER NOT NULL, CHECK ((content IS NULL) <> (prior_length IS NULL)), CHECK (prior_length_utf16 IS NULL OR prior_length IS NOT NULL))`,
+  entry_versions: `CREATE TABLE IF NOT EXISTS entry_versions (id INTEGER PRIMARY KEY, entry_id TEXT NOT NULL, workspace_id TEXT NOT NULL DEFAULT '', seq INTEGER NOT NULL, content TEXT, prior_length INTEGER, prior_length_utf16 INTEGER, tags TEXT NOT NULL, state TEXT NOT NULL DEFAULT '{}', actor_id TEXT NOT NULL DEFAULT '', channel TEXT NOT NULL DEFAULT '', reason TEXT NOT NULL, meta TEXT NOT NULL DEFAULT '{}', valid_from INTEGER, created_at INTEGER NOT NULL, write_marker TEXT, restore_lease_owner TEXT, CHECK ((content IS NULL) <> (prior_length IS NULL)), CHECK (prior_length_utf16 IS NULL OR prior_length IS NOT NULL))`,
   idx_entry_versions_entry: `CREATE UNIQUE INDEX IF NOT EXISTS idx_entry_versions_entry ON entry_versions(entry_id, seq)`,
-  entries_trash: `CREATE TABLE IF NOT EXISTS entries_trash (id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL DEFAULT '', actor_id TEXT NOT NULL DEFAULT '', content TEXT NOT NULL, row_json TEXT NOT NULL, edges_json TEXT NOT NULL DEFAULT '[]', vector_ids TEXT NOT NULL DEFAULT '[]', deleted_at INTEGER NOT NULL, deleted_by TEXT NOT NULL DEFAULT '', channel TEXT NOT NULL DEFAULT '', reason TEXT NOT NULL DEFAULT 'forget', nonce TEXT NOT NULL DEFAULT '')`,
+  entries_trash: `CREATE TABLE IF NOT EXISTS entries_trash (id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL DEFAULT '', actor_id TEXT NOT NULL DEFAULT '', content TEXT NOT NULL, row_json TEXT NOT NULL, edges_json TEXT NOT NULL DEFAULT '[]', vector_ids TEXT NOT NULL DEFAULT '[]', deleted_at INTEGER NOT NULL, deleted_by TEXT NOT NULL DEFAULT '', channel TEXT NOT NULL DEFAULT '', reason TEXT NOT NULL DEFAULT 'forget', nonce TEXT NOT NULL DEFAULT '', write_marker TEXT, restore_lease_owner TEXT)`,
   idx_entries_trash_deleted: `CREATE INDEX IF NOT EXISTS idx_entries_trash_deleted ON entries_trash(deleted_at)`,
   // R5 (budget audit, MINOR): listTrash scopes by workspace_id and orders by deleted_at DESC;
   // without this, SQLite's only path is the deleted_at index above, so it walks the whole trash
@@ -280,14 +326,23 @@ const ENTRIES_COLUMNS: Record<string, string> = {
   // test/unit/updated-at-coalesced.test.ts fails if any reader stops coalescing.
   updated_at: `ALTER TABLE entries ADD COLUMN updated_at INTEGER`,
   staleness_checked_at: `ALTER TABLE entries ADD COLUMN staleness_checked_at INTEGER`,
-  // Tenancy (v3). Defaults are the legacy single-owner semantics: '' reads as
-  // "the owner's own rows" so a brain that has not been team-enabled behaves
-  // identically before and after this column exists. The one-time backfill to
-  // real workspace ids happens in ensureTenantBootstrap (src/lib/tenancy.ts),
-  // not here — deliberately, because it rewrites every row and belongs behind
-  // an explicit, memoised bootstrap rather than on the migration path.
+  memory_tier: `ALTER TABLE entries ADD COLUMN memory_tier TEXT DEFAULT 'warm'`,
+  pinned: `ALTER TABLE entries ADD COLUMN pinned INTEGER DEFAULT 0`,
+  last_recalled_at: `ALTER TABLE entries ADD COLUMN last_recalled_at INTEGER`,
+  // Internal restore fencing token. It is never exported and ordinary writers leave it
+  // NULL; a restore INSERT must present the current D1 lease owner.
+  restore_lease_owner: `ALTER TABLE entries ADD COLUMN restore_lease_owner TEXT`,
+  // Presented only by the authenticated owner running the final embedding delta.
+  migration_lease_owner: `ALTER TABLE entries ADD COLUMN migration_lease_owner TEXT`,
+  // Every ordinary source or derived write presents a live admission capability here.
+  // Nullable keeps the upgrade additive; triggers require it once the epoch is active.
+  write_marker: `ALTER TABLE entries ADD COLUMN write_marker TEXT`,
   workspace_id: `ALTER TABLE entries ADD COLUMN workspace_id TEXT NOT NULL DEFAULT ''`,
   actor_id: `ALTER TABLE entries ADD COLUMN actor_id TEXT NOT NULL DEFAULT ''`,
+  // Derived, resumable semantic work. The authoritative appended text is committed to
+  // content in the same row; this bounded JSON passage lets recovery index only the
+  // addition after a Workers AI quota or Vectorize outage.
+  pending_append_passages: `ALTER TABLE entries ADD COLUMN pending_append_passages TEXT NOT NULL DEFAULT '[]'`,
   // The time-anchor primitive. Same nullable, never-backfilled shape as updated_at
   // above: most rows have no "when" at all, and NULL already reads that way to
   // every consumer. when_at is epoch ms; when_kind is 'due' | 'event' | 'wake';
@@ -309,55 +364,19 @@ const ENTRIES_COLUMNS: Record<string, string> = {
   valid_until: `ALTER TABLE entries ADD COLUMN valid_until INTEGER`,
 };
 
-/**
- * Columns added to `edges` after the table shipped. Same shape and reasoning as
- * ENTRIES_COLUMNS; kept separate because the two tables migrate independently.
- */
+/** Edge columns added after the graph table shipped. */
 const EDGES_COLUMNS: Record<string, string> = {
-  // Denormalized from the source entry at write time so graph walks can scope by
-  // workspace without joining back to entries mid-traversal.
+  restore_lease_owner: `ALTER TABLE edges ADD COLUMN restore_lease_owner TEXT`,
+  write_marker: `ALTER TABLE edges ADD COLUMN write_marker TEXT`,
   workspace_id: `ALTER TABLE edges ADD COLUMN workspace_id TEXT NOT NULL DEFAULT ''`,
 };
 
-/**
- * Columns added to `users` after the table shipped.
- */
 const USERS_COLUMNS: Record<string, string> = {
-  // Per-member capture-visibility override. '' inherits the org-level
-  // TEAM_DEFAULT_WORKSPACE config; "personal" and "company" pin the member.
   default_share: `ALTER TABLE users ADD COLUMN default_share TEXT NOT NULL DEFAULT ''`,
-  // Soft offboarding timestamp. Identity and actor-label lookups ignore rows
-  // where this is set; company entries keep actor_id as history.
   removed_at: `ALTER TABLE users ADD COLUMN removed_at INTEGER`,
-  // When this member's token last resolved an identity, throttled to at most one
-  // write per user per hour (see LAST_USED_THROTTLE_MS in src/lib/identity.ts).
-  // Nullable and deliberately NOT backfilled, for the same reason as updated_at
-  // above: there is no value to backfill it TO. "Never seen since the column
-  // shipped" and "seen at some unknown time before it shipped" are the same fact
-  // to every reader, and inventing a timestamp would cost one row written per
-  // user to make the roster say something untrue. NULL renders as "Never used".
   last_used_at: `ALTER TABLE users ADD COLUMN last_used_at INTEGER`,
 };
 
-/**
- * Columns added to `admin_events` after the table shipped.
- *
- * The trail shipped as (id, actor_id, event, payload, created_at) and gained its two
- * subject columns a release later, so a brain that wrote a single administration event
- * before that release has the narrow table and never gets the wide one from the
- * `CREATE TABLE IF NOT EXISTS` above. Nothing surfaces that on its own: adminAuditEvent
- * (src/lib/admin-audit.ts) binds all seven columns under ctx.waitUntil and ends in
- * .catch(console.error) by contract — an audit write must never fail the administration
- * action it records — so on such a brain every INSERT fails silently and the trail simply
- * stops. The two parity tests cannot see it either; they compare db/schema.sql with this
- * file, and those agree. test/unit/schema-upgrade-completeness.test.ts is the guard that
- * can: it asks what an EXISTING database ends up with, per table.
- *
- * '' rather than NULL matches the writer, which sends '' for an event with no target
- * user (team_renamed) or no workspace (member_created), and matches what the ALTER
- * itself writes into the rows already in the trail — so an old row and a new one with
- * no subject read identically. No backfill: '' is already the right value everywhere.
- */
 const ADMIN_EVENTS_COLUMNS: Record<string, string> = {
   target_user_id: `ALTER TABLE admin_events ADD COLUMN target_user_id TEXT NOT NULL DEFAULT ''`,
   workspace_id: `ALTER TABLE admin_events ADD COLUMN workspace_id TEXT NOT NULL DEFAULT ''`,
@@ -372,6 +391,8 @@ const ADMIN_EVENTS_COLUMNS: Record<string, string> = {
  * for those — NULL is a valid, already-handled value, not a gap to backfill.
  */
 const ENTRY_VERSIONS_COLUMNS: Record<string, string> = {
+  write_marker: `ALTER TABLE entry_versions ADD COLUMN write_marker TEXT`,
+  restore_lease_owner: `ALTER TABLE entry_versions ADD COLUMN restore_lease_owner TEXT`,
   prior_length_utf16: `ALTER TABLE entry_versions ADD COLUMN prior_length_utf16 INTEGER`,
 };
 
@@ -385,6 +406,8 @@ const ENTRY_VERSIONS_COLUMNS: Record<string, string> = {
  * silently trusted the way id or rowid alone were.
  */
 const ENTRIES_TRASH_COLUMNS: Record<string, string> = {
+  write_marker: `ALTER TABLE entries_trash ADD COLUMN write_marker TEXT`,
+  restore_lease_owner: `ALTER TABLE entries_trash ADD COLUMN restore_lease_owner TEXT`,
   nonce: `ALTER TABLE entries_trash ADD COLUMN nonce TEXT NOT NULL DEFAULT ''`,
 };
 
@@ -446,11 +469,6 @@ const POST_COLUMN_OBJECTS: Record<string, string> = {
     BEGIN
       DELETE FROM prompt_capsule_revisions WHERE workspace_id = OLD.id;
     END`,
-  // entries_fts_insert/update/delete are NOT here (v2.2 ownership rule):
-  // applySchema never creates or repairs an FTS trigger independently of the
-  // table — see the dedicated creation batch below. On an existing table
-  // with a trigger missing, that is "not live" (src/recall/fts.ts), left for
-  // the nightly rebuildFtsIndex, not silently patched back in here.
 };
 
 /**
@@ -460,36 +478,46 @@ const POST_COLUMN_OBJECTS: Record<string, string> = {
  * ALTER shows up immediately).
  * `kind` is what stops a name that appears on both sides from being read as the wrong one.
  *
- * This exists because the fifteen statements it replaces cost fifteen D1 calls to
+ * This exists because the fifteen statements it replaces cost fifteen subrequests to
  * discover that a migrated brain — which is every brain after its first request — needs
- * nothing done (#282). The free plan's actual ceiling is 1,000 D1/KV/Vectorize calls per
- * invocation, but this codebase holds itself to a much tighter self-imposed D1 budget
- * (~50 calls) per request for cost and 10 ms-CPU reasons, and ensureDbReady spends its
- * share inside the request that triggered it: GET /graph was already close enough to
- * that self-imposed budget that a cold isolate pushed it over — 59 against a target of
- * 50, now 47.
+ * nothing done (#282). Free-plan invocations get 50 subrequests, ensureDbReady spends
+ * them inside the request that triggered it, and GET /graph was already close enough to
+ * the ceiling that a cold isolate pushed it over: 59 against a limit of 50, now 47.
  *
  * Cost is one subrequest and one row read per catalogue entry, flat in the number of
- * entries because neither side of the UNION touches table data — measured on real D1
+ * entries because neither the catalogue nor pragma subqueries touch table data — measured on real D1
  * (workerd via Miniflare), not the mock, which is not something that can be re-verified
- * from a laptop. rows_read = 23 was that measurement, taken when SCHEMA_OBJECTS held
- * seven objects. It holds 26 now (team edition, projects, push subscriptions, and their
- * indexes all landed since), plus entries_fts, entry_counts, and their six triggers
- * (created outside SCHEMA_OBJECTS — see the ownership note above — but still read by
- * this same probe), so 23 is long stale and should be re-measured against a live
- * database rather than trusted as today's figure. What the measurement did establish,
- * and what still holds regardless of the exact count: it grows by one row per object
- * added to SCHEMA_OBJECTS, which is the cheap direction — adding a statement above now
- * costs one row here rather than one subrequest on every cold start.
+ * from a laptop. rows_read = 23 was that measurement, but it predates insight_candidates
+ * and its index: it was taken when SCHEMA_OBJECTS held seven objects, not the nine it
+ * holds now (plus D1's own bookkeeping table, SQLite's implicit autoindexes, and twelve
+ * columns), so 23 is stale by two rows and should be re-measured against a live database
+ * rather than trusted as today's figure. What the measurement did establish, and what
+ * still holds regardless of the exact count: it grows by one row per object added to
+ * SCHEMA_OBJECTS, which is the cheap direction — adding a statement above now costs one
+ * row here rather than one subrequest on every cold start.
  */
+// D1 expands each table-valued pragma internally. Combining five of them with UNION ALL
+// crosses SQLite's 500-term compound-SELECT limit even though only five UNION arms are
+// visible here. Aggregate each catalogue into JSON, then flatten the nested arrays with
+// json_each: the result shape stays { kind, name } and the whole probe remains one query.
 const PROBE_SQL =
-  `SELECT type AS kind, name, sql AS definition FROM sqlite_master WHERE type IN ('table','index','trigger') ` +
-  `UNION ALL SELECT 'column' AS kind, name, NULL AS definition FROM pragma_table_info('entries')` +
-  `UNION ALL SELECT 'edge_column' AS kind, name, NULL AS definition FROM pragma_table_info('edges')` +
-  `UNION ALL SELECT 'user_column' AS kind, name, NULL AS definition FROM pragma_table_info('users')` +
-  `UNION ALL SELECT 'admin_event_column' AS kind, name, NULL AS definition FROM pragma_table_info('admin_events')` +
-  `UNION ALL SELECT 'entry_version_column' AS kind, name, NULL AS definition FROM pragma_table_info('entry_versions')` +
-  `UNION ALL SELECT 'entries_trash_column' AS kind, name, NULL AS definition FROM pragma_table_info('entries_trash')`;
+  `WITH schema_groups(groups) AS (SELECT json_array(` +
+  `json((SELECT json_group_array(json_object('kind', type, 'name', name, 'definition', sql)) FROM sqlite_master WHERE type IN ('table','index','trigger'))), ` +
+  `json((SELECT json_group_array(json_object('kind', 'entry_column', 'name', name)) FROM pragma_table_info('entries'))), ` +
+  `json((SELECT json_group_array(json_object('kind', 'edge_column', 'name', name)) FROM pragma_table_info('edges'))), ` +
+  `json((SELECT json_group_array(json_object('kind', 'project_column', 'name', name)) FROM pragma_table_info('projects'))), ` +
+  `json((SELECT json_group_array(json_object('kind', 'insight_column', 'name', name)) FROM pragma_table_info('insight_candidates'))), ` +
+  `json((SELECT json_group_array(json_object('kind', 'admission_column', 'name', name)) FROM pragma_table_info('memory_write_admissions'))), ` +
+  `json((SELECT json_group_array(json_object('kind', 'cleanup_column', 'name', name)) FROM pragma_table_info('vector_cleanup_ops'))), ` +
+  `json((SELECT json_group_array(json_object('kind', 'restore_column', 'name', name)) FROM pragma_table_info('restore_state'))), ` +
+  `json((SELECT json_group_array(json_object('kind', 'migration_column', 'name', name)) FROM pragma_table_info('migration_control'))), ` +
+  `json((SELECT json_group_array(json_object('kind', 'user_column', 'name', name)) FROM pragma_table_info('users'))), ` +
+  `json((SELECT json_group_array(json_object('kind', 'entry_version_column', 'name', name)) FROM pragma_table_info('entry_versions'))), ` +
+  `json((SELECT json_group_array(json_object('kind', 'recall_log_column', 'name', name)) FROM pragma_table_info('recall_log'))), ` +
+  `json((SELECT json_group_array(json_object('kind', 'entries_trash_column', 'name', name)) FROM pragma_table_info('entries_trash'))), ` +
+  `json((SELECT json_group_array(json_object('kind', 'admin_event_column', 'name', name)) FROM pragma_table_info('admin_events'))))) ` +
+  `SELECT json_extract(item.value, '$.kind') AS kind, json_extract(item.value, '$.name') AS name, json_extract(item.value, '$.definition') AS definition ` +
+  `FROM schema_groups, json_each(schema_groups.groups) AS group_rows, json_each(group_rows.value) AS item`;
 
 type ObjectKind = "table" | "index" | "trigger";
 /**
@@ -498,14 +526,30 @@ type ObjectKind = "table" | "index" | "trigger";
  * the name alone would let a user table called `idx_entries_source` stand in for the index,
  * which resolves init successfully and silently never creates it.
  */
-type ExistingSchema = { definitions: Map<string, string>; objects: Map<string, ObjectKind>; columns: Set<string>; edgeColumns: Set<string>; userColumns: Set<string>; adminEventColumns: Set<string>; entryVersionColumns: Set<string>; entriesTrashColumns: Set<string> };
+type ExistingSchema = {
+  entryVersionColumns: Set<string>;
+  entriesTrashColumns: Set<string>;
+  recallLogColumns: Set<string>;
+  definitions: Map<string, string>;
+  objects: Map<string, ObjectKind>;
+  entryColumns: Set<string>;
+  edgeColumns: Set<string>;
+  projectColumns: Set<string>;
+  insightColumns: Set<string>;
+  admissionColumns: Set<string>;
+  cleanupColumns: Set<string>;
+  restoreColumns: Set<string>;
+  migrationColumns: Set<string>;
+  userColumns: Set<string>;
+  adminEventColumns: Set<string>;
+};
 
 /** Which kind of object a CREATE statement makes, so the probe can be asked about it. */
-const kindOf = (ddl: string): ObjectKind => {
-  if (ddl.startsWith("CREATE TABLE") || ddl.startsWith("CREATE VIRTUAL TABLE")) return "table";
-  if (ddl.startsWith("CREATE TRIGGER")) return "trigger";
-  return "index";
-};
+const kindOf = (ddl: string): ObjectKind => /^CREATE (?:VIRTUAL )?TABLE/.test(ddl)
+  ? "table"
+  : ddl.startsWith("CREATE TRIGGER")
+    ? "trigger"
+    : "index";
 
 /**
  * What the database already has, or null if that could not be established.
@@ -513,8 +557,7 @@ const kindOf = (ddl: string): ObjectKind => {
  * The invariant, and the only one that matters here: this may report a thing PRESENT only
  * if it actually saw it, as the kind it is looking for. Everything else — the probe
  * throwing, a result shape it does not recognise, a row whose `kind` is not one of the
- * recognised catalogue or column kinds, a name that exists as another kind — resolves
- * towards "missing", so the worst a
+ * four, a name that exists as the other kind — resolves towards "missing", so the worst a
  * confused probe can do is make applySchema pay the old whole-schema cost against DDL
  * that is idempotent anyway. The opposite error is the one that would hurt: a brand-new
  * brain talked out of migrating would then serve every request against tables that do not
@@ -538,26 +581,56 @@ async function probeSchema(env: Env): Promise<ExistingSchema | null> {
 
   const objects = new Map<string, ObjectKind>();
   const definitions = new Map<string, string>();
-  const columns = new Set<string>();
+  const entryColumns = new Set<string>();
   const edgeColumns = new Set<string>();
+  const projectColumns = new Set<string>();
+  const insightColumns = new Set<string>();
+  const admissionColumns = new Set<string>();
+  const cleanupColumns = new Set<string>();
+  const restoreColumns = new Set<string>();
+  const migrationColumns = new Set<string>();
   const userColumns = new Set<string>();
   const adminEventColumns = new Set<string>();
   const entryVersionColumns = new Set<string>();
   const entriesTrashColumns = new Set<string>();
+  const recallLogColumns = new Set<string>();
   for (const row of rows as { kind?: unknown; name?: unknown; definition?: unknown }[]) {
     if (typeof row?.name !== "string") continue;
-    if (row.kind === "column") columns.add(row.name);
+    if (row.kind === "entry_column") entryColumns.add(row.name);
+    else if (row.kind === "project_column") projectColumns.add(row.name);
     else if (row.kind === "edge_column") edgeColumns.add(row.name);
+    else if (row.kind === "insight_column") insightColumns.add(row.name);
+    else if (row.kind === "admission_column") admissionColumns.add(row.name);
+    else if (row.kind === "cleanup_column") cleanupColumns.add(row.name);
+    else if (row.kind === "restore_column") restoreColumns.add(row.name);
+    else if (row.kind === "migration_column") migrationColumns.add(row.name);
     else if (row.kind === "user_column") userColumns.add(row.name);
     else if (row.kind === "admin_event_column") adminEventColumns.add(row.name);
     else if (row.kind === "entry_version_column") entryVersionColumns.add(row.name);
+    else if (row.kind === "recall_log_column") recallLogColumns.add(row.name);
     else if (row.kind === "entries_trash_column") entriesTrashColumns.add(row.name);
     else if (row.kind === "table" || row.kind === "index" || row.kind === "trigger") {
       objects.set(row.name, row.kind);
       if (typeof row.definition === "string") definitions.set(row.name, row.definition);
     }
   }
-  return { definitions, objects, columns, edgeColumns, userColumns, adminEventColumns, entryVersionColumns, entriesTrashColumns };
+  return {
+    entryVersionColumns,
+    entriesTrashColumns,
+    recallLogColumns,
+    definitions,
+    objects,
+    entryColumns,
+    edgeColumns,
+    projectColumns,
+    insightColumns,
+    admissionColumns,
+    cleanupColumns,
+    restoreColumns,
+    migrationColumns,
+    userColumns,
+    adminEventColumns,
+  };
 }
 
 /**
@@ -611,42 +684,43 @@ function isUniqueViolation(e: unknown): boolean {
 // A fully migrated brain leaves here having issued the probe and nothing else. The DDL
 // keeps its IF NOT EXISTS: it costs nothing to keep and it is the same backstop as the
 // duplicate-column tolerance, for the same concurrent-cold-start race.
-/**
- * The one CREATE failure that is routine rather than a fault: a racing
- * isolate's own gated creation batch below already created entries_fts and
- * its triggers first. ENTRIES_FTS_TABLE_DDL deliberately has no IF NOT
- * EXISTS, so this collision fails the WHOLE batch atomically (verified
- * against real node:sqlite: "table entries_fts already exists") rather than
- * partially applying — nothing here to clean up by hand.
- */
-function isTableAlreadyExists(e: unknown): boolean {
-  return /table entries_fts already exists/i.test(String((e as { message?: string })?.message ?? e));
-}
-
-/**
- * The entry_counts analogue of isTableAlreadyExists above: a racing isolate's
- * own gated creation batch already won. ENTRY_COUNTS_TABLE_DDL also has no
- * IF NOT EXISTS, for the same atomic-collision reason.
- */
-function isEntryCountsTableAlreadyExists(e: unknown): boolean {
-  return /table entry_counts already exists/i.test(String((e as { message?: string })?.message ?? e));
-}
-
-/**
- * Applies the schema. Returns whether FTS creation was deferred — see
- * initializeDatabase, which uses that to decide whether this pass may be
- * memoized as fully done.
- */
-async function applySchema(env: Env): Promise<boolean> {
+async function applySchema(env: Env): Promise<DatabaseInitResult> {
   const existing = await probeSchema(env);
+  let changed = existing === null;
+  // A successful probe can prove a table is absent. Its CREATE below uses the
+  // current full definition, so replaying every historical ALTER in the same
+  // invocation would waste 25 D1 statements and push a clean bootstrap over the
+  // Free 50-query ceiling. A failed/unknown probe does not take this shortcut.
+  const createdFresh = (table: string) => existing !== null && existing.objects.get(table) !== "table";
+  const freshEntries = createdFresh("entries");
+  const freshEdges = createdFresh("edges");
+  const freshInsights = createdFresh("insight_candidates");
+  const freshAdmissions = createdFresh("memory_write_admissions");
+  const freshCleanup = createdFresh("vector_cleanup_ops");
+  const freshRestore = createdFresh("restore_state");
+  const freshMigration = createdFresh("migration_control");
+  const freshUsers = createdFresh("users");
+  const freshAdminEvents = createdFresh("admin_events");
 
   for (const [name, ddl] of Object.entries(SCHEMA_OBJECTS)) {
     // Kind as well as name: if something else has taken the name, this is not the object
     // we need and the CREATE has to be issued so SQLite raises the collision, which is
     // what it did before the probe existed.
     if (existing?.objects.get(name) === kindOf(ddl)) continue;
+    changed = true;
     await env.DB.exec(ddl);
   }
+  for (const [column, ddl] of Object.entries(ENTRIES_COLUMNS)) {
+    if (freshEntries || existing?.entryColumns.has(column)) continue;
+    changed = true;
+    try {
+      await env.DB.exec(ddl);
+    } catch (e) {
+      if (!isDuplicateColumn(e)) throw e; // column already exists — anything else is real
+    }
+  }
+  // The FTS index and sync triggers are a single atomic unit. A populated
+  // brain must invalidate its ready latch before creating an empty index.
 
   // History starts when the table does. A failed probe (existing === null) is unknown, not
   // proof the table is new, so it never writes the marker; getVersionsSince recovers instead.
@@ -684,24 +758,21 @@ async function applySchema(env: Env): Promise<boolean> {
   // row one (see the fresh-brain ready latch below).
   let ftsDeferred = false;
   if (existing?.objects.get("entries_fts") !== "table") {
-    // A failed probe (existing === null) is populated/unknown, never fresh
-    // (combined review of Tasks 4-6): an unknown corpus must go through the
-    // same KV invalidation as a populated brain, and the fresh-brain ready
-    // latch at the end skips it for the same reason.
     const entriesPreexisted = existing === null || existing.objects.get("entries") === "table";
     let kvOk = true;
     if (entriesPreexisted) {
       try {
         await env.OAUTH_KV.delete(FTS_READY_KV_KEY);
         await env.OAUTH_KV.put(FTS_BACKFILL_CURSOR_KV_KEY, "0");
-      } catch (e) {
+      } catch (error) {
         kvOk = false;
-        console.error("FTS creation deferred (non-fatal): ready-flag/cursor invalidation failed on a populated brain; will retry next call:", e);
+        console.error("FTS creation deferred (non-fatal): KV invalidation failed:", error);
       }
     }
     if (!kvOk) {
       ftsDeferred = true;
     } else {
+      changed = true;
       try {
         await env.DB.batch([
           env.DB.prepare(ENTRIES_FTS_TABLE_DDL),
@@ -709,52 +780,86 @@ async function applySchema(env: Env): Promise<boolean> {
           env.DB.prepare(ENTRIES_FTS_UPDATE_TRIGGER_DDL),
           env.DB.prepare(ENTRIES_FTS_DELETE_TRIGGER_DDL),
         ]);
-      } catch (e) {
-        if (!isTableAlreadyExists(e)) throw e;
+      } catch (error) {
+        if (!/table entries_fts already exists/i.test(String(error))) throw error;
       }
     }
   }
-
-  for (const [column, ddl] of Object.entries(ENTRIES_COLUMNS)) {
-    if (existing?.columns.has(column)) continue;
-    try {
-      await env.DB.exec(ddl);
-    } catch (e) {
-      if (!isDuplicateColumn(e)) throw e; // column already exists — anything else is real
-    }
-  }
-
-  // entry_counts (T-0065): same ownership rule as entries_fts above, but no
-  // KV gate — there is no separate backfill, so the seed rides in the SAME
-  // atomic batch as the triggers. Both the seed and the triggers reference
-  // entries.workspace_id, so this must run AFTER the ENTRIES_COLUMNS loop
-  // above, which ALTERs it in on a legacy pre-tenancy brain — placed any
-  // earlier, the seed's GROUP BY throws "no such column: workspace_id" on
-  // exactly that brain shape. Atomicity is what makes a concurrent entries
-  // write safe to interleave: a write that commits before this batch is
-  // counted by the seed; one that commits after is counted by the trigger
-  // (created in the same batch); D1 batch() is one transaction, so there is
-  // no window where neither counts it.
+  // Seed and triggers share a transaction, so every concurrent entry write
+  // is counted by either the seed or its trigger.
   if (existing?.objects.get("entry_counts") !== "table") {
+    changed = true;
     try {
       await env.DB.batch([
         env.DB.prepare(ENTRY_COUNTS_TABLE_DDL),
         env.DB.prepare(ENTRY_COUNTS_INSERT_TRIGGER_DDL),
         env.DB.prepare(ENTRY_COUNTS_UPDATE_TRIGGER_DDL),
         env.DB.prepare(ENTRY_COUNTS_DELETE_TRIGGER_DDL),
-        // scope-exempt: the one-time seed deliberately covers every workspace
-        // (that is the point of a GROUP BY over the whole table) — the read
-        // never reaches a response, it only populates the exact counter each
-        // scoped read later sums from.
+        // scope-exempt: deployment-wide one-time seed for per-workspace counts.
         env.DB.prepare(`INSERT INTO entry_counts SELECT workspace_id, count(*) FROM entries GROUP BY workspace_id`),
       ]);
-    } catch (e) {
-      if (!isEntryCountsTableAlreadyExists(e)) throw e;
+    } catch (error) {
+      if (!/table entry_counts already exists/i.test(String(error))) throw error;
     }
   }
-
+  if (freshEntries && !ftsDeferred) {
+    try { await env.OAUTH_KV.put(FTS_READY_KV_KEY, "1"); }
+    catch (error) { console.error("FTS ready latch failed (non-fatal):", error); }
+  }
   for (const [column, ddl] of Object.entries(EDGES_COLUMNS)) {
-    if (existing?.edgeColumns.has(column)) continue;
+    if (freshEdges || existing?.edgeColumns.has(column)) continue;
+    changed = true;
+    try {
+      await env.DB.exec(ddl);
+    } catch (e) {
+      if (!isDuplicateColumn(e)) throw e;
+    }
+  }
+  for (const [column, ddl] of Object.entries(INSIGHT_CANDIDATE_COLUMNS)) {
+    if (freshInsights || existing?.insightColumns.has(column)) continue;
+    changed = true;
+    try {
+      await env.DB.exec(ddl);
+    } catch (e) {
+      if (!isDuplicateColumn(e)) throw e;
+    }
+  }
+  for (const [column, ddl] of Object.entries(WRITE_ADMISSION_COLUMNS)) {
+    if (freshAdmissions || existing?.admissionColumns.has(column)) continue;
+    changed = true;
+    try {
+      await env.DB.exec(ddl);
+    } catch (e) {
+      if (!isDuplicateColumn(e)) throw e;
+    }
+  }
+  for (const [column, ddl] of Object.entries(VECTOR_CLEANUP_COLUMNS)) {
+    if (freshCleanup || existing?.cleanupColumns.has(column)) continue;
+    changed = true;
+    try {
+      await env.DB.exec(ddl);
+    } catch (e) {
+      if (!isDuplicateColumn(e)) throw e;
+    }
+  }
+  for (const column of ["restore_lease_owner", "write_marker"]) {
+    if (createdFresh("projects") || existing?.projectColumns.has(column)) continue;
+    changed = true;
+    try { await env.DB.exec(`ALTER TABLE projects ADD COLUMN ${column} TEXT`); }
+    catch (e) { if (!isDuplicateColumn(e)) throw e; }
+  }
+  for (const [column, ddl] of Object.entries(RESTORE_STATE_COLUMNS)) {
+    if (freshRestore || existing?.restoreColumns.has(column)) continue;
+    changed = true;
+    try {
+      await env.DB.exec(ddl);
+    } catch (e) {
+      if (!isDuplicateColumn(e)) throw e; // column already exists — anything else is real
+    }
+  }
+  for (const [column, ddl] of Object.entries(MIGRATION_CONTROL_COLUMNS)) {
+    if (freshMigration || existing?.migrationColumns.has(column)) continue;
+    changed = true;
     try {
       await env.DB.exec(ddl);
     } catch (e) {
@@ -762,7 +867,8 @@ async function applySchema(env: Env): Promise<boolean> {
     }
   }
   for (const [column, ddl] of Object.entries(USERS_COLUMNS)) {
-    if (existing?.userColumns.has(column)) continue;
+    if (freshUsers || existing?.userColumns.has(column)) continue;
+    changed = true;
     try {
       await env.DB.exec(ddl);
     } catch (e) {
@@ -770,7 +876,8 @@ async function applySchema(env: Env): Promise<boolean> {
     }
   }
   for (const [column, ddl] of Object.entries(ADMIN_EVENTS_COLUMNS)) {
-    if (existing?.adminEventColumns.has(column)) continue;
+    if (freshAdminEvents || existing?.adminEventColumns.has(column)) continue;
+    changed = true;
     try {
       await env.DB.exec(ddl);
     } catch (e) {
@@ -778,7 +885,8 @@ async function applySchema(env: Env): Promise<boolean> {
     }
   }
   for (const [column, ddl] of Object.entries(ENTRY_VERSIONS_COLUMNS)) {
-    if (existing?.entryVersionColumns.has(column)) continue;
+    if (createdFresh("entry_versions") || existing?.entryVersionColumns.has(column)) continue;
+    changed = true;
     try {
       await env.DB.exec(ddl);
     } catch (e) {
@@ -786,17 +894,25 @@ async function applySchema(env: Env): Promise<boolean> {
     }
   }
   for (const [column, ddl] of Object.entries(ENTRIES_TRASH_COLUMNS)) {
-    if (existing?.entriesTrashColumns.has(column)) continue;
+    if (createdFresh("entries_trash") || existing?.entriesTrashColumns.has(column)) continue;
+    changed = true;
     try {
       await env.DB.exec(ddl);
     } catch (e) {
       if (!isDuplicateColumn(e)) throw e;
     }
   }
+  for (const column of ["write_marker", "restore_lease_owner"]) {
+    if (createdFresh("recall_log") || existing?.recallLogColumns.has(column)) continue;
+    changed = true;
+    try { await env.DB.exec(`ALTER TABLE recall_log ADD COLUMN ${column} TEXT`); }
+    catch (e) { if (!isDuplicateColumn(e)) throw e; }
+  }
   // users.email uniqueness — see the note above EMAIL_UNIQUE_INDEX_DDL for why
   // this is not a plain SCHEMA_OBJECTS entry. Skipped once the index exists,
   // which the probe reports like any other index.
   if (existing?.objects.get("idx_users_email") !== "index") {
+    changed = true;
     try {
       await env.DB.exec(EMAIL_UNIQUE_INDEX_DDL);
     } catch (e) {
@@ -832,39 +948,51 @@ async function applySchema(env: Env): Promise<boolean> {
         // SQL文字列の空白は意味を持つため、その内部は正規化しない。
         .match(/'(?:''|[^'])*'|"(?:""|[^"])*"|[a-zA-Z_]\w*|\d+|[^\s]/g)?.join(" ") ?? "";
       if (normalize(existing?.definitions.get(name) ?? "") !== normalize(ddl)) {
-        const repair = [
+        await env.DB.batch([
           env.DB.prepare(`DROP TRIGGER IF EXISTS ${name}`),
           env.DB.prepare(ddl),
-        ];
-        // A repaired capsule invalidator must not reuse payloads from its old body;
-        // FTS and other sync triggers change nothing the capsule cache reads.
-        if (name.startsWith("prompt_capsule_")) {
-          repair.push(env.DB.prepare(`UPDATE prompt_capsule_revisions SET revision = lower(hex(randomblob(16)))`));
-        }
-        await env.DB.batch(repair);
+          // A repaired invalidator must not reuse payloads from its old body.
+          env.DB.prepare(`UPDATE prompt_capsule_revisions SET revision = lower(hex(randomblob(16)))`),
+        ]);
       }
       continue;
     }
     if (existing?.objects.get(name) === kindOf(ddl)) continue;
+    changed = true;
     // D1Database.exec splits on semicolons, including the statements inside a
     // trigger body, and therefore sends an incomplete CREATE TRIGGER. Prepared
     // DDL keeps the trigger as one SQLite statement.
     if (kindOf(ddl) === "trigger") await env.DB.prepare(ddl).run();
     else await env.DB.exec(ddl);
   }
-
-  // Brand-new brain: entries did not exist before this pass, so there are no
-  // pre-FTS rows and the triggers cover everything from row one. Latch ready
-  // now instead of waiting for the first nightly. A failed put is non-fatal:
-  // the nightly backfill reaches the same latch. Probe-failure (existing ===
-  // null) skips this — an existing corpus must go through the backfill.
-  if (existing !== null && existing.objects.get("entries") !== "table") {
-    try {
-      await env.OAUTH_KV.put(FTS_READY_KV_KEY, "1");
-    } catch (e) {
-      console.error("FTS ready latch failed (non-fatal):", e);
-    }
+  // Admissions deliberately spend only the cleanup+claim statements on the hot path.
+  // Seed the generation once during schema convergence instead of issuing a no-op
+  // INSERT on every request. The current triggers remain fail-closed if this row is ever
+  // removed. Admission acquisition has a bounded repair+retry path for an interrupted
+  // older schema pass that created the table but did not seed this singleton.
+  if (existing?.objects.get("memory_write_epoch") !== "table") {
+    changed = true;
+    // D1 exec splits on newlines; keep this single-statement seed on one line.
+    await env.DB.exec(`INSERT INTO memory_write_epoch (id, generation) VALUES ('current', lower(hex(randomblob(16)))) ON CONFLICT(id) DO NOTHING;`);
   }
-
-  return ftsDeferred;
+  if (existing?.objects.get("integration_state_generation") !== "table") {
+    changed = true;
+    await env.DB.exec(`INSERT INTO integration_state_generation (id, generation, restore_count) VALUES ('current', lower(hex(randomblob(16))), 0) ON CONFLICT(id) DO NOTHING;`);
+  }
+  for (const [name, ddl] of Object.entries(WRITE_FENCE_TRIGGERS)) {
+    if (existing?.objects.get(name) === "trigger") continue;
+    changed = true;
+    // D1Database.exec treats newlines as statement separators, including the
+    // newlines inside CREATE TRIGGER ... BEGIN ... END. Collapse this one DDL
+    // statement before sending it to workerd.
+    await env.DB.exec(ddl.replace(/\s+/g, " ").trim());
+  }
+  // Install every fail-closed capability trigger before retiring its older barrier-only
+  // predecessor. During a rolling upgrade there is never a gap with neither generation.
+  for (const name of OBSOLETE_WRITE_FENCE_TRIGGERS) {
+    if (existing !== null && existing.objects.get(name) !== "trigger") continue;
+    changed = true;
+    await env.DB.exec(`DROP TRIGGER IF EXISTS ${name}`);
+  }
+  return { changed, ftsDeferred };
 }

@@ -12,7 +12,8 @@ import { runVariant } from "./runner";
 import type { VariantReport } from "./types";
 import { getVariant } from "./variants";
 
-const MODEL = DEFAULTS.EMBEDDING_MODEL;
+// 上流同梱replayはBGE専用。Gemmaの品質証拠へ転用しない。
+const MODEL = "@cf/baai/bge-small-en-v1.5";
 const LOCK = resolve(CORE_DATA_DIR, "../baselines", `core-1k.${MODEL.split("/").pop()}.json`);
 const cache = replayPaths(MODEL, "core-1k").read;
 
@@ -29,7 +30,7 @@ describe("baseline lock (recall tripwire)", () => {
     expect(cache.length, "no replay cache: Task 9 Step 12 must be committed").toBeGreaterThan(0);
   });
 
-  it.skipIf(!EVAL_FULL)("recall on core-1k still ranks every golden query exactly as the committed lock does", async () => {
+  it.skipIf(!EVAL_FULL || String(DEFAULTS.EMBEDDING_MODEL) !== MODEL)("recall on core-1k still ranks every golden query exactly as the committed lock does", async () => {
     const lock = JSON.parse(readFileSync(LOCK, "utf8")) as VariantReport;
     const spec = buildCorpus("core-1k");
     const corpus = await loadCorpus({ spec, backend: "sqlite", replay: makeReplayAi({ store: new ReplayStore(cache), mode: "replay" }), embeddingModel: MODEL });
@@ -49,7 +50,7 @@ describe("baseline lock (recall tripwire)", () => {
 
   // The lock ranks the top 10; a topK 5 call must return exactly its first 5. The reverse (a larger topK reordering the
   // head) is what this catches, whether it comes from the candidate pool, the diversity pass, or the graph slot.
-  it.skipIf(!EVAL_FULL)("a topK 5 call returns the first 5 of the locked top 10 on every golden query", async () => {
+  it.skipIf(!EVAL_FULL || String(DEFAULTS.EMBEDDING_MODEL) !== MODEL)("a topK 5 call returns the first 5 of the locked top 10 on every golden query", async () => {
     const lock = JSON.parse(readFileSync(LOCK, "utf8")) as VariantReport;
     const locked = new Map(lock.results.map(r => [r.queryId, r.rankedIds]));
     const spec = buildCorpus("core-1k");

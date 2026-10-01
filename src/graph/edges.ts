@@ -1,9 +1,49 @@
 import { getKind, type MemoryKind } from "../memory/kind";
 import type { Env } from "../env";
+import { D1_MAX_BOUND_PARAMS, MIRRORED_SOURCES } from "../constants";
+import { topicTagsOf } from "../insight/eligibility";
 import { EDGE_TYPES, type EdgeProvenance, type EdgeType } from "./types";
-import { MIRRORED_SOURCES } from "../constants";
+import { assertMemoryWritesAllowed, memoryWriteMarker } from "../migration/write-lock";
 
 const DEFAULT_EDGE_WEIGHT = 0.5;
+const EDGE_INSERT_BINDINGS = 11;
+const EDGE_INSERT_ROWS_PER_STATEMENT = Math.floor(D1_MAX_BOUND_PARAMS / EDGE_INSERT_BINDINGS);
+
+export interface EdgeInsertRow {
+  id: string;
+  sourceId: string;
+  targetId: string;
+  type: EdgeType;
+  weight: number;
+  provenance: EdgeProvenance;
+  metadata: string;
+  createdAt: number;
+  updatedAt: number;
+  workspaceId: string;
+}
+
+export function edgeInsertRow(
+  sourceId: string,
+  targetId: string,
+  type: string,
+  opts: { weight?: number; provenance?: EdgeProvenance; metadata?: Record<string, unknown>; created_at?: number; workspaceId?: string } = {},
+): EdgeInsertRow | null {
+  if (!isValidEdgeType(type) || sourceId === targetId) return null;
+  if (isSymmetric(type) && sourceId > targetId) [sourceId, targetId] = [targetId, sourceId];
+  const now = Date.now();
+  return {
+    id: crypto.randomUUID(),
+    sourceId,
+    targetId,
+    type,
+    weight: Math.max(0, Math.min(1, opts.weight ?? DEFAULT_EDGE_WEIGHT)),
+    provenance: opts.provenance ?? "inferred",
+    metadata: JSON.stringify(opts.metadata ?? {}),
+    createdAt: opts.created_at ?? now,
+    updatedAt: now,
+    workspaceId: opts.workspaceId ?? "",
+  };
+}
 
 /**
  * What POST /link and the MCP `link` tool both say when a caller asks to join two
@@ -164,45 +204,37 @@ export function edgeInsertStatement(
   },
   env: Env,
 ): D1PreparedStatement | null {
-  if (!isValidEdgeType(type)) return null;
-  if (sourceId === targetId) return null;
-
-  let source = sourceId;
-  let target = targetId;
-  if (isSymmetric(type) && source > target) [source, target] = [target, source];
-
-  const weight = Math.max(0, Math.min(1, opts.weight ?? DEFAULT_EDGE_WEIGHT));
-  const provenance = opts.provenance ?? "inferred";
-  const metadata = JSON.stringify(opts.metadata ?? {});
-  const now = Date.now();
-  const createdAt = opts.created_at ?? now;
-
-  const values = [crypto.randomUUID(), source, target, type, weight, provenance, metadata, createdAt, now, opts.workspaceId ?? ""];
+  const row = edgeInsertRow(sourceId, targetId, type, opts);
+  if (!row) return null;
+  const values = edgeInsertBindings(row, env);
+  // Upstream's generic-edge guard stays in SQL, so a concurrent typed writer
+  // cannot be followed by a stale lookup inserting a less-specific edge.
   const readable = JSON.stringify(opts.readableWorkspaceIds);
-
   if (opts.onlyIfNoTypedEdge) {
-    // INSERT ... SELECT rather than VALUES, because only the SELECT form takes a
-    // WHERE. SQLite needs that WHERE for the upsert clause to parse unambiguously
-    // after a SELECT, which this has.
     return env.DB.prepare(
-      // scope-exempt: by-id: the guards read only the pair being written, scoped by the actor's readable workspaces
-      `INSERT INTO edges (id, source_id, target_id, type, weight, provenance, metadata, created_at, updated_at, workspace_id)
-       SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+      // scope-exempt: by-id: both endpoints of this guarded inference were hydrated and workspace-checked by the caller
+      `INSERT INTO edges (id, source_id, target_id, type, weight, provenance, metadata, created_at, updated_at, write_marker, workspace_id)
+       SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
        WHERE ${edgeEndpointsReadableSql("?", "?", "?")} AND NOT EXISTS (
          SELECT 1 FROM edges g
          WHERE ((g.source_id = ? AND g.target_id = ?) OR (g.source_id = ? AND g.target_id = ?))
            AND g.type <> 'relates_to')
-       ON CONFLICT(source_id, target_id, type) DO UPDATE SET weight = max(weight, excluded.weight), updated_at = excluded.updated_at`
-    ).bind(...values, source, readable, target, readable, source, target, target, source);
+       ON CONFLICT(source_id, target_id, type) DO UPDATE SET
+         weight = max(edges.weight, excluded.weight), metadata = excluded.metadata,
+         updated_at = excluded.updated_at, write_marker = excluded.write_marker,
+         workspace_id = excluded.workspace_id
+       WHERE edges.provenance = 'inferred'`,
+    ).bind(...values, row.sourceId, readable, row.targetId, readable, row.sourceId, row.targetId, row.targetId, row.sourceId);
   }
-
   return env.DB.prepare(
-    // scope-exempt: by-id: the guard reads only the pair being written, scoped by the actor's readable workspaces
-    `INSERT INTO edges (id, source_id, target_id, type, weight, provenance, metadata, created_at, updated_at, workspace_id)
-     SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+    `INSERT INTO edges (id, source_id, target_id, type, weight, provenance, metadata, created_at, updated_at, write_marker, workspace_id)
+     SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
      WHERE ${edgeEndpointsReadableSql("?", "?", "?")}
-     ON CONFLICT(source_id, target_id, type) DO UPDATE SET weight = max(weight, excluded.weight), updated_at = excluded.updated_at`
-  ).bind(...values, source, readable, target, readable);
+     ON CONFLICT(source_id, target_id, type) DO UPDATE SET
+       weight = max(weight, excluded.weight), updated_at = excluded.updated_at,
+       write_marker = excluded.write_marker, workspace_id = excluded.workspace_id
+     WHERE edges.provenance <> 'explicit' OR excluded.provenance = 'explicit'`,
+  ).bind(...values, row.sourceId, readable, row.targetId, readable);
 }
 
 export async function createEdge(
@@ -212,6 +244,7 @@ export async function createEdge(
   opts: { weight?: number; provenance?: EdgeProvenance; metadata?: Record<string, unknown>; created_at?: number; workspaceId?: string; readableWorkspaceIds: string[] },
   env: Env,
 ): Promise<{ source_id: string; target_id: string; type: EdgeType } | null> {
+  await assertMemoryWritesAllowed(env);
   const stmt = edgeInsertStatement(sourceId, targetId, type, opts, env);
   if (!stmt) return null;
   await stmt.run();
@@ -229,194 +262,342 @@ export async function deleteEdge(
   type: string | undefined,
   env: Env,
 ): Promise<number> {
-  // scope-exempt: by-id: both endpoints checked readable at the route/MCP edge
+  await assertMemoryWritesAllowed(env);
+  // scope-exempt: both endpoint ids are authorized before the ID-only edge deletion helper is called
   let sql = `DELETE FROM edges WHERE ((source_id = ? AND target_id = ?) OR (source_id = ? AND target_id = ?))`;
   const bindings: string[] = [sourceId, targetId, targetId, sourceId];
   if (type) {
     sql += ` AND type = ?`;
     bindings.push(type);
   }
-  const result = await env.DB.prepare(sql).bind(...bindings).run();
+  const [_, result] = await env.DB.batch([
+    // scope-exempt: this dynamically reuses the same authorized endpoint predicate as the deletion immediately below
+    env.DB.prepare(`UPDATE edges SET write_marker = ? WHERE ${sql.slice("DELETE FROM edges WHERE ".length)}`)
+      .bind(memoryWriteMarker(env, "delete"), ...bindings),
+    env.DB.prepare(sql).bind(...bindings),
+  ]);
   return result.meta.changes ?? 0;
 }
 
-const EDGE_INFER_THRESHOLD = 0.78;
+// Gemma MRL128 calibration: 8/10 curated related pairs clear 0.42 while all
+// 10 unrelated pairs stay below it (observed max 0.3785). Production data is
+// broader than that calibration corpus, however: 0.42 alone admitted semantic
+// lookalikes from different projects. Keep the recall-friendly floor only when
+// a concrete topic/project tag agrees; otherwise require the empirically clean
+// high-confidence band.
+export const EDGE_INFER_THRESHOLD = 0.42;
+export const EDGE_INFER_UNTAGGED_THRESHOLD = 0.70;
+export const EDGE_INFERENCE_POLICY = "embeddinggemma-mrl128-v2";
 const EDGE_INFER_MAX = 3;
+
+export interface InferenceNeighbor {
+  id: string;
+  score: number;
+}
+
+export interface InferenceRecalculation {
+  entryId: string;
+  neighbors: InferenceNeighbor[];
+  options?: { suppressId?: string; newKind?: MemoryKind | null };
+}
+
+export interface InferenceDecision {
+  eligible: boolean;
+  basis: "shared-topic-tag" | "high-similarity" | "rejected";
+  sharedTags: string[];
+}
+
+function sharedTopicTags(a: string[], b: string[]): string[] {
+  const right = new Set([...topicTagsOf(b)].map(tag => tag.trim().toLowerCase()));
+  return [...topicTagsOf(a)]
+    .map(tag => tag.trim().toLowerCase())
+    .filter(tag => tag.length > 0 && right.has(tag))
+    .sort();
+}
+
+export function decideInferredEdge(
+  score: number,
+  sourceTags: string[] = [],
+  targetTags: string[] = [],
+): InferenceDecision {
+  if (!Number.isFinite(score) || score < EDGE_INFER_THRESHOLD) {
+    return { eligible: false, basis: "rejected", sharedTags: [] };
+  }
+  const sharedTags = sharedTopicTags(sourceTags, targetTags);
+  if (sharedTags.length) return { eligible: true, basis: "shared-topic-tag", sharedTags };
+  if (score >= EDGE_INFER_UNTAGGED_THRESHOLD) {
+    return { eligible: true, basis: "high-similarity", sharedTags: [] };
+  }
+  return { eligible: false, basis: "rejected", sharedTags: [] };
+}
+
+function parseTags(raw: unknown): string[] {
+  try {
+    const parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
+    return Array.isArray(parsed) ? parsed.filter((tag): tag is string => typeof tag === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
+async function loadEntryFacts(
+  ids: string[],
+  env: Env,
+): Promise<Map<string, { tags: string[]; workspaceId: string; createdAt: number | null; source: string }>> {
+  const unique = [...new Set(ids)];
+  const facts = new Map<string, { tags: string[]; workspaceId: string; createdAt: number | null; source: string }>();
+  for (let offset = 0; offset < unique.length; offset += D1_MAX_BOUND_PARAMS) {
+    const page = unique.slice(offset, offset + D1_MAX_BOUND_PARAMS);
+    const { results } = await env.DB.prepare(
+      // scope-exempt: IDs are produced by already workspace-scoped Vectorize neighbors/recalculations and this internal hydration cannot widen that set
+      `SELECT id, workspace_id, tags, created_at, source FROM entries WHERE id IN (${page.map(() => "?").join(", ")})`,
+    ).bind(...page).all() as { results: { id: string; tags: string; workspace_id: string | null; created_at: number | null; source: string | null }[] };
+    for (const row of results) {
+      facts.set(row.id, { tags: parseTags(row.tags), workspaceId: row.workspace_id ?? "", createdAt: row.created_at, source: row.source ?? "" });
+    }
+  }
+  return facts;
+}
+
+function inferenceMetadata(decision: InferenceDecision): Record<string, unknown> {
+  return {
+    inference_policy: EDGE_INFERENCE_POLICY,
+    basis: decision.basis,
+    ...(decision.sharedTags.length ? { shared_topic_tags: decision.sharedTags.slice(0, 8) } : {}),
+  };
+}
+
+export function inferredEdgeStatements(
+  newId: string,
+  neighbors: InferenceNeighbor[],
+  env: Env,
+  sourceTags: string[] = [],
+  tagsById: ReadonlyMap<string, string[]> = new Map(),
+): D1PreparedStatement[] {
+  return inferredEdgeInsertManyStatements(
+    inferredEdgeRows(newId, neighbors, sourceTags, tagsById),
+    env,
+  );
+}
+
+export function inferredEdgeRows(
+  newId: string,
+  neighbors: InferenceNeighbor[],
+  sourceTags: string[] = [],
+  tagsById: ReadonlyMap<string, string[]> = new Map(),
+  workspaceId = "",
+): EdgeInsertRow[] {
+  return neighbors
+    .map(n => ({ neighbor: n, decision: decideInferredEdge(n.score, sourceTags, tagsById.get(n.id) ?? []) }))
+    .filter(({ neighbor, decision }) => neighbor.id !== newId && decision.eligible)
+    .sort((a, b) => b.neighbor.score - a.neighbor.score)
+    .slice(0, EDGE_INFER_MAX)
+    .map(({ neighbor, decision }) => {
+      let sourceId = newId;
+      let targetId = neighbor.id;
+      if (sourceId > targetId) [sourceId, targetId] = [targetId, sourceId];
+      const now = Date.now();
+      return {
+        id: crypto.randomUUID(),
+        sourceId,
+        targetId,
+        type: "relates_to",
+        weight: Math.max(0, Math.min(1, neighbor.score)),
+        provenance: "inferred",
+        metadata: JSON.stringify(inferenceMetadata(decision)),
+        createdAt: now,
+        updatedAt: now,
+        workspaceId,
+      };
+    });
+}
+
+/** 単行・一括・推論で、列順と書込権限の付与を揃える。 */
+function edgeInsertBindings(row: EdgeInsertRow, env: Env): (string | number | null)[] {
+  return [
+    row.id, row.sourceId, row.targetId, row.type, row.weight, row.provenance,
+    row.metadata, row.createdAt, row.updatedAt, memoryWriteMarker(env), row.workspaceId,
+  ];
+}
+
+/** Pack rows below D1's 100-bound-parameter ceiling. */
+export function edgeInsertManyStatements(rows: EdgeInsertRow[], env: Env): D1PreparedStatement[] {
+  const statements: D1PreparedStatement[] = [];
+  for (let offset = 0; offset < rows.length; offset += EDGE_INSERT_ROWS_PER_STATEMENT) {
+    const page = rows.slice(offset, offset + EDGE_INSERT_ROWS_PER_STATEMENT);
+    const values = page.map(() => "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").join(", ");
+    const bindings = page.flatMap(row => edgeInsertBindings(row, env));
+    statements.push(env.DB.prepare(
+      `INSERT INTO edges (id, source_id, target_id, type, weight, provenance, metadata, created_at, updated_at, write_marker, workspace_id)
+       SELECT column1, column2, column3, column4, column5, column6,
+              column7, column8, column9, column10, column11
+       FROM (VALUES ${values})
+       WHERE ${edgeEndpointsReadableSql("column2", "column3", "json_array(column11)")}
+       ON CONFLICT(source_id, target_id, type) DO UPDATE SET
+         weight = max(weight, excluded.weight),
+         updated_at = excluded.updated_at,
+         write_marker = excluded.write_marker,
+         workspace_id = excluded.workspace_id`,
+    ).bind(...bindings));
+  }
+  return statements;
+}
+
+/** Inference upserts may refresh inference, but can never rewrite an explicit edge. */
+function inferredEdgeInsertManyStatements(rows: EdgeInsertRow[], env: Env): D1PreparedStatement[] {
+  const statements: D1PreparedStatement[] = [];
+  for (let offset = 0; offset < rows.length; offset += EDGE_INSERT_ROWS_PER_STATEMENT) {
+    const page = rows.slice(offset, offset + EDGE_INSERT_ROWS_PER_STATEMENT);
+    const values = page.map(() => "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").join(", ");
+    const bindings = page.flatMap(row => edgeInsertBindings(row, env));
+    statements.push(env.DB.prepare(
+      // scope-exempt: candidates contain only endpoint IDs hydrated and workspace-checked by inference; this guard returns no corpus data
+      `INSERT INTO edges (id, source_id, target_id, type, weight, provenance, metadata, created_at, updated_at, write_marker, workspace_id)
+       SELECT column1, column2, column3, column4, column5, column6,
+              column7, column8, column9, column10, column11
+       FROM (VALUES ${values})
+       WHERE ${edgeEndpointsReadableSql("column2", "column3", "json_array(column11)")}
+         AND (column4 <> 'relates_to' OR NOT EXISTS (
+         SELECT 1 FROM edges g
+         WHERE ((g.source_id = column2 AND g.target_id = column3)
+             OR (g.source_id = column3 AND g.target_id = column2))
+           AND g.type <> 'relates_to'))
+       ON CONFLICT(source_id, target_id, type) DO UPDATE SET
+         weight = max(edges.weight, excluded.weight),
+         metadata = excluded.metadata,
+         updated_at = excluded.updated_at,
+         write_marker = excluded.write_marker,
+         workspace_id = excluded.workspace_id
+       WHERE edges.provenance = 'inferred'`,
+    ).bind(...bindings));
+  }
+  return statements;
+}
+
+async function inferenceRowsFor(
+  recalculations: InferenceRecalculation[],
+  env: Env,
+): Promise<EdgeInsertRow[]> {
+  const ids = recalculations.flatMap(item => [item.entryId, ...item.neighbors.map(n => n.id)]);
+  const factsById = await loadEntryFacts(ids, env);
+  const tagsById = new Map([...factsById].map(([id, fact]) => [id, fact.tags]));
+  const deduplicated = new Map<string, EdgeInsertRow>();
+
+  for (const item of recalculations) {
+    const sourceTags = tagsById.get(item.entryId);
+    if (!sourceTags || sourceTags.includes("status:deprecated")) continue;
+    const sourceWorkspace = factsById.get(item.entryId)?.workspaceId ?? "";
+    const existingNeighbors = item.neighbors.filter(neighbor => {
+      const tags = tagsById.get(neighbor.id);
+      return neighbor.id !== item.options?.suppressId
+        && tags !== undefined
+        && !tags.includes("status:deprecated")
+        && factsById.get(neighbor.id)?.workspaceId === sourceWorkspace;
+    });
+    const rows = inferredEdgeRows(
+      item.entryId, existingNeighbors, sourceTags, tagsById, sourceWorkspace,
+    );
+    const sourceFact = factsById.get(item.entryId)!;
+    const newKind = item.options?.newKind !== undefined
+      ? item.options.newKind : getKind(sourceTags);
+    // Upstream #335: only one eligible, non-mirrored episodic predecessor in
+    // the 30-minute window can be a follows edge. Multiple predecessors are a
+    // burst, not evidence of a train of thought. Keep the calibrated Gemma
+    // candidate gate above; no additional model or D1 call is needed.
+    const qualifying = MIRRORED_SOURCES.has(sourceFact.source) ? [] : rows.filter(row => {
+      const neighborId = row.sourceId === item.entryId ? row.targetId : row.sourceId;
+      const fact = factsById.get(neighborId)!;
+      if (MIRRORED_SOURCES.has(fact.source)
+        || !kindsAllowEdge("follows", newKind, getKind(fact.tags))
+        || sourceFact.createdAt == null || fact.createdAt == null) return false;
+      const gap = sourceFact.createdAt - fact.createdAt;
+      return gap > 0 && gap <= GRAPH_FOLLOWS_WINDOW_MS;
+    });
+    const followsRow = qualifying.length === 1 ? qualifying[0] : null;
+    for (let row of rows) {
+      if (row === followsRow) {
+        const targetId = row.sourceId === item.entryId ? row.targetId : row.sourceId;
+        row = { ...row, sourceId: item.entryId, targetId, type: "follows" };
+      }
+      const key = `${row.sourceId}|${row.targetId}|${row.type}`;
+      const current = deduplicated.get(key);
+      if (!current || row.weight > current.weight) deduplicated.set(key, row);
+    }
+  }
+  return [...deduplicated.values()];
+}
+
+/** Retire only the inferred generic edges replaced by upstream typed evidence. */
+export function retireInferredRelatesToStatements(
+  pairs: { sourceId: string; targetId: string }[],
+  env: Env,
+): D1PreparedStatement[] {
+  const statements: D1PreparedStatement[] = [];
+  // Four endpoint bindings per pair plus the delete capability marker.
+  for (let offset = 0; offset < pairs.length; offset += 24) {
+    const page = pairs.slice(offset, offset + 24);
+    const predicate = `type = 'relates_to' AND provenance = 'inferred' AND (${page.map(
+      () => "((source_id = ? AND target_id = ?) OR (source_id = ? AND target_id = ?))",
+    ).join(" OR ")})`;
+    const bindings = page.flatMap(pair => [pair.sourceId, pair.targetId, pair.targetId, pair.sourceId]);
+    statements.push(
+      env.DB.prepare(`UPDATE edges SET write_marker = ? WHERE ${predicate}`)
+        .bind(memoryWriteMarker(env, "delete"), ...bindings),
+      // scope-exempt: predicate contains only exact endpoint pairs already workspace-checked by inference or the weekly pass
+      env.DB.prepare(`DELETE FROM edges WHERE ${predicate}`).bind(...bindings),
+    );
+  }
+  return statements;
+}
+
+function inferenceWriteStatements(rows: EdgeInsertRow[], env: Env): D1PreparedStatement[] {
+  // Preserve the fork's 9 rows / 99 bindings batching, including the upstream
+  // pair-level generic-edge guard. A 24-edge refresh still uses three INSERTs.
+  return inferredEdgeInsertManyStatements(rows, env);
+}
 
 export async function inferEdgesOnWrite(
   newId: string,
-  neighbors: { id: string; score: number }[],
+  neighbors: InferenceNeighbor[],
   env: Env,
-  opts: { suppressId?: string; newKind?: MemoryKind | null } = {},
+  options: { suppressId?: string; newKind?: MemoryKind | null } = {},
 ): Promise<number> {
-  // `suppressId` is the entry capture already flagged this one as a duplicate
-  // of. It is the highest-scoring neighbour by construction, so left alone it
-  // takes an inference slot to record what the duplicate-candidate tag says.
-  const top = neighbors
-    .filter(n => n.id !== newId && n.id !== opts.suppressId && n.score >= EDGE_INFER_THRESHOLD)
-    .sort((a, b) => b.score - a.score)
-    .slice(0, EDGE_INFER_MAX);
-  if (!top.length) return 0;
+  if (!neighbors.some(neighbor => neighbor.id !== newId && neighbor.id !== options.suppressId
+    && Number.isFinite(neighbor.score) && neighbor.score >= EDGE_INFER_THRESHOLD)) return 0;
+  const rows = await inferenceRowsFor([{ entryId: newId, neighbors, options }], env);
+  if (!rows.length) return 0;
+  await assertMemoryWritesAllowed(env);
+  const retire = retireInferredRelatesToStatements(rows.filter(row => row.type !== "relates_to"), env);
+  const results = await env.DB.batch([...retire, ...inferenceWriteStatements(rows, env)]);
+  // Upstream's count is committed inference INSERT/UPSERT changes, not new distinct
+  // relationships. Capability staging and retirement must never inflate it.
+  return results.slice(retire.length).reduce((sum, result) => sum + (result.meta.changes ?? 0), 0);
+}
 
-  // Edges inherit the SOURCE entry's workspace rather than the column default:
-  // the nightly graph backfill (src/graph/pass.ts) runs corpus-wide by design, and
-  // without this copy every edge it inferred would land in "" no matter which
-  // workspace the entry itself lives in, invisible to that owner's scoped walks.
-  //
-  // The neighbours' workspaces come back from the SAME statement, which is what
-  // makes the check below free: one read per write batch either way, no
-  // per-neighbour subrequest. Ids are globally unique, so a by-id read needs no
-  // scope clause of its own.
-  const ids = [newId, ...top.map(n => n.id)];
-  const { results } = await env.DB.prepare(
-    // scope-exempt: by-id: reads each endpoint's own workspace, to stamp the edge with the source's and to refuse a pair whose workspaces disagree
-    `SELECT id, workspace_id, tags, created_at, source FROM entries WHERE id IN (${ids.map(() => "?").join(", ")})`
-  ).bind(...ids).all() as { results: { id: string; workspace_id: string | null; tags: string | null; created_at: number | null; source: string | null }[] };
-  const workspaceById = new Map(results.map(r => [r.id, r.workspace_id ?? ""]));
-  const workspaceId = workspaceById.get(newId) ?? "";
-  const statements: D1PreparedStatement[] = [];
-  let inserted = 0;
+/**
+ * Replace only inferred relates_to edges incident to the recalculated entries.
+ * Explicit, system and typed relationship edges survive unchanged.
+ */
+export async function replaceInferredEdgesOnWrite(
+  recalculations: InferenceRecalculation[],
+  env: Env,
+): Promise<number> {
+  const entryIds = [...new Set(recalculations.map(item => item.entryId))];
+  if (!entryIds.length) return 0;
+  const rows = await inferenceRowsFor(recalculations, env);
+  await assertMemoryWritesAllowed(env);
 
-  // tags and created_at ride along on the statement above rather than costing a
-  // second read: the neighbour's kind is in its tags, and `follows` needs both
-  // ends' timestamps to know which way it points.
-  const kindById = new Map(results.map(r => {
-    let tags: string[] = [];
-    try { tags = JSON.parse(r.tags ?? "[]"); } catch { tags = []; }
-    return [r.id, getKind(tags)];
-  }));
-  const createdAtById = new Map(results.map(r => [r.id, r.created_at]));
-  const sourceById = new Map(results.map(r => [r.id, r.source ?? ""]));
-
-  /**
-   * The kind the `follows` gate reads.
-   *
-   * The caller passes one only on the capture path, where the classifier has
-   * just run and `null` is a real answer meaning classification failed, so an
-   * explicit null is honoured rather than second-guessed from the tags. Every
-   * other caller (the nightly backfill, the update path, the append path) passes
-   * nothing, and for those the row's own classifier kind is already in hand from
-   * the SELECT above. Without this fallback those three paths could never type
-   * an edge at all, which matters because a Vectorize write is not immediately
-   * queryable: the predecessor written moments ago is often invisible to capture
-   * and only ever seen by the backfill.
-   */
-  const newKind = opts.newKind !== undefined ? opts.newKind : (kindById.get(newId) ?? null);
-
-  /**
-   * A mirrored record is a mailbox or calendar entry, not a thought someone had
-   * next. An import writes dozens of them minutes apart, and typing those as
-   * `follows` would describe the order the mailbox synced, the shape of a bulk
-   * write, which is the artefact the burst guard already refuses by another
-   * route. Cheap to exclude: the source is on the row the workspace check reads.
-   */
-  const mirrored = (id: string) => MIRRORED_SOURCES.has(sourceById.get(id) ?? "");
-
-  const newCreatedAt = createdAtById.get(newId) ?? null;
-  // Absent from the read means the entry does not exist, which is refused
-  // below, so an unknown neighbour is not "same workspace" either.
-  const sameWorkspace = (id: string) => workspaceById.get(id) === workspaceId;
-  /** Strictly earlier than the new entry, and close enough to be one thought. */
-  const precedesInWindow = (id: string) => {
-    const at = createdAtById.get(id);
-    if (newCreatedAt === null || at === null || at === undefined) return false;
-    const gap = newCreatedAt - at;
-    return gap > 0 && gap <= GRAPH_FOLLOWS_WINDOW_MS;
-  };
-
-  // The burst guard. A bulk import or a chunked transcript writes many episodic
-  // entries at once, and each would "follow" the last, a chain that records the
-  // shape of the write rather than the thinking. So `follows` is claimed only
-  // when exactly one candidate qualifies. Measured over the neighbours that were
-  // going to be linked anyway, which costs nothing; it is not a general check
-  // for "what else was written in this window", which would need its own read.
-  const qualifying = mirrored(newId) ? [] : top.filter(n =>
-    sameWorkspace(n.id)
-    && !mirrored(n.id)
-    && kindsAllowEdge("follows", newKind, kindById.get(n.id) ?? null)
-    && precedesInWindow(n.id));
-  const followsTarget = qualifying.length === 1 ? qualifying[0].id : null;
-
-  for (const n of top) {
-    // Two different members' private entries are never linked, whatever the
-    // vector index returned. This is the ENFORCEMENT, not a backstop behind one:
-    // of the three paths that reach here, two send the vector index no workspace
-    // filter at all.
-    //
-    //   - src/graph/pass.ts (nightly backfill) queries unfiltered on purpose,
-    //     its candidate rows include entries whose vectors predate workspace
-    //     stamping, so a filter on that field can match nothing (see the comment
-    //     there);
-    //   - src/capture/store.ts's append and update paths go through
-    //     neighborsFromVectorQuery (src/graph/traverse.ts), a plain unfiltered
-    //     query;
-    //   - only src/capture/entry.ts's capture path filters, via
-    //     checkDuplicateAndContradiction, and that filter is best-effort by
-    //     contract anyway (src/vectorize/scope.ts degrades to an unfiltered query
-    //     on a filter-shaped rejection and latches it per isolate).
-    //
-    // So a foreign neighbour arriving here is the ordinary case rather than the
-    // degraded one, and this check, which reads both endpoints' workspaces from
-    // `entries`, the authoritative source, never from vector metadata, is the
-    // only thing that makes the invariant true.
-    //
-    // A neighbour with no `entries` row at all, a vector that outlived the
-    // entry it indexed, is refused here too, which it did NOT used to be.
-    //
-    // The edge such a neighbour produces is unreachable: every graph read
-    // hydrates both endpoints through the caller's scope and drops what is
-    // missing. It was tolerated on the grounds that it changed nothing. It does
-    // now, in two ways:
-    //
-    //   - the nightly sweep (src/graph/pass.ts) deletes inferred edges with a
-    //     missing endpoint, which makes the source edgeless, which returns it to
-    //     the backfill's slate, which draws the same edge again. Left alone the
-    //     two passes trade the same row back and forth every night, spending an
-    //     embed, a Vectorize query and one of 25 backfill slots each time;
-    //   - a dangling id is not permanently dangling. src/entries/import.ts
-    //     accepts caller-supplied ids, so a later import can create a row with
-    //     that id in ANOTHER workspace and turn this into a live crossing edge.
-    //
-    // Refusing costs nothing: the absence is already visible in the endpoint
-    // read above. Within one workspace nothing else changes, which is every pair
-    // on a solo brain.
-    if (workspaceById.get(n.id) !== workspaceId) continue;
-
-    if (n.id === followsTarget) {
-      // Typed replaces generic: an earlier pass may already have drawn the
-      // undirected relates_to this edge supersedes. Only the INFERRED one goes.
-      // A relates_to the user drew themselves is a statement, not a guess.
-      //
-      // Ordered immediately before the insert in the same batch, because the
-      // two are one replacement: issued as separate calls, a failure between
-      // them leaves the pair with no edge at all, which is worse than either
-      // the old edge or the new one.
-      statements.push(env.DB.prepare(
-        // scope-exempt: by-id: the pair whose typed edge is being written, both endpoints already workspace-checked above
-        `DELETE FROM edges
-         WHERE ((source_id = ? AND target_id = ?) OR (source_id = ? AND target_id = ?))
-           AND type = 'relates_to' AND provenance = 'inferred'`,
-      ).bind(newId, n.id, n.id, newId));
-      const typed = edgeInsertStatement(newId, n.id, "follows", { weight: n.score, provenance: "inferred", ...sameWorkspaceEdge(workspaceId) }, env);
-      if (typed) { statements.push(typed); inserted++; }
-      continue;
-    }
-
-    // Guarded: a later write touching a pair that already has a typed edge,
-    // an edit, an append, the nightly backfill, falls to this branch outside
-    // the follows window and would otherwise stack relates_to on top of it.
-    const generic = edgeInsertStatement(newId, n.id, "relates_to", { weight: n.score, provenance: "inferred", ...sameWorkspaceEdge(workspaceId), onlyIfNoTypedEdge: true }, env);
-    if (generic) { statements.push(generic); inserted++; }
-  }
-
-  // One call for every edge this write produces. Capture spends most of this
-  // codebase's self-imposed ~50-call D1/AI budget embedding chunks before it
-  // ever gets here, so a call per edge is what puts a large multi-chunk
-  // capture over that self-imposed line (well under the platform's real
-  // 1,000-call ceiling).
-  if (statements.length) await env.DB.batch(statements);
-  // Counts INSERTs only, not the paired DELETE above a typed follows edge, a
-  // replacement is one edge, not zero or two. Read by the nightly graph pass
-  // (src/graph/pass.ts) to report "links inferred" in GET /stats/night.
-  return inserted;
+  const placeholders = entryIds.map(() => "?").join(", ");
+  const incident = `provenance = 'inferred' AND type = 'relates_to'
+    AND (source_id IN (${placeholders}) OR target_id IN (${placeholders}))`;
+  const results = await env.DB.batch([
+    env.DB.prepare(`UPDATE edges SET write_marker = ? WHERE ${incident}`)
+      .bind(memoryWriteMarker(env, "delete"), ...entryIds, ...entryIds),
+    // scope-exempt: incident is built only from authorized/recalculated entry IDs and deletes inferred edges touching exactly that set
+    env.DB.prepare(`DELETE FROM edges WHERE ${incident}`).bind(...entryIds, ...entryIds),
+    ...inferenceWriteStatements(rows, env),
+  ]);
+  // The first two statements stage/delete retired generic edges; only the
+  // inference writes have the upstream inserted/updated-edge count semantics.
+  return results.slice(2).reduce((sum, result) => sum + (result.meta.changes ?? 0), 0);
 }

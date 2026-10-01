@@ -24,8 +24,8 @@
  * ignores workspace bindings entirely, so a green mock proves nothing here.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { Client } from "@modelcontextprotocol/client";
+import { InMemoryTransport } from "@modelcontextprotocol/client";
 import worker from "../../src/index";
 import { buildMcpServer } from "../../src/mcp/server";
 import { makeSqliteD1, type SqliteD1 } from "../helpers/sqlite-d1";
@@ -93,7 +93,7 @@ async function edgeRows(a: string, b: string): Promise<{ source_id: string; targ
 /** The MCP `link`/`unlink` tools, driven through a real client as that member. */
 async function viaMcp(token: string, tool: "link" | "unlink", args: Record<string, unknown>): Promise<string> {
   const identity = (await resolveIdentityFromToken(token, env))!;
-  const server = buildMcpServer(env, ctx, identity);
+  const server = buildMcpServer(sqlite.admitEnv(env), ctx, identity);
   const [ct, st] = InMemoryTransport.createLinkedPair();
   const client = new Client({ name: "link-client", version: "1.0.0" });
   await Promise.all([client.connect(ct), server.connect(st)]);
@@ -222,6 +222,8 @@ describe("POST /link and the MCP link tool leave the database in the same state"
   it.each(CASES)("$name — both callers write the same edges rows", async ({ source, target, expectRows }) => {
     await call("POST", "/link", alice.token, { source_id: source, target_id: target });
     const afterHttp = await edgeRows(source, target);
+    await sqlite.db.prepare(`UPDATE edges SET write_marker = ?`)
+      .bind(sqlite.fixtureMarker("delete")).run();
     await sqlite.db.prepare(`DELETE FROM edges`).run();
 
     await viaMcp(alice.token, "link", { source_id: source, target_id: target, type: "relates_to" });
@@ -299,7 +301,7 @@ describe("a link the system draws on capture lands in the capturer's own layer",
     });
     env.AI = {
       run: vi.fn().mockImplementation(async (model: string) => {
-        if (model === "@cf/baai/bge-small-en-v1.5") return { data: [new Array(384).fill(0.1)] };
+        if (model === "@cf/google/embeddinggemma-300m") return { data: [new Array(768).fill(0.1)] };
         return sse('{"action":"contradiction","conflicting_id":"a-one","reason":"plan changed"}');
       }),
     } as unknown as Ai;
@@ -365,7 +367,7 @@ describe("a link the system draws on capture lands in the capturer's own layer",
     });
     env.AI = {
       run: vi.fn().mockImplementation(async (model: string) => {
-        if (model === "@cf/baai/bge-small-en-v1.5") return { data: [new Array(384).fill(0.1)] };
+        if (model === "@cf/google/embeddinggemma-300m") return { data: [new Array(768).fill(0.1)] };
         return sse;
       }),
     } as unknown as Ai;

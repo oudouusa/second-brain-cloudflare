@@ -1,28 +1,28 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
-import { DEFAULTS } from "../../src/config";
-import type { Env } from "../../src/env";
+import { resetStandingIsolateState } from "../../src/standing/cache";
 import worker from "../../src/index";
-import { recallEntries } from "../../src/recall/search";
-import type { RecallDiagnostics } from "../../src/recall/types";
-import { TAG_VOCABULARY_KEY } from "../../src/tags/vocabulary";
 import { FTS_READY_KV_KEY } from "../../src/constants";
-import { makeMemoryKV, makeTestEnv, makeVectorizeMock } from "../helpers/make-env";
-import { snapshotRecallBudget } from "../helpers/recall-budget";
-import { makeSqliteD1, type SqliteD1 } from "../helpers/sqlite-d1";
 import { resetFtsReadyMemo } from "../../src/recall/fts";
 import { initializeDatabase, resetDatabaseInit } from "../../src/db/init";
 import { ensureTenantBootstrap } from "../../src/lib/tenancy";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { DEFAULTS } from "../../src/config";
+import type { Env } from "../../src/env";
+import { recallEntries } from "../../src/recall/search";
+import type { RecallDiagnostics } from "../../src/recall/types";
+import { TAG_VOCABULARY_KEY } from "../../src/tags/vocabulary";
+import { makeMemoryKV, makeTestEnv, makeVectorizeMock } from "../helpers/make-env";
+import { snapshotRecallBudget } from "../helpers/recall-budget";
+import { makeSqliteD1, type SqliteD1 } from "../helpers/sqlite-d1";
+import { readDerivedStateGeneration } from "../../src/migration/write-lock";
 
 describe("recall stays within the Cloudflare Free operation envelope", () => {
   const open: SqliteD1[] = [];
   afterEach(() => open.splice(0).forEach(sqlite => sqlite.close()));
 
   async function setup(hops: 0 | 1) {
+    resetStandingIsolateState();
     const sqlite = makeSqliteD1();
     open.push(sqlite);
-    await sqlite.db.prepare(`ALTER TABLE entries ADD COLUMN updated_at INTEGER`).run();
-    await sqlite.db.prepare(`ALTER TABLE entries ADD COLUMN valid_from INTEGER`).run();
-    await sqlite.db.prepare(`ALTER TABLE entries ADD COLUMN valid_until INTEGER`).run();
     sqlite.seed({ id: "root", content: "atlas ledger changed", createdAt: 1000, tags: ["work"] });
     if (hops) {
       sqlite.seed({ id: "neighbor", content: "reconciliation rationale", createdAt: 1001, tags: ["work"] });
@@ -33,7 +33,6 @@ describe("recall stays within the Cloudflare Free operation envelope", () => {
     }
 
     const kv = makeMemoryKV();
-    await kv.put(TAG_VOCABULARY_KEY, JSON.stringify({ tags: ["work"], rebuiltAt: Date.now() }));
     const vectorQuery = vi.fn().mockResolvedValue({
       matches: [{ id: "root", score: .9, metadata: { parentId: "root", created_at: 1000 } }],
     });
@@ -42,27 +41,30 @@ describe("recall stays within the Cloudflare Free operation envelope", () => {
       OAUTH_KV: kv,
       VECTORIZE: makeVectorizeMock({ query: vectorQuery }),
     });
+    await kv.put(TAG_VOCABULARY_KEY, JSON.stringify({
+      tags: ["work"],
+      rebuiltAt: Date.now(),
+      generation: await readDerivedStateGeneration(env),
+    }));
     const deferred: Promise<unknown>[] = [];
     const ctx = { waitUntil: (promise: Promise<unknown>) => deferred.push(promise) } as unknown as ExecutionContext;
     const diagnostics: RecallDiagnostics = {};
-    return { env, ctx, diagnostics, deferred };
+
+    return { env: sqlite.admitEnv(env), ctx, diagnostics, deferred };
   }
 
   async function run(hops: 0 | 1) {
-    // Each case models its own invocation; the readiness answer is cached per
-    // isolate for FTS_READY_CACHE_MS, so a cold start must be simulated or the
-    // second case would inherit the first case's cached answer and undercount.
     resetFtsReadyMemo();
-    const state = await setup(hops);
+    const { env, ctx, diagnostics, deferred } = await setup(hops);
     const result = await recallEntries(
       { query: "why atlas ledger changed", topK: 5, hops, synthesize: false },
-      state.env,
-      state.ctx,
+      env,
+      ctx,
       DEFAULTS,
-      { diagnostics: state.diagnostics },
+      { diagnostics },
     );
-    await Promise.all(state.deferred);
-    return snapshotRecallBudget(state.diagnostics, result);
+    await Promise.all(deferred);
+    return snapshotRecallBudget(diagnostics, result);
   }
 
   it("charges one existing operation path for direct recall", async () => {
@@ -75,20 +77,14 @@ describe("recall stays within the Cloudflare Free operation envelope", () => {
       embeddingCalls: 1,
       vectorizeQueries: 1,
       vectorizeGets: 0,
-      // Tag vocabulary read plus the FTS readiness flag read (Task 3): the
-      // keyword arm checks fts:ready on every non-tag recall. The answer is
-      // cached per isolate for FTS_READY_CACHE_MS in both directions, so a
-      // cold isolate pays one read per recall window, not per request.
-      // Deliberate +1 (Track 7 lane D Task 11): readStandingCaches's own bulk KV get, one call for
-      // every readable workspace (here, the single '' legacy workspace this identity-less caller
-      // reads), started alongside distillation and paid whether or not a standing cache exists.
-      kvReads: 3,
-      kvWrites: 0,
+      // embedding cacheのmiss読取とwaitUntilでの保存を含める。
+      kvReads: 5,
+      kvWrites: 1,
       graphSeeds: 0,
       expandedNodes: 0,
       renderedResults: 1,
     });
-    expect(budget.d1Statements).toBe(5);
+    expect(budget.d1Statements).toBe(6);
     expect(budget.d1Statements).toBeLessThanOrEqual(30);
     // The observer runs first() as all() so its meta is seen. This double reports
     // no rows_read at all, so the read total stays unknown (never a fabricated
@@ -104,15 +100,13 @@ describe("recall stays within the Cloudflare Free operation envelope", () => {
     expect(budget.embeddingCalls).toBe(1);
     expect(budget.vectorizeQueries).toBe(1);
     expect(budget.vectorizeGets).toBe(0);
-    // Tag vocabulary read plus the FTS readiness flag read (Task 3); the
-    // ready-cache reset in run() models each case's cold isolate.
-    expect(budget.kvReads).toBe(2);
-    expect(budget.kvWrites).toBe(0);
+    expect(budget.kvReads).toBe(5);
+    expect(budget.kvWrites).toBe(1);
     expect(budget.workerRequests).toBe(1);
     expect(budget.graphSeeds).toBe(1);
     expect(budget.expandedNodes).toBe(1);
     expect(budget.renderedResults).toBeLessThanOrEqual(5);
-    expect(budget.d1Statements).toBe(7);
+    expect(budget.d1Statements).toBe(8);
     expect(budget.d1Statements).toBeLessThanOrEqual(30);
     expect(budget.d1RowsRead).toBeNull();
     expect(budget.d1RowsWritten).toBeTypeOf("number");
@@ -133,7 +127,7 @@ describe("recall stays within the Cloudflare Free operation envelope", () => {
       { diagnostics: state.diagnostics },
     );
     await Promise.all(state.deferred);
-    expect(snapshotRecallBudget(state.diagnostics, cold).kvReads).toBe(2); // tag vocabulary + the readiness flag
+    expect(snapshotRecallBudget(state.diagnostics, cold).kvReads).toBe(5); // vocabulary, readiness, query cache, AI health, standing
 
     const warmDiagnostics: RecallDiagnostics = {};
     const warm = await recallEntries(
@@ -144,20 +138,11 @@ describe("recall stays within the Cloudflare Free operation envelope", () => {
       { diagnostics: warmDiagnostics },
     );
     await Promise.all(state.deferred);
-    expect(snapshotRecallBudget(warmDiagnostics, warm).kvReads).toBe(1); // tag vocabulary only; no readiness re-read
+    expect(snapshotRecallBudget(warmDiagnostics, warm).kvReads).toBe(2); // vocabulary and query cache; no readiness or standing re-read
   });
 
-  // Write-path isolation v2.2: the liveness check (src/recall/fts.ts) rides
-  // in the SAME env.DB.batch() as the FTS query, so it costs one extra SQL
-  // statement but zero extra subrequests — a batch counts as one D1 call
-  // (src/recall/diagnostics.ts's observeD1) regardless of how many
-  // statements it carries, the same convention production D1 bills by.
-  // MOVED 6 -> 5 (T-0065): entry_counts replaced distillation's scoped
-  // COUNT(*)/cache with an exact, O(1) per-workspace counter, so total, every
-  // per-term count, and the liveness check now ride in ONE batch always — the
-  // same one D1 call the LIKE df scan cost, not two. Cold and warm are now
-  // identical: there is no cache left to be cold against.
-  it("a live FTS index costs no extra D1 call over the LIKE-path baseline — distillation's total is exact, not scanned", async () => {
+  // forkのdiagnosticsはD1 batchを呼出し数ではなく含まれるSQL文数で計上する。
+  it("a live FTS index stays within eight SQL statements, counting each batched statement", async () => {
     resetFtsReadyMemo();
     const state = await setup(0);
     await state.env.OAUTH_KV.put(FTS_READY_KV_KEY, "1");
@@ -175,12 +160,8 @@ describe("recall stays within the Cloudflare Free operation envelope", () => {
     // T-0059: distillation counted through the index, or (every row here holds the terms) the one pass that prices cheaper; same call either way
     expect(["fts", "scan"]).toContain(state.diagnostics.distillSource);
     const budget = snapshotRecallBudget(state.diagnostics, result);
-    // T-0059/T-0065 (distill.ts): the LIKE df scan (1 D1 call) is replaced by
-    // ONE batch — liveness, entry_counts' total, and every per-term count
-    // together — the same one call, so the 5-call LIKE-path baseline above
-    // does not move. keywordSearch's own FTS query (liveness + MATCH rows) is
-    // unchanged at one batch.
-    expect(budget.d1Statements).toBe(5);
+    // FTS健全性検査とentry_counts集計を含むバッチ内のSQLも数える。
+    expect(budget.d1Statements).toBe(8);
   });
 
   it("a second recall costs the same as the first — entry_counts is exact, not cached, so there is no cold/warm split", async () => {
@@ -205,7 +186,7 @@ describe("recall stays within the Cloudflare Free operation envelope", () => {
     expect(["fts", "scan"]).toContain(warmDiagnostics.distillSource);
     // Matches the first call above exactly (T-0065): entry_counts has no
     // warm/cold distinction left to be cheaper than the first call.
-    expect(snapshotRecallBudget(warmDiagnostics, warm).d1Statements).toBe(5);
+    expect(snapshotRecallBudget(warmDiagnostics, warm).d1Statements).toBe(8);
   });
 
   // MINOR 4b (final review): every case above calls recallEntries directly,
@@ -216,9 +197,10 @@ describe("recall stays within the Cloudflare Free operation envelope", () => {
   // same way production does) against a freshly migrated real SQLite brain
   // (initializeDatabase, not a pre-populated D1 mock) — so the pinned count
   // reflects an actual request's real cost, not a hand-assembled one.
-  it("a real GET /recall request through worker.fetch pins its D1 subrequest count end to end", async () => {
+  it("a real POST /recall request through worker.fetch pins its D1 subrequest count end to end", async () => {
     resetDatabaseInit();
     resetFtsReadyMemo();
+    resetStandingIsolateState();
     const sqlite = makeSqliteD1();
     open.push(sqlite);
     const kv = makeMemoryKV();
@@ -243,8 +225,10 @@ describe("recall stays within the Cloudflare Free operation envelope", () => {
     const ctx = { waitUntil: (p: Promise<unknown>) => deferred.push(p) } as unknown as ExecutionContext;
 
     const res = await worker.fetch(
-      new Request("http://localhost/recall?query=why+atlas+ledger+changed&topK=5", {
-        headers: { Authorization: "Bearer test-token" },
+      new Request("http://localhost/recall", {
+        method: "POST",
+        body: JSON.stringify({query: "why atlas ledger changed", topK: 5}),
+        headers: { Authorization: "Bearer test-token", "Content-Type": "application/json" },
       }),
       env, ctx,
     );
@@ -258,6 +242,8 @@ describe("recall stays within the Cloudflare Free operation envelope", () => {
     // resolution, distillation, the keyword and dense arms, candidate
     // hydration, and the deferred recall_count bump. If this number moves,
     // say why in the same commit.
-    expect(sqlite.issued.length).toBe(7);
+
+    // admission取得・解放3文、generation初期化4文、vocabulary再構築1文も含む。
+    expect(sqlite.issued.length).toBe(15);
   });
 });

@@ -48,7 +48,8 @@
  * an empty brain, not an error.
  */
 import type { Env } from "../env";
-import { scopeWorkspaces } from "../lib/scope";
+import { readDerivedStateGeneration } from "../migration/write-lock";
+import { readScopeWorkspaces } from "../lib/scope";
 import type { Identity } from "../lib/identity";
 
 // Prefixed to coexist with workers-oauth-provider's token:/grant:/client: keys,
@@ -109,19 +110,28 @@ export const TAG_VOCABULARY_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 interface CachedVocabulary {
   tags: string[];
   rebuiltAt: number;
+  generation: string;
 }
 
 /** Any failure reads as "nothing cached", which costs a scan rather than a request. */
-async function readCache(env: Env, key: string = TAG_VOCABULARY_KEY): Promise<CachedVocabulary | null> {
+async function readCache(
+  env: Env,
+  key: string = TAG_VOCABULARY_KEY,
+  knownGeneration?: string,
+): Promise<CachedVocabulary | null> {
   try {
-    const raw = await env.OAUTH_KV.get(key);
+    const [generation, raw] = await Promise.all([
+      knownGeneration ?? readDerivedStateGeneration(env),
+      env.OAUTH_KV.get(key),
+    ]);
     if (!raw) return null;
     const parsed = JSON.parse(raw) as unknown;
     if (typeof parsed !== "object" || parsed === null) return null;
-    const { tags, rebuiltAt } = parsed as Record<string, unknown>;
-    if (!Array.isArray(tags)) return null;
+    const { tags, rebuiltAt, generation: cachedGeneration } = parsed as Record<string, unknown>;
+    if (!Array.isArray(tags) || cachedGeneration !== generation) return null;
     return {
       tags: tags.filter((t): t is string => typeof t === "string"),
+      generation,
       // A missing or unusable timestamp reads as "never reconciled" — 0 — so the value
       // is still served and a rebuild is still scheduled. A timestamp in the future is
       // unusable in exactly that sense: nothing can have been reconciled at a moment
@@ -182,6 +192,28 @@ async function scanTagVocabulary(env: Env): Promise<string[]> {
     .sort();
 }
 
+async function scanTagVocabularyByWorkspace(
+  env: Env,
+  workspaceIds: string[],
+): Promise<Map<string, string[]>> {
+  const byWorkspace = new Map<string, string[]>(workspaceIds.map(id => [id, []]));
+  if (!workspaceIds.length) return byWorkspace;
+  const placeholders = workspaceIds.map(() => "?").join(", ");
+  const { results } = await env.DB.prepare(
+    `SELECT DISTINCT workspace_id, value
+       FROM entries, json_each(entries.tags)
+      WHERE workspace_id IN (${placeholders})`,
+  ).bind(...workspaceIds).all();
+  for (const row of results as { workspace_id: unknown; value: unknown }[]) {
+    if (typeof row.workspace_id !== "string" || typeof row.value !== "string") continue;
+    byWorkspace.get(row.workspace_id)?.push(row.value);
+  }
+  for (const [id, tags] of byWorkspace) {
+    byWorkspace.set(id, [...new Set(tags)].sort());
+  }
+  return byWorkspace;
+}
+
 /**
  * The workspace-partitioned scan: every (workspace, tag) pair for the named
  * workspaces, in ONE statement.
@@ -195,31 +227,18 @@ async function scanTagVocabulary(env: Env): Promise<string[]> {
  * alongside value and splitting the rows in JS reads the table once, exactly as
  * the corpus-wide scan did.
  */
-async function scanTagVocabularyByWorkspace(
+async function writeCache(
   env: Env,
-  workspaceIds: string[],
-): Promise<Map<string, string[]>> {
-  const placeholders = workspaceIds.map(() => "?").join(", ");
-  const { results } = await env.DB.prepare(
-    `SELECT DISTINCT workspace_id, value FROM entries, json_each(entries.tags) WHERE workspace_id IN (${placeholders})`
-  ).bind(...workspaceIds).all();
-
-  // Seed every requested workspace so one with no entries yet caches an empty
-  // vocabulary rather than re-scanning on every read.
-  const byWorkspace = new Map<string, string[]>(workspaceIds.map(w => [w, []]));
-  for (const row of results as { workspace_id: unknown; value: unknown }[]) {
-    if (typeof row.value !== "string") continue;
-    const wid = typeof row.workspace_id === "string" ? row.workspace_id : "";
-    byWorkspace.get(wid)?.push(row.value);
-  }
-  for (const [wid, tags] of byWorkspace) byWorkspace.set(wid, [...new Set(tags)].sort());
-  return byWorkspace;
-}
-
-/** Store one workspace's freshly scanned vocabulary. Never throws. */
-async function writeCache(env: Env, key: string, tags: string[]): Promise<void> {
+  key: string,
+  tags: string[],
+  generation: string,
+): Promise<void> {
   try {
-    await env.OAUTH_KV.put(key, JSON.stringify({ tags, rebuiltAt: Date.now() } satisfies CachedVocabulary));
+    await env.OAUTH_KV.put(key, JSON.stringify({
+      tags,
+      rebuiltAt: Date.now(),
+      generation,
+    } satisfies CachedVocabulary));
   } catch (e) {
     console.error("Tag vocabulary cache write failed (non-fatal):", e);
   }
@@ -232,15 +251,20 @@ async function writeCache(env: Env, key: string, tags: string[]): Promise<void> 
  * go through `rebuildWorkspaces`, which partitions.
  */
 async function rebuildTagVocabulary(env: Env, key: string): Promise<string[]> {
+  // Read before scanning. A restore that rotates the generation while this work
+  // is in flight makes the eventual cache write unreadable instead of stale-valid.
+  const generation = await readDerivedStateGeneration(env);
   const tags = await scanTagVocabulary(env);
-  await writeCache(env, key, tags);
+  await writeCache(env, key, tags, generation);
   return tags;
 }
 
 /** Scan the named workspaces in one statement and store each one's blob. */
 async function rebuildWorkspaces(env: Env, workspaceIds: string[]): Promise<Map<string, string[]>> {
+  const generation = await readDerivedStateGeneration(env);
   const scanned = await scanTagVocabularyByWorkspace(env, workspaceIds);
-  await Promise.all([...scanned].map(([wid, tags]) => writeCache(env, tagVocabularyKey(wid), tags)));
+  await Promise.all([...scanned].map(([wid, tags]) =>
+    writeCache(env, tagVocabularyKey(wid), tags, generation)));
   return scanned;
 }
 
@@ -269,11 +293,18 @@ async function rebuildWorkspaces(env: Env, workspaceIds: string[]): Promise<Map<
  * rare and its cost is one extra scan, which is what every recall used to cost. Add
  * an isolate-scoped guard if that ever shows up in a bill, not before.
  */
-export async function getTagVocabulary(env: Env, ctx?: ExecutionContext, identity?: Identity, only?: "personal" | "company"): Promise<string[]> {
+export async function getTagVocabulary(
+  env: Env,
+  ctx?: ExecutionContext,
+  identity?: Identity,
+  only?: "personal" | "company",
+  teamId?: string,
+): Promise<string[]> {
   // No identity means system code with no reader to leak to — background jobs and
   // the pre-team single-owner path. Keep the corpus-wide key and scan they had.
   if (!identity) {
-    const cached = await readCache(env, TAG_VOCABULARY_KEY);
+    const generation = await readDerivedStateGeneration(env);
+    const cached = await readCache(env, TAG_VOCABULARY_KEY, generation);
     if (cached && Date.now() - cached.rebuiltAt < TAG_VOCABULARY_MAX_AGE_MS) return cached.tags;
     if (cached && ctx) {
       ctx.waitUntil(
@@ -290,9 +321,10 @@ export async function getTagVocabulary(env: Env, ctx?: ExecutionContext, identit
     }
   }
 
-  const workspaces = scopeWorkspaces(identity, only);
+  const workspaces = readScopeWorkspaces(identity, { layer: only, teamId });
+  const generation = await readDerivedStateGeneration(env);
   const cached = await Promise.all(
-    workspaces.map(async w => [w, await readCache(env, tagVocabularyKey(w))] as const),
+    workspaces.map(async w => [w, await readCache(env, tagVocabularyKey(w), generation)] as const),
   );
 
   const fresh = Date.now();
@@ -374,14 +406,14 @@ export async function rememberTags(env: Env, tags: string[], workspaceId?: strin
   // it buys nothing: no production path reads the corpus-wide key on a v3 brain
   // (recallEntries' only two callers, the /recall route and the MCP tool, both
   // resolve an Identity first), so the second KV get was pure cost — three extra
-  // calls a night against the weekly insight cron's self-imposed ~50-call D1
-  // budget (the platform's real ceiling is 1,000 per invocation).
+  // subrequests a night against the weekly insight cron's 50-subrequest budget.
   await admitInto(env, workspaceId ? tagVocabularyKey(workspaceId) : TAG_VOCABULARY_KEY, tags);
 }
 
 async function admitInto(env: Env, key: string, tags: string[]): Promise<void> {
   try {
-    const cached = await readCache(env, key);
+    const generation = await readDerivedStateGeneration(env);
+    const cached = await readCache(env, key, generation);
     if (!cached) return;
 
     const known = new Set(cached.tags);
@@ -400,7 +432,7 @@ async function admitInto(env: Env, key: string, tags: string[]): Promise<void> {
     // narrows both windows to the put itself — KV has no compare-and-set, so they
     // cannot be closed, and the residual cost is one scan, which is what every recall
     // used to cost.
-    const latest = (await readCache(env, key)) ?? cached;
+    const latest = (await readCache(env, key, generation)) ?? cached;
     const merged = new Set(latest.tags);
     for (const tag of additions) merged.add(tag);
     if (merged.size === latest.tags.length) return;
@@ -410,6 +442,7 @@ async function admitInto(env: Env, key: string, tags: string[]): Promise<void> {
       JSON.stringify({
         tags: [...merged].sort(),
         rebuiltAt: Math.max(cached.rebuiltAt, latest.rebuiltAt),
+        generation: latest.generation,
       } satisfies CachedVocabulary)
     );
   } catch (e) {

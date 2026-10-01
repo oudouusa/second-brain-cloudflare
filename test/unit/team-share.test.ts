@@ -31,7 +31,7 @@ async function makeEnv() {
   // module-scoped, so each fresh database needs the seam reset first.
   resetDatabaseInit();
   await initializeDatabase(env);
-  return { env, ctx };
+  return { env: d1.admitEnv(env), ctx };
 }
 
 describe("share semantics", () => {
@@ -51,6 +51,10 @@ describe("share semantics", () => {
     });
     const { id } = await env.DB.prepare(`SELECT id FROM entries LIMIT 1`).first<{ id: string }>() ?? {};
     expect(id).toBeTruthy();
+    await env.DB.prepare(
+      `INSERT INTO entries (id, content, tags, source, created_at, vector_ids, workspace_id, actor_id)
+       VALUES ('other', 'related note', '[]', 'api', 1, '[]', ?, ?)`,
+    ).bind(owner.personalWorkspaceId, owner.userId).run();
     await env.DB.prepare(`INSERT INTO edges (id, source_id, target_id, type, weight, provenance, metadata, created_at, updated_at, workspace_id) VALUES ('e1', ?, 'other', 'relates_to', 0.5, 'explicit', '{}', 1, 1, ?)`)
       .bind(id!, owner.personalWorkspaceId).run();
 

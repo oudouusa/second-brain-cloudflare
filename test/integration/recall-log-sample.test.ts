@@ -21,7 +21,7 @@ describe("sampled recall log", () => {
     resetDatabaseInit();
     sqlite = makeSqliteD1();
     const kv = makeMemoryKV();
-    const bootEnv = makeTestEnv(undefined, { DB: sqlite.db as unknown as D1Database, OAUTH_KV: kv });
+    const bootEnv = sqlite.admitEnv(makeTestEnv(undefined, { DB: sqlite.db as unknown as D1Database, OAUTH_KV: kv }));
     await initializeDatabase(bootEnv);
     const roots = await ensureTenantBootstrap(bootEnv);
     sqlite.seed({ id: "m1", content: "atlas ledger note", createdAt: 1000, tags: ["work"] });
@@ -29,17 +29,17 @@ describe("sampled recall log", () => {
     await kv.put(TAG_VOCABULARY_KEY, JSON.stringify({ tags: ["work"], rebuiltAt: Date.now() }));
     if (recallLogOn) await kv.put(CONFIG_KEY, JSON.stringify({ RECALL_LOG: "on" }));
 
-    const env: Env = makeTestEnv(undefined, {
+    const env: Env = sqlite.admitEnv(makeTestEnv(undefined, {
       DB: sqlite.db as unknown as D1Database,
       OAUTH_KV: kv,
       VECTORIZE: makeVectorizeMock({
         query: vi.fn().mockResolvedValue({ matches: [{ id: "m1", score: 0.9, metadata: { parentId: "m1", created_at: 1000 } }] }),
       }),
-    });
+    }));
     const deferred: Promise<unknown>[] = [];
     const ctx = { waitUntil: (p: Promise<unknown>) => deferred.push(p) } as unknown as ExecutionContext;
     const res = await worker.fetch(
-      new Request(`http://localhost/recall?query=atlas+ledger+note&topK=5`, { headers: { Authorization: "Bearer test-token" } }),
+      new Request("http://localhost/recall", { method: "POST", headers: { Authorization: "Bearer test-token", "Content-Type": "application/json" }, body: JSON.stringify({ query: "atlas ledger note", topK: 5 }) }),
       env, ctx,
     );
     await Promise.all(deferred);

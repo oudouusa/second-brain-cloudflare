@@ -68,12 +68,13 @@ describe("core.buildRecallPlan / buildRecallUrl / buildBriefUrl", () => {
     expect(plan[1].project).toBeUndefined();
     const url = new URL(core.buildRecallUrl("https://w.example", plan[0]));
     expect(url.pathname).toBe("/recall");
-    expect(url.searchParams.get("project")).toBe("brain-app");
-    expect(url.searchParams.get("workspace")).toBe("personal");
+    expect(JSON.parse(core.buildRecallBody(plan[0]))).toMatchObject({ project: "brain-app", workspace: "personal" });
+    expect(url.search).toBe("");
   });
   it("always sends synthesize=0 (4.0: no hook-initiated recall pays for LLM synthesis)", () => {
     const url = new URL(core.buildRecallUrl("https://w.example", { query: "q", topK: 5, workspace: "personal" }));
-    expect(url.searchParams.get("synthesize")).toBe("0");
+    expect(JSON.parse(core.buildRecallBody({ query: "q", topK: 5, workspace: "personal" })).synthesize).toBe(false);
+    expect(url.search).toBe("");
   });
   it("uses a recent-window generic query when there is no project", () => {
     const plan = core.buildRecallPlan(null, "personal", 1_000_000_000_000);
@@ -289,12 +290,12 @@ describe("core timing defaults", () => {
 });
 
 describe("core.performRecall", () => {
-  const withStub = async (handler: (url: URL) => { status: number; body: unknown } | null, run: () => Promise<unknown>) => {
+  const withStub = async (handler: (url: URL, init?: RequestInit) => { status: number; body: unknown } | null, run: () => Promise<unknown>) => {
     const realFetch = global.fetch;
     // @ts-expect-error test stub
     global.fetch = async (url: string, init?: RequestInit) => {
       const u = new URL(String(url));
-      const hit = handler(u);
+      const hit = handler(u, init);
       if (!hit) throw new Error("unreachable");
       return new Response(JSON.stringify(hit.body), { status: hit.status, headers: { "Content-Type": "application/json" } });
     };
@@ -354,9 +355,9 @@ describe("core.performRecall", () => {
   it("falls back to free text when the project arm 404s", async () => {
     const urls: string[] = [];
     const out = await withStub(
-      (u) => {
+      (u, init) => {
         urls.push(u.pathname + u.search);
-        if (u.pathname === "/recall" && u.searchParams.get("project")) return { status: 404, body: { ok: false } };
+        if (u.pathname === "/recall" && JSON.parse(String(init?.body)).project) return { status: 404, body: { ok: false } };
         if (u.pathname === "/recall") return { status: 200, body: { ok: true, results: [{ content: "fallback note" }] } };
         if (u.pathname === "/brief") return { status: 200, body: { ok: true } };
         return null;

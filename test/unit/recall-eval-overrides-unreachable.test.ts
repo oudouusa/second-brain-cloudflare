@@ -21,7 +21,7 @@ describe("eval-only recall switches are unreachable from routes and MCP", () => 
     expect(callers.map(rel).sort()).toEqual(["mcp/server.ts", "routes/recall.ts"]);
     for (const f of callers) {
       const src = readFileSync(f, "utf8");
-      const calls = [...src.matchAll(/recallEntries\([\s\S]*?\}, env, ctx, cfg, (\{[^}]*\})\)/g)];
+      const calls = [...src.matchAll(/recallEntries\([\s\S]*?\},\s*env,\s*ctx,\s*cfg,\s*(\{[^}]*\}),?\s*\)/g)];
       expect(calls.length, rel(f)).toBeGreaterThan(0);
       for (const c of calls) {
         const keys = c[1].slice(1, -1).split(",").map(part => part.split(":")[0].trim()).filter(Boolean);

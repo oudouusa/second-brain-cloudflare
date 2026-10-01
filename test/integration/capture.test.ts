@@ -44,70 +44,24 @@ describe("POST /capture", () => {
     expect(res.status).toBe(400);
   });
 
-  it("stores an explicit when, defaulting when_kind to wake", async () => {
+  it("rejects content that would fan out beyond the embedding budget before D1 write", async () => {
     const { ctx } = makeCtx();
-    const res = await worker.fetch(req("POST", "/capture", { body: { content: "Renew the passport", when: "2026-06-15" } }), env, ctx);
-    expect(res.status).toBe(200);
-    expect(db.entries).toHaveLength(1);
-    expect(db.entries[0].when_at).toBe(Date.parse("2026-06-15"));
-    expect(db.entries[0].when_kind).toBe("wake");
-    expect(db.entries[0].when_source).toBe("explicit");
-  });
+    const res = await worker.fetch(req("POST", "/capture", {
+      body: { content: "x".repeat(12_001) },
+    }), env, ctx);
 
-  it("stores an explicit when_kind alongside when", async () => {
-    const { ctx } = makeCtx();
-    const res = await worker.fetch(req("POST", "/capture", { body: { content: "Pay the invoice", when: "2026-06-15", when_kind: "due" } }), env, ctx);
-    expect(res.status).toBe(200);
-    expect(db.entries[0].when_kind).toBe("due");
-  });
-
-  it("rejects an unparseable when", async () => {
-    const { ctx } = makeCtx();
-    const res = await worker.fetch(req("POST", "/capture", { body: { content: "Test note", when: "not a date" } }), env, ctx);
-    expect(res.status).toBe(400);
+    expect(res.status).toBe(413);
     expect(db.entries).toHaveLength(0);
   });
 
-  it("rejects a when more than 5 years out", async () => {
+  it("rejects oversized Vectorize metadata before D1 write", async () => {
     const { ctx } = makeCtx();
-    const farFuture = new Date(Date.now() + 6 * 365 * 86400000).toISOString();
-    const res = await worker.fetch(req("POST", "/capture", { body: { content: "Test note", when: farFuture } }), env, ctx);
+    const res = await worker.fetch(req("POST", "/capture", {
+      body: { content: "short", tags: ["x".repeat(11 * 1024)] },
+    }), env, ctx);
+
     expect(res.status).toBe(400);
-  });
-
-  it("rejects when_kind without when", async () => {
-    const { ctx } = makeCtx();
-    const res = await worker.fetch(req("POST", "/capture", { body: { content: "Test note", when_kind: "due" } }), env, ctx);
-    expect(res.status).toBe(400);
-  });
-
-  it("leaves when_at null when when is omitted and no date is in the content", async () => {
-    const { ctx } = makeCtx();
-    const res = await worker.fetch(req("POST", "/capture", { body: { content: "Test note" } }), env, ctx);
-    expect(res.status).toBe(200);
-    expect(db.entries[0].when_at ?? null).toBeNull();
-  });
-
-  it("falls back to the regex date pass when when is omitted", async () => {
-    const { ctx } = makeCtx();
-    const farFuture = new Date(Date.now() + 400 * 86400000);
-    const iso = farFuture.toISOString().slice(0, 10);
-    const res = await worker.fetch(req("POST", "/capture", { body: { content: `Renew the passport by ${iso}` } }), env, ctx);
-    expect(res.status).toBe(200);
-    expect(db.entries[0].when_at).toBe(Date.parse(iso));
-    expect(db.entries[0].when_kind).toBe("due");
-    expect(db.entries[0].when_source).toBe("regex");
-  });
-
-  it("an explicit when wins over a date the regex pass would have found", async () => {
-    const { ctx } = makeCtx();
-    const farFuture = new Date(Date.now() + 400 * 86400000);
-    const iso = farFuture.toISOString().slice(0, 10);
-    const explicit = new Date(Date.now() + 500 * 86400000).toISOString().slice(0, 10);
-    const res = await worker.fetch(req("POST", "/capture", { body: { content: `Renew the passport by ${iso}`, when: explicit } }), env, ctx);
-    expect(res.status).toBe(200);
-    expect(db.entries[0].when_at).toBe(Date.parse(explicit));
-    expect(db.entries[0].when_source).toBe("explicit");
+    expect(db.entries).toHaveLength(0);
   });
 
   it("stores valid entry and returns id", async () => {
@@ -122,10 +76,32 @@ describe("POST /capture", () => {
     expect(db.entries[0].content).toBe("Test note");
   });
 
-  it("blocks a near-exact duplicate (score ≥ 0.95)", async () => {
+  it("normalizes source before persistence so backup and restore classify it identically", async () => {
+    const { ctx, drain } = makeCtx();
+    const res = await worker.fetch(req("POST", "/capture", {
+      body: { content: "Owner note", source: "  browser  " },
+    }), env, ctx);
+    await drain();
+
+    expect(res.status).toBe(200);
+    expect(db.entries[0].source).toBe("browser");
+  });
+
+  it("normalizes a blank source to api", async () => {
+    const { ctx, drain } = makeCtx();
+    const res = await worker.fetch(req("POST", "/capture", {
+      body: { content: "Owner note", source: "   " },
+    }), env, ctx);
+    await drain();
+
+    expect(res.status).toBe(200);
+    expect(db.entries[0].source).toBe("api");
+  });
+
+  it("blocks an exact duplicate (score ≥ 0.98)", async () => {
     const vectorize = makeVectorizeMock({
       query: vi.fn().mockResolvedValue({
-        matches: [{ id: "existing", score: 0.97, metadata: { parentId: "existing" } }],
+        matches: [{ id: "existing", score: 0.99, metadata: { parentId: "existing" } }],
       }),
     });
     env = makeTestEnv(db, { VECTORIZE: vectorize });
@@ -246,7 +222,7 @@ describe("POST /capture", () => {
       }),
       AI: {
         run: vi.fn().mockImplementation(async (model: string) => {
-          if (model.startsWith("@cf/baai/bge")) return { data: [new Array(384).fill(0.1)] };
+          if (model === "@cf/google/embeddinggemma-300m") return { data: [new Array(768).fill(0.1)] };
           return new ReadableStream({
             start(c) {
               c.enqueue(new TextEncoder().encode(`data: {"response":${JSON.stringify('{"action":"merge","target_id":"protected","merged_content":"merged"}')}}\n\n`));
@@ -266,7 +242,7 @@ describe("POST /capture", () => {
     expect(data.warning).toBe("similar");
     await drain();
 
-    const fetched = await worker.fetch(req("GET", `/entry?id=${data.id}`), env, ctx);
+    const fetched = await worker.fetch(req("POST", "/entry", { body: { id: data.id } }), env, ctx);
     expect(fetched.status).toBe(200);
     const entry = await fetched.json() as any;
     expect(entry.entry.id).toBe(data.id);

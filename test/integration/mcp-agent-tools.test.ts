@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { Client } from "@modelcontextprotocol/client";
+import { InMemoryTransport } from "@modelcontextprotocol/client";
 import { buildMcpServer } from "../../src/mcp/server";
 import { makeSqliteD1, type SqliteD1 } from "../helpers/sqlite-d1";
 import { makeTestEnv, makeMemoryKV } from "../helpers/make-env";
@@ -37,8 +37,9 @@ beforeEach(async () => {
   resetDatabaseInit();
   pending = [];
   sqlite = makeSqliteD1();
-  env = makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV() });
+  env = sqlite.admitEnv(makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV() }));
   await initializeDatabase(env);
+  env = sqlite.admitEnv(env);
   await ensureTenantBootstrap(env);
   identity = (await resolveIdentityFromToken("test-token", env))!;
   sqlite.issued.length = 0;
@@ -88,7 +89,7 @@ describe("MCP brief", () => {
 
   it("returns capped due, loops, stale and insight sections within twelve statements", async () => {
     const now = Date.now();
-    await createProject(env.DB, identity.personalWorkspaceId, { id: "site", name: "Site", aliases: ["hosting"] });
+    await createProject(env.DB, identity.personalWorkspaceId, { id: "site", name: "Site", aliases: ["hosting"] }, env);
     for (let i = 0; i < 8; i++) {
       sqlite.seed({ id: `due-${i}`, content: `Pay invoice ${i}`, createdAt: now, tags: ["task", i % 2 ? "hosting" : "project:site"] });
       await env.DB.prepare(`UPDATE entries SET when_at = ?, when_kind = 'due', when_source = 'explicit' WHERE id = ?`).bind(now + i * 1000, `due-${i}`).run();
@@ -114,12 +115,14 @@ describe("MCP brief", () => {
     // read apiece -- the window read forced a full sorted scan of every due/open-loop row.
     // Deliberate +1 (S2, T-0089.4.3, 5.8's own Budget note): getChanges runs in the same
     // Promise.all as every other MCP brief read.
-    expect(sqlite.issued).toHaveLength(9);
+    // forkのhot-contextを追加した10 SQL。上限12は維持する。
+    expect(sqlite.issued).toHaveLength(10);
+    expect(sqlite.issued.length).toBeLessThanOrEqual(12);
   });
 });
 
 describe("MCP resolve", () => {
-  it("marks one task done with a channel audit in at most four statements", async () => {
+  it("marks one task done with a channel audit in six statements including history", async () => {
     sqlite.seed({ id: "todo", content: "Send invoice", createdAt: 1, tags: ["task"] });
     sqlite.issued.length = 0;
     expect(await call("resolve", { id: "todo", action: "done" })).toMatch(/todo.*done/i);
@@ -128,7 +131,8 @@ describe("MCP resolve", () => {
     expect(sqlite.rows().find(r => r.id === "todo")?.tags).toContain("task:done");
     const event = await env.DB.prepare(`SELECT payload FROM entry_events WHERE entry_id = 'todo'`).first<{ payload: string }>();
     expect(JSON.parse(event!.payload)).toMatchObject({ loop_action: "done", channel: "mcp" });
-    expect(statements).toBe(3);
+    // 4.0 snapshot保存・prune marker・prune deleteの3文が追加される。
+    expect(statements).toBe(6);
   });
 
   it("requires until for snooze and a specific actionable id", async () => {
@@ -142,11 +146,11 @@ describe("MCP resolve", () => {
     sqlite.issued.length = 0;
     expect(await call("resolve", { id: "insight", action: "confirm_insight" })).toMatch(/insight.*confirm/i);
     await Promise.all(pending);
-    expect(sqlite.issued).toHaveLength(3);
+    expect(sqlite.issued).toHaveLength(6);
     sqlite.issued.length = 0;
     expect(await call("resolve", { id: "stale", action: "still_true" })).toMatch(/stale.*still_true/i);
     await Promise.all(pending);
-    expect(sqlite.issued).toHaveLength(3);
+    expect(sqlite.issued).toHaveLength(6);
     const tags = Object.fromEntries(sqlite.rows().map(r => [r.id, JSON.parse(String(r.tags)) as string[]]));
     expect(tags.insight).toContain("status:canonical");
     expect(tags.insight).not.toContain("auto-insight");
@@ -220,7 +224,7 @@ describe("MCP digest", () => {
   it("returns the latest existing project digest and never runs compression", async () => {
     const compress = vi.spyOn(compression, "compressTag");
     try {
-      await createProject(env.DB, identity.personalWorkspaceId, { id: "site", name: "Site" });
+      await createProject(env.DB, identity.personalWorkspaceId, { id: "site", name: "Site" }, env);
       sqlite.seed({ id: "older", content: "Older summary", createdAt: 1000, tags: ["synthesized", "project:site"], source: "system" });
       sqlite.seed({ id: "latest", content: "Current summary", createdAt: 2000, tags: ["synthesized", "project:site"], source: "system" });
       sqlite.seed({ id: "wrong", content: "Wrong summary", createdAt: 3000, tags: ["synthesized", "other"], source: "system" });
@@ -237,7 +241,7 @@ describe("MCP digest", () => {
   });
 
   it("requires exactly one filter and suggests recall when no digest exists", async () => {
-    await createProject(env.DB, identity.personalWorkspaceId, { id: "site", name: "Site" });
+    await createProject(env.DB, identity.personalWorkspaceId, { id: "site", name: "Site" }, env);
     expect(await call("digest", {})).toContain("exactly one");
     expect(await call("digest", { tag: "work", project: "site" })).toContain("exactly one");
     expect(await call("digest", { tag: "work" })).toContain("No digest yet");
@@ -282,7 +286,8 @@ describe("MCP history", () => {
     // BE-11: events are unbounded now (a version, not a truncated event list, covers the ceiling);
     // all 12 seeded "updated" events predate the versions:since marker above, so all twelve show.
     expect(text.match(/ updated by /g)).toHaveLength(12);
-    expect(sqlite.issued).toHaveLength(5);
+    // 上流履歴に加えてfork旧保存形式を1回読む。
+    expect(sqlite.issued).toHaveLength(6);
   });
 
   it("hides another member's personal history", async () => {

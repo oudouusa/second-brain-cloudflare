@@ -13,6 +13,7 @@ import { getTrashedEntry, restoreEntry } from "../../src/memory/trash";
 import { revertEntry } from "../../src/memory/undo";
 import { buildCasGuard, Params, pruneStatement, snapshotStatement } from "../../src/memory/versions";
 import { DEFAULTS } from "../../src/config";
+import { memoryWriteMarker } from "../../src/migration/write-lock";
 import type { Env } from "../../src/env";
 
 let sqlite: SqliteD1;
@@ -23,8 +24,9 @@ let ws: string;
 beforeEach(async () => {
   resetDatabaseInit();
   sqlite = makeSqliteD1();
-  env = makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV(), VECTORIZE: makeVectorizeMock(), AI: makeAIMock() });
+  env = sqlite.admitEnv(makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV(), VECTORIZE: makeVectorizeMock(), AI: makeAIMock() }));
   await initializeDatabase(env);
+  env = sqlite.admitEnv(env);
   const roots = await ensureTenantBootstrap(env);
   owner = (await resolveIdentityByUserId(env, roots.ownerUserId))!;
   ws = owner.personalWorkspaceId;
@@ -47,7 +49,7 @@ async function setValidity(id: string, next: { valid_from?: number | null; valid
   const sets = cols.map(c => `${c} = ${p.add(next[c] ?? null)}`).join(", ");
   return env.DB.batch([
     snapshotStatement(env, { entryId: id, reason: "validity", change, content: { kind: "unchanged" }, nextTags: "unchanged", nextState: next, meta: { cause: "explicit" }, now }),
-    env.DB.prepare(`UPDATE entries AS e SET ${sets} WHERE e.id = ${p.add(id)}`).bind(...p.values()),
+    env.DB.prepare(`UPDATE entries AS e SET write_marker = ${p.add(memoryWriteMarker(env))}, ${sets} WHERE e.id = ${p.add(id)}`).bind(...p.values()),
     pruneStatement(env, id, 20),
   ]);
 }

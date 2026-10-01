@@ -5,6 +5,7 @@
  * overwritten by the sync's own stale-tags write.
  */
 import { describe, it, expect, afterEach, vi } from "vitest";
+import { saveIntegrationFixture } from "../helpers/integration-record";
 import worker from "../../src/index";
 import { makeSqliteD1, type SqliteD1 } from "../helpers/sqlite-d1";
 import { makeTestEnv, makeMemoryKV } from "../helpers/make-env";
@@ -24,8 +25,9 @@ describe("ADV-8: a mirror sync does not revert a concurrent set_status", () => {
   it("the canonical status set during the sync survives it", async () => {
     resetDatabaseInit();
     sqlite = makeSqliteD1();
-    const env = makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV() }) as Env;
+    let env = sqlite.admitEnv(makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV() })) as Env;
     await initializeDatabase(env);
+  env = sqlite.admitEnv(env);
     const roots = await ensureTenantBootstrap(env);
     const writeCtx = { workspaceId: roots.ownerPersonalWorkspaceId, actorId: roots.ownerUserId };
 
@@ -34,7 +36,7 @@ describe("ADV-8: a mirror sync does not revert a concurrent set_status", () => {
 
     const raw = env.DB as any;
     let raced = false;
-    const racingEnv = { ...env, DB: { ...raw, prepare(sql: string) {
+    const racingEnv = { ...env, WRITE_ADMISSION_TOKEN: env.WRITE_ADMISSION_TOKEN, DB: { ...raw, prepare(sql: string) {
       if (!raced && sql.startsWith("INSERT INTO entry_versions")) {
         raced = true;
         raw.prepare(`UPDATE entries SET tags = '["notion","status:canonical"]' WHERE id = ?`).bind(id).run();
@@ -56,8 +58,9 @@ describe("ADV-8: a mirror sync does not revert a concurrent set_status", () => {
   it("an ordinary sync (no race) still costs one batch", async () => {
     resetDatabaseInit();
     sqlite = makeSqliteD1();
-    const env = makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV() }) as Env;
+    let env = sqlite.admitEnv(makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV() })) as Env;
     await initializeDatabase(env);
+  env = sqlite.admitEnv(env);
     const roots = await ensureTenantBootstrap(env);
     const writeCtx = { workspaceId: roots.ownerPersonalWorkspaceId, actorId: roots.ownerUserId };
     const ms = makeMirrorStore(env, writeCtx, undefined, "notion");
@@ -65,7 +68,7 @@ describe("ADV-8: a mirror sync does not revert a concurrent set_status", () => {
 
     let batches = 0;
     const raw = env.DB as any;
-    const countingEnv = { ...env, DB: { ...raw, batch: (s: unknown[]) => { batches++; return raw.batch(s); } } } as unknown as Env;
+    const countingEnv = { ...env, WRITE_ADMISSION_TOKEN: env.WRITE_ADMISSION_TOKEN, DB: { ...raw, batch: (s: unknown[]) => { batches++; return raw.batch(s); } } } as unknown as Env;
     const store = makeMirrorStore(countingEnv, writeCtx, undefined, "notion");
     const ok = await store.updateEntry(id, "page v2");
     expect(ok).toBe("updated");
@@ -78,8 +81,9 @@ describe("round 2 adversary: mirror update compare-and-set exhaustion (ADV-8 fix
     resetDatabaseInit();
     sqlite = makeSqliteD1();
     const kv = makeMemoryKV();
-    const env = makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: kv }) as Env;
+    let env = sqlite.admitEnv(makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: kv })) as Env;
     await initializeDatabase(env);
+  env = sqlite.admitEnv(env);
     const roots = await ensureTenantBootstrap(env);
     const headers = { "Content-Type": "application/json", Authorization: "Bearer test-token" };
     const ctx = { waitUntil: (p: Promise<unknown>) => { p.catch(() => {}); } } as ExecutionContext;
@@ -101,15 +105,15 @@ describe("round 2 adversary: mirror update compare-and-set exhaustion (ADV-8 fix
     ).bind(roots.ownerPersonalWorkspaceId, roots.ownerUserId).run();
     const rec = (await loadIntegration(env, "notion"))!;
     rec.itemMap = { pg1: { entryId: "m1", version: "v1" } };
-    await kv.put("integrations:notion", JSON.stringify(rec));
+    await saveIntegrationFixture(env, rec);
 
     // Someone keeps changing the row's status while the sync writes (each attempt re-reads, then loses).
     const realBatch = env.DB.batch.bind(env.DB);
     let n = 0;
     (env.DB as any).batch = async (stmts: any[]) => {
       // The mirror update batch: snapshot, the guarded UPDATE, prune, mirror prune (the UPDATE itself is wrapped by the FTS guard).
-      const sqls = stmts.map((s: any) => String(s?.sourceSql?.() ?? ""));
-      if (stmts.length === 4 && sqls[0].includes("INSERT INTO entry_versions") && sqls.slice(2).every((q) => q.includes("DELETE FROM entry_versions"))) {
+      const sqls = stmts.map((s: any) => String((s?.__inner ?? s)?.sourceSql?.() ?? ""));
+      if (sqls.some(q => q.startsWith("UPDATE entries SET content = ?")) && sqls.some(q => q.includes("INSERT INTO entry_versions"))) {
         n++;
         await sqlite.db.prepare(`UPDATE entries SET tags = ? WHERE id = 'm1'`).bind(JSON.stringify(["notion", `status:${n % 2 ? "canonical" : "draft"}`])).run();
       }

@@ -24,8 +24,9 @@ const ctx = { waitUntil: (_: Promise<unknown>) => {} } as unknown as ExecutionCo
 beforeEach(async () => {
   resetDatabaseInit();
   sqlite = makeSqliteD1();
-  env = makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV() });
+  env = sqlite.admitEnv(makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV() }));
   await initializeDatabase(env);
+  env = sqlite.admitEnv(env);
   const roots = await ensureTenantBootstrap(env);
   companyWs = roots.companyWorkspaceId;
   owner = (await resolveIdentityByUserId(env, roots.ownerUserId))!;
@@ -59,7 +60,7 @@ function afterGuardRead(base: Env, mutate: () => Promise<void>): Env {
       return { bind: (...a: unknown[]) => ({ first: async () => { const r = await st.bind(...a).first(); await mutate(); return r; } }) };
     },
   };
-  return { ...base, DB } as unknown as Env;
+  return { ...base, WRITE_ADMISSION_TOKEN: base.WRITE_ADMISSION_TOKEN, DB } as unknown as Env;
 }
 
 describe("ADV-1 (MAJOR): a snooze that loses its CAS on when_* still writes a version", () => {
@@ -71,7 +72,7 @@ describe("ADV-1 (MAJOR): a snooze that loses its CAS on when_* still writes a ve
     let n = 0;
     // Another client snoozes the same item (a different date) between this request's read and its batch, every attempt.
     const racing = afterGuardRead(env, async () => {
-      await sqlite.db.prepare(`UPDATE entries SET when_at = ? WHERE id = 'd1'`).bind(5_000_000_000_000 + ++n * 1000).run();
+      await sqlite.db.prepare(`UPDATE entries SET write_marker = '${sqlite.fixtureMarker()}', when_at = ? WHERE id = 'd1'`).bind(5_000_000_000_000 + ++n * 1000).run();
     });
     const until = new Date(Date.now() + 7 * 86_400_000).toISOString();
     const result = await resolveEntryAction(racing, ctx, owner, "d1", "snooze", until, { actorId: owner.userId, channel: "rest" });
@@ -83,7 +84,7 @@ describe("ADV-1 (MAJOR): a snooze that loses its CAS on when_* still writes a ve
     await seed("d2", { whenAt: 5_000_000_000_000, whenKind: "due", whenSource: "explicit", whenLabel: "x" });
     let n = 0;
     const racing = afterGuardRead(env, async () => {
-      await sqlite.db.prepare(`UPDATE entries SET when_label = ? WHERE id = 'd2'`).bind(`relabelled ${++n}`).run();
+      await sqlite.db.prepare(`UPDATE entries SET write_marker = '${sqlite.fixtureMarker()}', when_label = ? WHERE id = 'd2'`).bind(`relabelled ${++n}`).run();
     });
     const result = await resolveEntryAction(racing, ctx, owner, "d2", "clear_date", undefined, { actorId: owner.userId, channel: "rest" });
     expect(result.ok).toBe(false);
@@ -99,22 +100,22 @@ describe("ADV-2 (MAJOR): a person's merge lands in another member's personal wor
   it("member A's capture merge does not write into member B's now-private memory", async () => {
     const a = await member("Alice");
     const b = await member("Bob");
-    await seed("t1", { content: "Team fact about the Q3 launch plan", tags: ["work"], workspaceId: companyWs, actorId: b.userId });
+    await seed("t1", { content: "Team fact about the Q3 launch plan", tags: ["rocket-project"], workspaceId: companyWs, actorId: b.userId });
 
     const decision = JSON.stringify({ action: "merge", target_id: "t1", merged_content: "Team fact about the Q3 launch plan. Alice: my private note" });
     const stream = (text: string) => new ReadableStream({ start(c) {
       c.enqueue(new TextEncoder().encode(`data: {"response":${JSON.stringify(text)}}\n\n`));
       c.enqueue(new TextEncoder().encode("data: [DONE]\n\n")); c.close();
     } });
-    const raceEnv = makeTestEnv(undefined, {
+    const raceEnv = sqlite.admitEnv(makeTestEnv(undefined, {
       DB: sqlite.db as any, OAUTH_KV: makeMemoryKV(),
       VECTORIZE: makeVectorizeMock({
         query: vi.fn().mockResolvedValue({ matches: [{ id: "t1", score: 0.9, metadata: { parentId: "t1", workspace_id: companyWs } }] }),
         upsert: vi.fn(async () => ({ mutationId: "m" }) as any),
         deleteByIds: vi.fn(async () => ({ mutationId: "m" }) as any),
       }),
-      AI: { run: vi.fn(async (model: string, opts: any) => model.startsWith("@cf/baai/bge") ? { data: (Array.isArray(opts?.text) ? opts.text : [opts?.text]).map(() => new Array(384).fill(0.1)) } : stream(decision)) } as any,
-    }) as Env;
+      AI: { run: vi.fn(async (model: string, opts: any) => model === "@cf/google/embeddinggemma-300m" ? { data: (Array.isArray(opts?.text) ? opts.text : [opts?.text]).map(() => new Array(768).fill(0.1)) } : stream(decision)) } as any,
+    })) as Env;
     const db = raceEnv.DB as any;
     const prepare = db.prepare.bind(db);
     let raced = false;
@@ -122,7 +123,7 @@ describe("ADV-2 (MAJOR): a person's merge lands in another member's personal wor
       // Bob unshares t1 (his own memory) while Alice's merge is re-embedding: the move commits before her batch.
       if (!raced && sql.startsWith("INSERT INTO entry_versions")) {
         raced = true;
-        prepare(`UPDATE entries SET workspace_id = ? WHERE id = 't1'`).bind(b.personalWorkspaceId).run();
+        prepare(`UPDATE entries SET write_marker = '${sqlite.fixtureMarker()}', workspace_id = ? WHERE id = 't1'`).bind(b.personalWorkspaceId).run();
       }
       return prepare(sql);
     };
@@ -144,12 +145,12 @@ describe("ADV-2b (MAJOR): an admin's update or append lands in the author's pers
   function unshareAfterFirstOwnRead(base: Env, id: string, to: string): Env {
     let n = 0;
     const raw = base.DB as any;
-    return { ...base, DB: { ...raw, prepare(sql: string) {
+    return { ...base, WRITE_ADMISSION_TOKEN: base.WRITE_ADMISSION_TOKEN, DB: { ...raw, prepare(sql: string) {
       const st = raw.prepare(sql);
-      if (!sql.startsWith("SELECT content, tags, source, vector_ids, workspace_id FROM entries")) return st;
+      if (!sql.startsWith("SELECT content, tags, source, ")) return st;
       return { bind: (...a: unknown[]) => ({ first: async () => {
         const r = await st.bind(...a).first();
-        if (++n === 1) await sqlite.db.prepare(`UPDATE entries SET workspace_id = ? WHERE id = ?`).bind(to, id).run();
+        if (++n === 1) await sqlite.db.prepare(`UPDATE entries SET write_marker = '${sqlite.fixtureMarker()}', workspace_id = ? WHERE id = ?`).bind(to, id).run();
         return r;
       } }) };
     } } } as unknown as Env;
@@ -186,15 +187,15 @@ describe("ADV-2b (MAJOR): an admin's update or append lands in the author's pers
 describe("ADV-3 (MINOR): digest rollup writes a version for a source it did not change", () => {
   // digest.ts:68: snapshotManyStatement has no workspace predicate; the mark UPDATE has `AND workspace_id = ?`.
   it("a source moved out of the digest's workspace mid-run gets no rollup version", async () => {
-    const digestEnv = makeTestEnv(undefined, {
+    const digestEnv = sqlite.admitEnv(makeTestEnv(undefined, {
       DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV(),
-      AI: { run: vi.fn(async (model: string, opts: any) => model.startsWith("@cf/baai/bge") ? { data: (Array.isArray(opts?.text) ? opts.text : [opts?.text]).map(() => new Array(384).fill(0.1)) }
+      AI: { run: vi.fn(async (model: string, opts: any) => model === "@cf/google/embeddinggemma-300m" ? { data: (Array.isArray(opts?.text) ? opts.text : [opts?.text]).map(() => new Array(768).fill(0.1)) }
         : new ReadableStream({ start(c) {
           c.enqueue(new TextEncoder().encode(`data: {"response":"Synthesized text"}\n\n`));
           c.enqueue(new TextEncoder().encode("data: [DONE]\n\n")); c.close();
         } })) } as any,
-    }) as Env;
-    for (let i = 0; i < 12; i++) await seed(`s${i}`, { content: `Work memory number ${i} with enough detail to be eligible`, tags: ["work"], createdAt: 1000 + i });
+    })) as Env;
+    for (let i = 0; i < 12; i++) await seed(`s${i}`, { content: `Work memory number ${i} with enough detail to be eligible`, tags: ["rocket-project"], createdAt: 1000 + i });
     const db = digestEnv.DB as any;
     const prepare = db.prepare.bind(db);
     let moved = false;
@@ -202,11 +203,11 @@ describe("ADV-3 (MINOR): digest rollup writes a version for a source it did not 
       // The author shares s0 to the company workspace after the digest read its sources.
       if (!moved && sql.startsWith("INSERT INTO entry_versions")) {
         moved = true;
-        prepare(`UPDATE entries SET workspace_id = ? WHERE id = 's0'`).bind(companyWs).run();
+        prepare(`UPDATE entries SET write_marker = '${sqlite.fixtureMarker()}', workspace_id = ? WHERE id = 's0'`).bind(companyWs).run();
       }
       return prepare(sql);
     };
-    await compressTag("work", digestEnv, ctx);
+    await compressTag("rocket-project", digestEnv, ctx);
     const s0 = await live("s0");
     expect(s0.content).not.toContain("[Digest:"); // the mark missed, correctly
     expect(await versions("s0")).toEqual([]); // FAILS: a rollup version, stamped the company workspace, for no change
@@ -223,18 +224,18 @@ describe("ADV-4 (MINOR): vectors that describe uncommitted or replaced text surv
       insert: vi.fn(async (vs: any[]) => { for (const v of vs) store.set(v.id, v); return { mutationId: "m" } as any; }),
       deleteByIds: vi.fn(async (ids: string[]) => { for (const i of ids) store.delete(i); return { mutationId: "m" } as any; }),
     });
-    const e = makeTestEnv(undefined, {
+    const e = sqlite.admitEnv(makeTestEnv(undefined, {
       DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV(), VECTORIZE: vec,
-      AI: { run: vi.fn(async (_model: string, opts: any) => ({ data: (Array.isArray(opts?.text) ? opts.text : [opts?.text]).map(() => new Array(384).fill(0.1)) })) } as any,
-    }) as Env;
+      AI: { run: vi.fn(async (_model: string, opts: any) => ({ data: (Array.isArray(opts?.text) ? opts.text : [opts?.text]).map(() => new Array(768).fill(0.1)) })) } as any,
+    })) as Env;
     return { e, store };
   }
   function afterOwnRead(base: Env, mutate: () => Promise<void>): Env {
     let n = 0;
     const raw = base.DB as any;
-    return { ...base, DB: { ...raw, prepare(sql: string) {
+    return { ...base, WRITE_ADMISSION_TOKEN: base.WRITE_ADMISSION_TOKEN, DB: { ...raw, prepare(sql: string) {
       const st = raw.prepare(sql);
-      if (!sql.startsWith("SELECT content, tags, source, vector_ids, workspace_id FROM entries")) return st;
+      if (!sql.startsWith("SELECT content, tags, source, ")) return st;
       return { bind: (...a: unknown[]) => ({ first: async () => { const r = await st.bind(...a).first(); if (++n === 1) await mutate(); return r; } }) };
     } } } as unknown as Env;
   }
@@ -319,15 +320,15 @@ describe("ADV-7 (MINOR): a forget during a long append's embed leaves the memory
       insert: vi.fn(async (vs: any[]) => { for (const v of vs) store.set(v.id, v); return { mutationId: "m" } as any; }),
       deleteByIds: vi.fn(async (ids: string[]) => { for (const i of ids) store.delete(i); return { mutationId: "m" } as any; }),
     });
-    const e = makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV(), VECTORIZE: vec,
-      AI: { run: vi.fn(async (_model: string, opts: any) => ({ data: (Array.isArray(opts?.text) ? opts.text : [opts?.text]).map(() => new Array(384).fill(0.1)) })) } as any }) as Env;
+    const e = sqlite.admitEnv(makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV(), VECTORIZE: vec,
+      AI: { run: vi.fn(async (_model: string, opts: any) => ({ data: (Array.isArray(opts?.text) ? opts.text : [opts?.text]).map(() => new Array(768).fill(0.1)) })) } as any })) as Env;
     await seed("g1", { content: "PRIVATE MEDICAL NOTE ".repeat(80), vectorIds: [] });
     // The user forgets the memory while the append is embedding: forget read vector_ids ([]) before the append's
     // storeEntry wrote its chunk ids, and its DELETE commits before the append's batch.
     const raw = e.DB as any;
     let forgot = false;
     const racing = { ...e, DB: { ...raw, prepare(sql: string) {
-      if (!forgot && sql.startsWith("INSERT INTO entry_versions")) { forgot = true; raw.prepare(`DELETE FROM entries WHERE id = 'g1'`).run(); }
+      if (!forgot && sql.startsWith("INSERT INTO entry_versions")) { forgot = true; void sqlite.deleteFixtureRows(`DELETE FROM entries WHERE id = 'g1'`); }
       return raw.prepare(sql);
     } } } as unknown as Env;
     await expect(appendToEntry(racing, "g1", "", "more", [], "api", DEFAULTS, undefined,
@@ -346,10 +347,10 @@ describe("ADV-8 (MINOR): a mirror sync silently reverts a user's concurrent stat
     const id = await ms.createEntry("page v1", ["notion"], "notion");
     const raw = env.DB as any;
     let raced = false;
-    const racingEnv = { ...env, DB: { ...raw, prepare(sql: string) {
+    const racingEnv = { ...env, WRITE_ADMISSION_TOKEN: env.WRITE_ADMISSION_TOKEN, DB: { ...raw, prepare(sql: string) {
       if (!raced && sql.startsWith("INSERT INTO entry_versions")) {
         raced = true;
-        raw.prepare(`UPDATE entries SET tags = '["notion","status:canonical"]' WHERE id = ?`).bind(id).run();
+        raw.prepare(`UPDATE entries SET write_marker = '${sqlite.fixtureMarker()}', tags = '["notion","status:canonical"]' WHERE id = ?`).bind(id).run();
       }
       return raw.prepare(sql);
     } } } as unknown as Env;
@@ -365,26 +366,26 @@ describe("ADV-9 (MINOR): a digest rollup marks a source the user replaced after 
   // digest summarised. A replacement committed during synthesis gets `rolled-up` (0.4x recall, barred from future
   // digests) although the digest never saw its text. store.ts strips rolled-up on a replace for exactly this reason.
   it("the user's new text is not marked rolled-up by a digest that summarised the old text", async () => {
-    const digestEnv = makeTestEnv(undefined, {
+    const digestEnv = sqlite.admitEnv(makeTestEnv(undefined, {
       DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV(),
-      AI: { run: vi.fn(async (model: string, opts: any) => model.startsWith("@cf/baai/bge") ? { data: (Array.isArray(opts?.text) ? opts.text : [opts?.text]).map(() => new Array(384).fill(0.1)) }
+      AI: { run: vi.fn(async (model: string, opts: any) => model === "@cf/google/embeddinggemma-300m" ? { data: (Array.isArray(opts?.text) ? opts.text : [opts?.text]).map(() => new Array(768).fill(0.1)) }
         : new ReadableStream({ start(c) {
           c.enqueue(new TextEncoder().encode(`data: {"response":"Synthesized text"}\n\n`));
           c.enqueue(new TextEncoder().encode("data: [DONE]\n\n")); c.close();
         } })) } as any,
-    }) as Env;
-    for (let i = 0; i < 12; i++) await seed(`s${i}`, { content: `Work memory number ${i} with enough detail to be eligible`, tags: ["work"], createdAt: 1000 + i });
+    })) as Env;
+    for (let i = 0; i < 12; i++) await seed(`s${i}`, { content: `Work memory number ${i} with enough detail to be eligible`, tags: ["rocket-project"], createdAt: 1000 + i });
     const db = digestEnv.DB as any;
     const prepare = db.prepare.bind(db);
     let edited = false;
     db.prepare = (sql: string) => {
       if (!edited && sql.startsWith("INSERT INTO entry_versions")) {
         edited = true;
-        prepare(`UPDATE entries SET content = 'Corrected: the launch moved to October', updated_at = 5000 WHERE id = 's0'`).run();
+        prepare(`UPDATE entries SET write_marker = '${sqlite.fixtureMarker()}', content = 'Corrected: the launch moved to October', updated_at = 5000 WHERE id = 's0'`).run();
       }
       return prepare(sql);
     };
-    await compressTag("work", digestEnv, ctx);
+    await compressTag("rocket-project", digestEnv, ctx);
     const s0 = await live("s0");
     expect(s0.content.startsWith("Corrected: the launch moved to October")).toBe(true);
     expect(JSON.parse(s0.tags)).not.toContain("rolled-up"); // FAILS
@@ -405,7 +406,7 @@ describe("ADV-11 (MINOR): the owner loses the timeline of their own legacy memor
     await ev("updated", 1000, { channel: "rest" });
     await ev("shared", 2000, { workspaceId: companyWs, channel: "rest" });                 // 3.x: no fromWorkspaceId
     await ev("unshared", 3000, { workspaceId: owner.personalWorkspaceId, channel: "rest" }); // 3.x: no fromWorkspaceId
-    const res = await worker.fetch(req("GET", "/entry?id=L1"), env, ctx);
+    const res = await worker.fetch(req("POST", "/entry?id=L1"), env, ctx);
     const body = await res.json() as any;
     expect((body.entry ?? body).timeline.map((e: any) => e.event)).toEqual(["updated", "shared", "unshared"]); // FAILS: ["unshared"]
   });
@@ -421,9 +422,9 @@ describe("ADV-12 (MINOR): a slow append records its version, and updated_at, ear
     await seed("o1", { content: "base", vectorIds: ["o1"] });
     const wctx = { workspaceId: owner.personalWorkspaceId, actorId: owner.userId };
     const change = { actorId: owner.userId, channel: "mcp" as const };
-    const plain = makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV() }) as Env;
+    const plain = sqlite.admitEnv(makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV() })) as Env;
     let raced = false;
-    const slow = makeTestEnv(undefined, {
+    const slow = sqlite.admitEnv(makeTestEnv(undefined, {
       DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV(),
       VECTORIZE: makeVectorizeMock({
         // Another client's append commits while this one is inserting its chunk vector.
@@ -432,7 +433,7 @@ describe("ADV-12 (MINOR): a slow append records its version, and updated_at, ear
           return { mutationId: "m" } as any;
         }),
       }),
-    }) as Env;
+    })) as Env;
     await appendToEntry(slow, "o1", "", "slow one", [], "api", DEFAULTS, undefined, wctx, change, undefined, (wctx).workspaceId);
     const vs = await versions("o1");
     expect(vs.map(v => v.seq)).toEqual([1, 2]);
@@ -460,9 +461,9 @@ describe("R2-1 (MAJOR): the short append stamps prior_length_utf16 from a stale 
     const change = { actorId: owner.userId, channel: "rest" as const };
     let raced = false;
     const raw = env.DB as any;
-    const racing = { ...env, DB: { ...raw, prepare(sql: string) {
+    const racing = { ...env, WRITE_ADMISSION_TOKEN: env.WRITE_ADMISSION_TOKEN, DB: { ...raw, prepare(sql: string) {
       const st = raw.prepare(sql);
-      if (!sql.startsWith("SELECT content, tags, source, vector_ids, workspace_id FROM entries")) return st;
+      if (!sql.startsWith("SELECT content, tags, source, ")) return st;
       return { bind: (...a: unknown[]) => ({ first: async () => {
         const r = await st.bind(...a).first();
         if (!raced) { raced = true; await appendToEntry(env, "p1", "", "B 🎉 addition", [], "api", DEFAULTS, undefined, wctx, change, undefined, (wctx).workspaceId); }
@@ -492,9 +493,9 @@ describe("R2-1 (MAJOR): the short append stamps prior_length_utf16 from a stale 
     const change = { actorId: owner.userId, channel: "rest" as const };
     let raced = false;
     const raw = env.DB as any;
-    const racing = { ...env, DB: { ...raw, prepare(sql: string) {
+    const racing = { ...env, WRITE_ADMISSION_TOKEN: env.WRITE_ADMISSION_TOKEN, DB: { ...raw, prepare(sql: string) {
       const st = raw.prepare(sql);
-      if (!sql.startsWith("SELECT content, tags, source, vector_ids, workspace_id FROM entries")) return st;
+      if (!sql.startsWith("SELECT content, tags, source, ")) return st;
       return { bind: (...a: unknown[]) => ({ first: async () => {
         const r = await st.bind(...a).first();
         if (!raced) { raced = true; await appendToEntry(env, "p2", "", "B 🎉 addition", [], "api", DEFAULTS, undefined, wctx, change, undefined, (wctx).workspaceId); }
@@ -526,8 +527,8 @@ describe("R2-2 (MAJOR): a lost update deletes the row's own live vector", () => 
       insert: vi.fn(async (vs: any[]) => { for (const v of vs) store.set(v.id, v); return { mutationId: "m" } as any; }),
       deleteByIds: vi.fn(async (ids: string[]) => { for (const i of ids) store.delete(i); return { mutationId: "m" } as any; }),
     });
-    const e = makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV(), VECTORIZE: vec,
-      AI: { run: vi.fn(async (_model: string, opts: any) => ({ data: (Array.isArray(opts?.text) ? opts.text : [opts?.text]).map(() => new Array(384).fill(0.1)) })) } as any }) as Env;
+    const e = sqlite.admitEnv(makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV(), VECTORIZE: vec,
+      AI: { run: vi.fn(async (_model: string, opts: any) => ({ data: (Array.isArray(opts?.text) ? opts.text : [opts?.text]).map(() => new Array(768).fill(0.1)) })) } as any })) as Env;
     await seed("v1", { content: "Bob's company note", workspaceId: companyWs, actorId: author.userId, vectorIds: ["v1"] });
     store.set("v1", { id: "v1", values: [0.1], metadata: { content: "Bob's company note", parentId: "v1" } });
     // Bob unshares while the admin's edit is embedding (after its first read, before its batch).
@@ -536,7 +537,7 @@ describe("R2-2 (MAJOR): a lost update deletes the row's own live vector", () => 
     const racing = { ...e, DB: { ...raw, prepare(sql: string) {
       if (!moved && sql.startsWith("INSERT INTO entry_versions")) {
         moved = true;
-        raw.prepare(`UPDATE entries SET workspace_id = ? WHERE id = 'v1'`).bind(author.personalWorkspaceId).run();
+        raw.prepare(`UPDATE entries SET write_marker = '${sqlite.fixtureMarker()}', workspace_id = ? WHERE id = 'v1'`).bind(author.personalWorkspaceId).run();
       }
       return raw.prepare(sql);
     } } } as unknown as Env;
@@ -559,13 +560,13 @@ describe("R2-3 (MAJOR): ADV-2 is still open between the route's authorization an
   async function racingRouteRead(moveTo: string, id: string): Promise<Env> {
     const raw = env.DB as any;
     let moved = false;
-    return { ...env, DB: { ...raw, prepare(sql: string) {
+    return { ...env, WRITE_ADMISSION_TOKEN: env.WRITE_ADMISSION_TOKEN, DB: { ...raw, prepare(sql: string) {
       const st = raw.prepare(sql);
       if (moved || !/^SELECT id, workspace_id, actor_id, (content, tags, )?source FROM entries WHERE id = \? AND/.test(sql)) return st;
       return { bind: (...a: unknown[]) => ({ first: async () => {
         const r = await st.bind(...a).first();
         moved = true;
-        await sqlite.db.prepare(`UPDATE entries SET workspace_id = ? WHERE id = ?`).bind(moveTo, id).run();
+        await sqlite.db.prepare(`UPDATE entries SET write_marker = '${sqlite.fixtureMarker()}', workspace_id = ? WHERE id = ?`).bind(moveTo, id).run();
         return r;
       } }) };
     } } } as unknown as Env;
@@ -613,7 +614,7 @@ describe("R2-4 (MAJOR): the ADV-11 fix shows the owner's private legacy history 
     const moved = await moveEntry("L2", "personal", env, admin, { actorId: admin.userId, channel: "rest" });
     expect(moved.status).toBe("unshared");
     expect((await live("L2")).workspace_id).toBe(admin.personalWorkspaceId);
-    const res = await worker.fetch(req("GET", "/entry?id=L2", { token: adminTok }), env, ctx);
+    const res = await worker.fetch(req("POST", "/entry?id=L2", { token: adminTok }), env, ctx);
     const body = await res.json() as any;
     // FAILS: ["status_changed", "shared", "unshared"]: the owner's private-era event, with its prior tags.
     expect((body.entry ?? body).timeline.map((e: any) => e.event)).not.toContain("status_changed");
@@ -630,10 +631,10 @@ describe("R2-5 (MINOR): the author sharing their own memory mid-edit turns their
     await seed("m1", { content: "my note" });
     const raw = env.DB as any;
     let moved = false;
-    const racing = { ...env, DB: { ...raw, prepare(sql: string) {
+    const racing = { ...env, WRITE_ADMISSION_TOKEN: env.WRITE_ADMISSION_TOKEN, DB: { ...raw, prepare(sql: string) {
       if (!moved && sql.startsWith("INSERT INTO entry_versions")) {
         moved = true;
-        raw.prepare(`UPDATE entries SET workspace_id = ? WHERE id = 'm1'`).bind(companyWs).run();
+        raw.prepare(`UPDATE entries SET write_marker = '${sqlite.fixtureMarker()}', workspace_id = ? WHERE id = 'm1'`).bind(companyWs).run();
       }
       return raw.prepare(sql);
     } } } as unknown as Env;
@@ -654,7 +655,7 @@ describe("R2-6 (MINOR): version created_at is still not monotonic in seq", () =>
     const raw = env.DB as any;
     let raced = false;
     // The other writer's batch reaches D1 while this one's is in flight.
-    const slowBatch = { ...env, DB: { ...raw, prepare: raw.prepare.bind(raw), batch: async (stmts: unknown[]) => {
+    const slowBatch = { ...env, WRITE_ADMISSION_TOKEN: env.WRITE_ADMISSION_TOKEN, DB: { ...raw, prepare: raw.prepare.bind(raw), batch: async (stmts: unknown[]) => {
       if (!raced) { raced = true; await new Promise(r => setTimeout(r, 5)); await appendToEntry(env, "n1", "", "other isolate", [], "api", DEFAULTS, undefined, wctx, change, undefined, (wctx).workspaceId); }
       return raw.batch(stmts);
     } } } as unknown as Env;
@@ -681,10 +682,10 @@ describe("R2-7 (MAJOR): revertEntry writes into the author's personal memory aft
     expect(r.status).toBe("updated");
     const raw = env.DB as any;
     let moved = false;
-    const racing = { ...env, DB: { ...raw, prepare(sql: string) {
+    const racing = { ...env, WRITE_ADMISSION_TOKEN: env.WRITE_ADMISSION_TOKEN, DB: { ...raw, prepare(sql: string) {
       if (!moved && sql.startsWith("INSERT INTO entry_versions")) {
         moved = true;
-        raw.prepare(`UPDATE entries SET workspace_id = ? WHERE id = 'u9'`).bind(author.personalWorkspaceId).run();
+        raw.prepare(`UPDATE entries SET write_marker = '${sqlite.fixtureMarker()}', workspace_id = ? WHERE id = 'u9'`).bind(author.personalWorkspaceId).run();
       }
       return raw.prepare(sql);
     } } } as unknown as Env;
@@ -701,7 +702,7 @@ describe("R2-7 (MAJOR): revertEntry writes into the author's personal memory aft
 function afterFirstRead(base: Env, pattern: RegExp, mutate: () => Promise<void>): Env {
   const raw = base.DB as any;
   let fired = false;
-  return { ...base, DB: { ...raw, prepare(sql: string) {
+  return { ...base, WRITE_ADMISSION_TOKEN: base.WRITE_ADMISSION_TOKEN, DB: { ...raw, prepare(sql: string) {
     const st = raw.prepare(sql);
     if (fired || !pattern.test(sql)) return st;
     return { bind: (...a: unknown[]) => ({ first: async () => {
@@ -729,7 +730,7 @@ describe("R3-1 (MAJOR): Delete forever destroys a memory that moved out of the c
 });
 
 describe("R3-2 (MAJOR): an admin's unshare can take a member's already-private memory", () => {
-  // capture/share.ts moveEntry: a scoped read, then `UPDATE entries SET workspace_id = ? WHERE id = ?` with no pin on
+  // capture/share.ts moveEntry: a scoped read, then `UPDATE entries SET write_marker = '${sqlite.fixtureMarker()}', workspace_id = ? WHERE id = ?` with no pin on
   // the workspace it read. When Bob unshares his company memory in the gap between an admin's read and batch, the
   // admin's batch moves Bob's PRIVATE memory into the admin's own personal workspace: the admin now reads it, Bob
   // no longer can. (The move event is conditional on `e.workspace_id <> target`, the move itself is not.)
@@ -741,7 +742,7 @@ describe("R3-2 (MAJOR): an admin's unshare can take a member's already-private m
     const author = await member("Bob");
     await seed("x2", { content: "Bob's note", workspaceId: companyWs, actorId: author.userId });
     const racing = afterFirstRead(env, /^SELECT id, workspace_id, actor_id, vector_ids, tags FROM entries WHERE id = \? AND/, async () => {
-      await sqlite.db.prepare(`UPDATE entries SET workspace_id = ? WHERE id = 'x2'`).bind(author.personalWorkspaceId).run();
+      await sqlite.db.prepare(`UPDATE entries SET write_marker = '${sqlite.fixtureMarker()}', workspace_id = ? WHERE id = 'x2'`).bind(author.personalWorkspaceId).run();
     });
     await worker.fetch(req("POST", "/share", { body: { id: "x2", workspace: "personal" }, token: adminTok }), racing, ctx);
     const row = await live("x2");
@@ -764,8 +765,8 @@ describe("R3-3 (MINOR): restoreRowVectors orphans the chunks of the appends that
       insert: vi.fn(async (vs: any[]) => { for (const v of vs) store.set(v.id, v); return { mutationId: "m" } as any; }),
       deleteByIds: vi.fn(async (ids: string[]) => { for (const i of ids) store.delete(i); return { mutationId: "m" } as any; }),
     });
-    const e = makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV(), VECTORIZE: vec,
-      AI: { run: vi.fn(async (_model: string, opts: any) => ({ data: (Array.isArray(opts?.text) ? opts.text : [opts?.text]).map(() => new Array(384).fill(0.1)) })) } as any }) as Env;
+    const e = sqlite.admitEnv(makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV(), VECTORIZE: vec,
+      AI: { run: vi.fn(async (_model: string, opts: any) => ({ data: (Array.isArray(opts?.text) ? opts.text : [opts?.text]).map(() => new Array(768).fill(0.1)) })) } as any })) as Env;
     const ws = owner.personalWorkspaceId;
     const wctx = { workspaceId: ws, actorId: owner.userId };
     const change = { actorId: owner.userId, channel: "rest" as const };
@@ -775,7 +776,7 @@ describe("R3-3 (MINOR): restoreRowVectors orphans the chunks of the appends that
     const raw = e.DB as any;
     const racing = { ...e, DB: { ...raw, prepare(sql: string) {
       const st = raw.prepare(sql);
-      if (!sql.startsWith("SELECT content, tags, source, vector_ids, workspace_id FROM entries")) return st;
+      if (!sql.startsWith("SELECT content, tags, source, ")) return st;
       return { bind: (...a: unknown[]) => ({ first: async () => {
         const r = await st.bind(...a).first();
         if (n++ < 3) { await new Promise(res => setTimeout(res, 2)); await appendToEntry(e, "e3", "", `addition ${n}`, [], "api", DEFAULTS, undefined, wctx, change, undefined, ws); }
@@ -809,7 +810,7 @@ describe("R3-4 (MAJOR): the owner inherits a member's private history of a syste
     const back = await moveEntry("dg1", "personal", env, owner, { actorId: owner.userId, channel: "rest" });
     expect(back.status).toBe("unshared");
     expect((await live("dg1")).workspace_id).toBe(owner.personalWorkspaceId);
-    const res = await worker.fetch(req("GET", "/entry?id=dg1"), env, ctx); // default token = the owner
+    const res = await worker.fetch(req("POST", "/entry?id=dg1"), env, ctx); // default token = the owner
     const body = await res.json() as any;
     // FAILS: the owner sees "status_changed" (Bob's private-era event, with its prior tags).
     expect((body.entry ?? body).timeline.map((e: any) => e.event)).not.toContain("status_changed");
@@ -831,7 +832,7 @@ describe("R4-1 (MINOR): a move that loses its pinned UPDATE still records a move
     const author = await member("Bob");
     await seed("x4", { content: "Bob's note", workspaceId: companyWs, actorId: author.userId });
     const racing = afterFirstRead(env, /^SELECT id, workspace_id, actor_id, vector_ids, tags FROM entries WHERE id = \? AND/, async () => {
-      await sqlite.db.prepare(`UPDATE entries SET workspace_id = ? WHERE id = 'x4'`).bind(author.personalWorkspaceId).run();
+      await sqlite.db.prepare(`UPDATE entries SET write_marker = '${sqlite.fixtureMarker()}', workspace_id = ? WHERE id = 'x4'`).bind(author.personalWorkspaceId).run();
     });
     const res = await worker.fetch(req("POST", "/share", { body: { id: "x4", workspace: "personal" }, token: adminTok }), racing, ctx);
     expect(res.status).toBe(409);
@@ -843,7 +844,7 @@ describe("R4-1 (MINOR): a move that loses its pinned UPDATE still records a move
 
 describe("R4-2 (MINOR): /vectorize-pending racing an edit lists vectors of text the row no longer holds (found via the code graph)", () => {
   // routes/admin.ts /vectorize-pending -> storeEntry (store.ts): embeds the content it read, upserts under the row's
-  // deterministic ids, then `UPDATE entries SET vector_ids = ? WHERE id = ?` with no compare-and-set. An update that
+  // deterministic ids, then `UPDATE entries SET write_marker = '${sqlite.fixtureMarker()}', vector_ids = ? WHERE id = ?` with no compare-and-set. An update that
   // commits during that embed is overwritten in the index by the older text, and vector_ids is now non-empty, so
   // /vectorize-pending (vector_ids = '[]') never looks at the row again. /migration/reembed calls storeEntry the same way.
   it("after the repair and a concurrent update, the row's listed vector describes its committed content", async () => {
@@ -857,16 +858,16 @@ describe("R4-2 (MINOR): /vectorize-pending racing an edit lists vectors of text 
       insert: vi.fn(async (vs: any[]) => { for (const v of vs) store.set(v.id, v); return { mutationId: "m" } as any; }),
       deleteByIds: vi.fn(async (ids: string[]) => { for (const i of ids) store.delete(i); return { mutationId: "m" } as any; }),
     });
-    const plain = makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV(), VECTORIZE: vec,
-      AI: { run: vi.fn(async (_model: string, opts: any) => ({ data: (Array.isArray(opts?.text) ? opts.text : [opts?.text]).map(() => new Array(384).fill(0.1)) })) } as any }) as Env;
+    const plain = sqlite.admitEnv(makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV(), VECTORIZE: vec,
+      AI: { run: vi.fn(async (_model: string, opts: any) => ({ data: (Array.isArray(opts?.text) ? opts.text : [opts?.text]).map(() => new Array(768).fill(0.1)) })) } as any })) as Env;
     let raced = false;
-    const repairEnv = makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV(), VECTORIZE: vec,
+    const repairEnv = sqlite.admitEnv(makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV(), VECTORIZE: vec,
       AI: { run: vi.fn(async () => {
         // The author edits the memory while the repair is embedding its old text.
         if (!raced) { raced = true; await updateEntryContent(plain, "vp1", "the corrected text", DEFAULTS, undefined, undefined,
           { workspaceId: owner.personalWorkspaceId, actorId: owner.userId }, { actorId: owner.userId, channel: "rest" }, owner.personalWorkspaceId); }
-        return { data: [new Array(384).fill(0.1)] };
-      }) } as any }) as Env;
+        return { data: [new Array(768).fill(0.1)] };
+      }) } as any })) as Env;
     await seed("vp1", { content: "the original text", vectorIds: [], createdAt: 1000 });
     const res = await worker.fetch(req("POST", "/vectorize-pending"), repairEnv, ctx);
     expect(res.status).toBe(200);
@@ -889,16 +890,16 @@ describe("R4-2 (MINOR): /vectorize-pending racing an edit lists vectors of text 
       insert: vi.fn(async (vs: any[]) => { for (const v of vs) store.set(v.id, v); return { mutationId: "m" } as any; }),
       deleteByIds: vi.fn(async (ids: string[]) => { for (const i of ids) store.delete(i); return { mutationId: "m" } as any; }),
     });
-    const plain = makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV(), VECTORIZE: vec,
-      AI: { run: vi.fn(async (_model: string, opts: any) => ({ data: (Array.isArray(opts?.text) ? opts.text : [opts?.text]).map(() => new Array(384).fill(0.1)) })) } as any }) as Env;
+    const plain = sqlite.admitEnv(makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV(), VECTORIZE: vec,
+      AI: { run: vi.fn(async (_model: string, opts: any) => ({ data: (Array.isArray(opts?.text) ? opts.text : [opts?.text]).map(() => new Array(768).fill(0.1)) })) } as any })) as Env;
     let raced = false;
-    const repairEnv = makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV(), VECTORIZE: vec,
+    const repairEnv = sqlite.admitEnv(makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV(), VECTORIZE: vec,
       AI: { run: vi.fn(async () => {
         // The author edits the memory while the migration batch is embedding its old text.
         if (!raced) { raced = true; await updateEntryContent(plain, "rb1", "the corrected text", DEFAULTS, undefined, undefined,
           { workspaceId: owner.personalWorkspaceId, actorId: owner.userId }, { actorId: owner.userId, channel: "rest" }, owner.personalWorkspaceId); }
-        return { data: [new Array(384).fill(0.1)] };
-      }) } as any }) as Env;
+        return { data: [new Array(768).fill(0.1)] };
+      }) } as any })) as Env;
     await seed("rb1", { content: "the original text", vectorIds: [], createdAt: 1000 });
     const res = await worker.fetch(req("POST", "/migration/reembed"), repairEnv, ctx);
     expect(res.status).toBe(200);

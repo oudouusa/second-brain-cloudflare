@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { Client } from "@modelcontextprotocol/client";
+import { InMemoryTransport } from "@modelcontextprotocol/client";
 import worker from "../../src/index";
 import { buildMcpServer } from "../../src/mcp/server";
 import { captureEntry } from "../../src/capture/entry";
@@ -31,16 +31,17 @@ async function setup(score: number, decision: string) {
   resetDatabaseInit();
   sqlite = makeSqliteD1();
   deleteByIds = vi.fn(async (_ids: string[]): Promise<any> => ({ mutationId: "m" }));
-  env = makeTestEnv(undefined, {
+  env = sqlite.admitEnv(makeTestEnv(undefined, {
     DB: sqlite.db as any,
     OAUTH_KV: makeMemoryKV(),
     VECTORIZE: makeVectorizeMock({
       query: vi.fn().mockResolvedValue({ matches: [{ id: "old", score, metadata: { parentId: "old" } }] }),
       deleteByIds,
     }),
-    AI: { run: vi.fn(async (model: string) => model.startsWith("@cf/baai/bge") ? { data: [new Array(384).fill(0.1)] } : stream(decision)) } as any,
-  }) as Env;
+    AI: { run: vi.fn(async (model: string) => model === "@cf/google/embeddinggemma-300m" ? { data: [new Array(768).fill(0.1)] } : stream(decision)) } as any,
+  })) as Env;
   await initializeDatabase(env);
+  env = sqlite.admitEnv(env);
 }
 afterEach(() => sqlite?.close());
 
@@ -243,7 +244,7 @@ describe("versioning: status", () => {
     // meta.event_id (round 3 re-review MAJOR) is minted fresh per call -- legitimately different
     // between the REST and MCP writes this test compares, so it is stripped the same way id/
     // channel/created_at/valid_from already are.
-    const strip = ({ id: _i, channel: _c, created_at: _t, valid_from: _v, meta, ...rest }: any) => {
+    const strip = ({ write_marker: _wm, restore_lease_owner: _ro, id: _i, channel: _c, created_at: _t, valid_from: _v, meta, ...rest }: any) => {
       const { event_id: _e, ...metaRest } = JSON.parse(meta || "{}");
       return { ...rest, meta: metaRest };
     };

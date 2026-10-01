@@ -54,7 +54,7 @@ async function brain() {
   resetDatabaseInit();
   resetFtsReadyMemo();
   const sqlite = makeSqliteD1();
-  const env: Env = makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV() });
+  const env: Env = sqlite.admitEnv(makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV() }));
   await initializeDatabase(env);
   return { sqlite, env };
 }

@@ -44,14 +44,20 @@ function exportPayload(db: D1Mock) {
       importance_score: e.importance_score ?? 0,
       contradiction_wins: e.contradiction_wins ?? 0,
       contradiction_losses: e.contradiction_losses ?? 0,
+      memory_tier: e.memory_tier ?? "warm",
+      pinned: Number(e.pinned ?? 0) === 1,
+      last_recalled_at: e.last_recalled_at ?? null,
     })),
     edges: db.edges.map(e => ({
+      id: e.id,
       source_id: e.source_id,
       target_id: e.target_id,
       type: e.type,
       weight: e.weight,
       provenance: e.provenance,
+      metadata: JSON.parse(e.metadata ?? "{}"),
       created_at: e.created_at,
+      updated_at: e.updated_at ?? e.created_at,
     })),
   };
 }
@@ -71,10 +77,10 @@ describe("POST /import", () => {
   });
 
   it("rejects invalid version", async () => {
-    const res = await worker.fetch(req("POST", "/import", { body: { version: 1, entries: [] } }), env, ctx);
+    const res = await worker.fetch(req("POST", "/import", { body: { version: 99, entries: [] } }), env, ctx);
     expect(res.status).toBe(400);
     const data = await res.json() as any;
-    expect(data.error).toMatch(/version must be 2/);
+    expect(data.error).toMatch(/version must be 1, 2 or 3/);
   });
 
   it("rejects missing entries array", async () => {
@@ -84,21 +90,69 @@ describe("POST /import", () => {
     expect(data.error).toMatch(/entries must be an array/);
   });
 
+  it("rejects more than 10,000 rows before import work begins", async () => {
+    const res = await worker.fetch(req("POST", "/import", {
+      body: { version: 2, entries: Array.from({ length: 10_001 }, () => ({})), edges: [] },
+    }), env, ctx);
+    expect(res.status).toBe(400);
+    expect(await res.json()).toMatchObject({ error: expect.stringContaining("manual import") });
+    expect(db.entries).toHaveLength(0);
+  });
+
+  it("rejects a JSON body over 1 MiB before parsing or writing", async () => {
+    const request = new Request("http://localhost/import", {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer test-token",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ version: 2, entries: [], padding: "x".repeat(1024 * 1024) }),
+    });
+    const res = await worker.fetch(request, env, ctx);
+    expect(res.status).toBe(413);
+    expect(db.entries).toHaveLength(0);
+  });
+
+  it("fails manual-import rows that can never fit the embedding contract", async () => {
+    const res = await worker.fetch(req("POST", "/import", {
+      body: {
+        version: 2,
+        entries: [
+          { id: "too-large", content: "x".repeat(12_001), source: "import" },
+          { id: "tag-too-large", content: "valid", tags: ["あ".repeat(22)], source: "import" },
+        ],
+      },
+    }), env, ctx);
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({
+      imported: 0,
+      failed: 2,
+      results: [
+        { id: "too-large", status: "failed", reason: "index_limit" },
+        { id: "tag-too-large", status: "failed", reason: "index_limit" },
+      ],
+    });
+    expect(db.entries).toHaveLength(0);
+  });
+
   it("round-trips export payload into an empty brain", async () => {
     seedEntry(db, "a", "Memory A", ["work", "kind:semantic"], 5000, { source: "phone", recall_count: 3, importance_score: 4 });
     seedEntry(db, "b", "Memory B", ["idea"], 4000);
-    db.edges.push({ id: "edge-1", source_id: "a", target_id: "b", type: "relates_to", weight: 0.7, provenance: "inferred", metadata: "{}", created_at: 1, updated_at: 1 });
+    db.edges.push({ id: "edge-1", source_id: "a", target_id: "b", type: "relates_to", weight: 0.7, provenance: "inferred", metadata: '{"reason":"shared-project"}', created_at: 1, updated_at: 9 });
 
     const payload = exportPayload(db);
     db.reset();
 
     const res = await worker.fetch(req("POST", "/import", { body: payload }), env, ctx);
     expect(res.status).toBe(200);
-    const data = await res.json() as any;
+    const entryData = await res.json() as any;
+    const edgeRes = await worker.fetch(req("POST", "/import?offset=2", { body: payload }), env, ctx);
+    const data = await edgeRes.json() as any;
     expect(data.ok).toBe(true);
-    expect(data.imported).toBe(2);
-    expect(data.skipped).toBe(0);
-    expect(data.failed).toBe(0);
+    expect(entryData.imported).toBe(2);
+    expect(entryData.skipped).toBe(0);
+    expect(entryData.failed).toBe(0);
     expect(data.edges_imported).toBe(1);
     expect(data.edges_failed).toBe(0);
     expect(data.remaining_entries).toBe(0);
@@ -113,10 +167,13 @@ describe("POST /import", () => {
     expect(a.updated_at).toBe(5000);
     expect(a.recall_count).toBe(3);
     expect(a.importance_score).toBe(4);
+    expect(a.memory_tier).toBe("warm");
+    expect(a.pinned).toBe(0);
+    expect(a.last_recalled_at).toBeNull();
     expect(a.vector_ids).toBe("[]");
 
     expect(db.edges).toHaveLength(1);
-    expect(db.edges[0]).toMatchObject({ source_id: "a", target_id: "b", type: "relates_to", metadata: "{}" });
+    expect(db.edges[0]).toMatchObject({ id: "edge-1", source_id: "a", target_id: "b", type: "relates_to", metadata: '{"reason":"shared-project"}', updated_at: 9 });
     expect(db.edges[0].created_at).toBe(1);
   });
 
@@ -147,8 +204,10 @@ describe("POST /import", () => {
     };
 
     const res = await worker.fetch(req("POST", "/import", { body: payload }), env, ctx);
-    const data = await res.json() as any;
-    expect(data.imported).toBe(1);
+    const entryData = await res.json() as any;
+    const edgeRes = await worker.fetch(req("POST", "/import?offset=1", { body: payload }), env, ctx);
+    const data = await edgeRes.json() as any;
+    expect(entryData.imported).toBe(1);
     expect(data.edges_imported).toBe(0);
     // A missing endpoint and another member's private one look the same (T-0089.1.1): a plain skip.
     expect(data.edges_skipped).toBe(1);
@@ -243,9 +302,12 @@ describe("POST /import", () => {
     expect(partialData.edges_imported).toBe(0);
     expect(db.edges).toHaveLength(0);
 
-    const finish = await worker.fetch(req("POST", "/import", { body: payload }), env, ctx);
+    const finish = await worker.fetch(req("POST", `/import?offset=${partialData.next_offset}`, { body: payload }), env, ctx);
     const finishData = await finish.json() as any;
-    expect(finishData.edges_imported).toBe(1);
+    expect(finishData.edges_imported).toBe(0);
+    const edges = await worker.fetch(req("POST", `/import?offset=${finishData.next_offset}`, { body: payload }), env, ctx);
+    const edgeData = await edges.json() as any;
+    expect(edgeData.edges_imported).toBe(1);
     expect(db.edges).toHaveLength(1);
   });
 
@@ -303,19 +365,24 @@ describe("POST /import", () => {
     expect(p2.imported).toBe(1);
     expect(db.edges).toHaveLength(0);
 
-    // The final entries page and the first edge page share a call.
+    // The final entries page never starts edge work in the same D1 budget.
     const p3 = await (await worker.fetch(req("POST", "/import?limit=1&offset=2", { body: payload }), env, ctx)).json() as any;
     expect(p3.imported).toBe(1);
     expect(p3.remaining_entries).toBe(0);
-    expect(p3.edges_imported).toBe(1);
-    expect(p3.next_edge_offset).toBe(1);
-    expect(p3.remaining_edges).toBe(1);
+    expect(p3.edges_imported).toBe(0);
+    expect(p3.next_edge_offset).toBe(0);
+    expect(p3.remaining_edges).toBe(2);
+
+    const p4 = await (await worker.fetch(req("POST", "/import?limit=1&offset=3", { body: payload }), env, ctx)).json() as any;
+    expect(p4.edges_imported).toBe(1);
+    expect(p4.next_edge_offset).toBe(1);
+    expect(p4.remaining_edges).toBe(1);
     expect(db.edges).toHaveLength(1);
     expect(db.edges[0].created_at).toBe(100);
 
-    const p4 = await (await worker.fetch(req("POST", "/import?limit=1&offset=3&edge_offset=1", { body: payload }), env, ctx)).json() as any;
-    expect(p4.edges_imported).toBe(1);
-    expect(p4.remaining_edges).toBe(0);
+    const p5 = await (await worker.fetch(req("POST", "/import?limit=1&offset=3&edge_offset=1", { body: payload }), env, ctx)).json() as any;
+    expect(p5.edges_imported).toBe(1);
+    expect(p5.remaining_edges).toBe(0);
     expect(db.edges).toHaveLength(2);
     expect(db.edges.find((e: any) => e.source_id === "b" && e.target_id === "c")?.created_at).toBe(200);
 
@@ -402,7 +469,14 @@ describe("POST /import", () => {
   });
 
   it("rejects self-edges the way the capture path does", async () => {
-    const res = await worker.fetch(req("POST", "/import", {
+    await worker.fetch(req("POST", "/import", {
+      body: {
+        version: 2,
+        entries: [{ id: "a", content: "A", created_at: 1 }],
+        edges: [{ source_id: "a", target_id: "a", type: "relates_to" }],
+      },
+    }), env, ctx);
+    const res = await worker.fetch(req("POST", "/import?offset=1", {
       body: {
         version: 2,
         entries: [{ id: "a", content: "A", created_at: 1 }],
@@ -457,45 +531,42 @@ describe("POST /import", () => {
       created_at: 1000 + i,
     }));
 
-    const res = await worker.fetch(req("POST", "/import?limit=100", { body: { version: 2, entries, edges } }), env, ctx);
-    expect(res.status).toBe(200);
-    const data = await res.json() as any;
-    expect(data.imported).toBe(52);
-    expect(data.edges_imported).toBe(51);
-    expect(data.edges_failed).toBe(0);
+    let offset = 0;
+    while (offset < entries.length) {
+      const res = await worker.fetch(req("POST", `/import?offset=${offset}`, {
+        body: { version: 2, entries, edges },
+      }), env, ctx);
+      expect(res.status).toBe(200);
+      const data = await res.json() as any;
+      offset = data.next_offset;
+    }
+    let edgeOffset = 0;
+    while (edgeOffset < edges.length) {
+      const res = await worker.fetch(req("POST", `/import?offset=${entries.length}&edge_offset=${edgeOffset}`, {
+        body: { version: 2, entries, edges },
+      }), env, ctx);
+      expect(res.status).toBe(200);
+      const data = await res.json() as any;
+      expect(data.edges_failed).toBe(0);
+      edgeOffset = data.next_edge_offset;
+    }
     expect(db.edges).toHaveLength(51);
   });
 
-  describe("Rahil's decision: 128 KB per note (18-copy-deck.md 6.8)", () => {
-    // Codex review, T-0102 B2: skipping an oversize row here silently lost real 3.7 data on an
-    // upgrade (the note existed, and now does not, with no record of it). It is imported instead,
-    // forced held too_long -- the same state a too-long note reaches on a fresh 4.0 write.
-    it("imports an oversize record held too_long, rather than skipping it and losing it", async () => {
-      // D1Mock does not model holdStatements' own SQL (snapshotStatement's meta JSON), so the held
-      // tags this row ends up with are verified against real SQLite instead, in
-      // import-quarantine-hold.test.ts ("holds an oversize row too_long, with a real hold version
-      // and event"). This test stays on D1Mock for the structural, non-hold assertions below.
-      const entries = [
-        { id: "ok", content: "a normal memory", created_at: 1000 },
-        { id: "too-big", content: "a".repeat(131_073), created_at: 2000 },
-      ];
+  describe("Gemma128の手動import境界", () => {
+    it("巨大な本文を明示的に拒否し、同じpage内の有効な記憶は保存する", async () => {
+      const entries = [{ id: "ok", content: "短い記憶", created_at: 1 }, { id: "too-big", content: "a".repeat(131_073), created_at: 2 }];
       const res = await worker.fetch(req("POST", "/import", { body: { version: 2, entries } }), env, ctx);
       expect(res.status).toBe(200);
       const data = await res.json() as any;
-      expect(data.ok).toBe(true);
-      expect(data.imported).toBe(2);
-      expect(data.skipped_too_large).toBe(0);
-      expect(db.entries.map((e: any) => e.id).sort()).toEqual(["ok", "too-big"]);
-      const importedResult = data.results.find((r: any) => r.id === "too-big");
-      expect(importedResult).toMatchObject({ id: "too-big", status: "imported" });
+      expect(data).toMatchObject({ imported: 1, failed: 1, skipped_too_large: 0 });
+      expect(data.results).toContainEqual(expect.objectContaining({ id: "too-big", status: "failed", reason: "index_limit" }));
+      expect(db.entries.map(e => e.id)).toEqual(["ok"]);
     });
-
-    it("accepts a record at exactly the limit", async () => {
+    it("上流128KiB以内でも固定embedding上限を超えればindex_limitを返す", async () => {
       const entries = [{ id: "at-limit", content: "a".repeat(131_072), created_at: 1000 }];
       const res = await worker.fetch(req("POST", "/import", { body: { version: 2, entries } }), env, ctx);
-      const data = await res.json() as any;
-      expect(data.imported).toBe(1);
-      expect(data.skipped_too_large).toBe(0);
+      expect(await res.json()).toMatchObject({ imported: 0, failed: 1, results: [expect.objectContaining({ id: "at-limit", reason: "index_limit" })] });
     });
   });
 });

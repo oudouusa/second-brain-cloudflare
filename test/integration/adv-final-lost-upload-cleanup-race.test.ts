@@ -9,16 +9,18 @@ import { DEFAULTS } from "../../src/config";
 let t: TrashEnv;
 afterEach(() => t?.close());
 
-it("stale-upload cleanup cannot delete a concurrent winner's deterministic vector", async () => {
+it("競合に負けたuploadのcleanupは勝者のuploadごとのvectorを削除しない", async () => {
   t = await makeTrashEnv();
   const content = "a deferred fact whose owner shares it";
-  t.seed("race", { content, created_at: Date.now() - 60 * 60_000 });
+  const createdAt = Date.now() - 60 * 60_000;
+  t.seed("race", { content, created_at: createdAt });
   const owner = (await resolveIdentityByUserId(t.env, t.roots.ownerUserId))!;
   const present = new Map<string, string>();
   const upsert = t.env.VECTORIZE.upsert.bind(t.env.VECTORIZE);
   const remove = t.env.VECTORIZE.deleteByIds.bind(t.env.VECTORIZE);
   let moved = false;
   let winnerCommitted = false;
+  let winnerStarted = false;
   (t.env.VECTORIZE as any).upsert = async (vectors: any[]) => {
     for (const v of vectors) present.set(v.id, v.metadata.workspace_id);
     const result = await upsert(vectors);
@@ -30,8 +32,9 @@ it("stale-upload cleanup cannot delete a concurrent winner's deterministic vecto
     return result;
   };
   (t.env.VECTORIZE as any).deleteByIds = async (ids: string[]) => {
-    if (!winnerCommitted) {
-      const winner = await storeEntry(t.env, "race", content, [], "api", Date.now(), DEFAULTS,
+    if (!winnerStarted) {
+      winnerStarted = true;
+      const winner = await storeEntry(t.env, "race", content, [], "api", createdAt, DEFAULTS,
         { workspaceId: t.roots.companyWorkspaceId, actorId: owner.userId });
       expect(winner.committed).toBe(true);
       winnerCommitted = true;

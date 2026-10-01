@@ -144,14 +144,14 @@ describe("session-start.js", () => {
 
   it("scopes recall to workspace_roots, not the hooks directory it runs from", async () => {
     await runHook("session-start.js", startPayload());
-    const recall = captured.find(c => c.url.startsWith("/recall?"))!;
-    expect(new URL(`http://x${recall.url}`).searchParams.get("project")).toBe("brain-app");
+    const recall = captured.find(c => c.method === "POST" && c.url === "/recall")!;
+    expect(JSON.parse(recall.body).project).toBe("brain-app");
   });
 
   it("asks for recall without LLM synthesis", async () => {
     await runHook("session-start.js", startPayload());
-    const recall = captured.find(c => c.url.startsWith("/recall?"))!;
-    expect(new URL(`http://x${recall.url}`).searchParams.get("synthesize")).toBe("0");
+    const recall = captured.find(c => c.method === "POST" && c.url === "/recall")!;
+    expect(JSON.parse(recall.body).synthesize).toBe(false);
   });
 
   it("reports a rejected token: exit 1, [Second Brain] stderr, no stdout, no secrets", async () => {

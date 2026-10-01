@@ -294,22 +294,25 @@ describe("pushDueItems", () => {
     expect(fetchSpy.mock.calls[0][0]).toBe("https://push.example.com/a");
   });
 
-  it("prunes pushed ids older than 30 days from the KV map on write", async () => {
+  it("D1で消滅した配達記録を削除し、古くても有効な期限の記録を保持する", async () => {
     sq = await migrated();
     seedDue(sq, "e1", "File the report", Date.now() - DAY);
     seedSubscription(sq, "sub-1", "", "https://push.example.com/s1");
     const kv = makeMemoryKV();
     const OLD = 31 * DAY;
-    await kv.put("pushed:", JSON.stringify({ "forgotten-test-id": Date.now() - OLD, "recent-id": Date.now() - DAY }));
+    const oldAt = Date.now() - OLD;
+    seedDue(sq, "recent-id", "送信済みの古い期限", oldAt);
+    await kv.put("pushed:", JSON.stringify({ "forgotten-test-id": Date.now() - OLD, "recent-id": oldAt }));
     const env = makeTestEnv(dbOf(sq) as any, { OAUTH_KV: kv });
     mockFetchAlways(201);
 
-    await pushDueItems(env, "");
+    expect((await pushDueItems(env, "")).sent).toBe(1);
 
     const stored = JSON.parse((await kv.get("pushed:")) as string);
     expect(stored).not.toHaveProperty("forgotten-test-id");
     expect(stored).toHaveProperty("recent-id");
     expect(stored).toHaveProperty("e1");
+    expect((await pushDueItems(env, "")).sent).toBe(0);
   });
 
   describe("per-subscription outcomes (results)", () => {
@@ -421,4 +424,128 @@ describe("sendTestNotification", () => {
     expect(result.sent).toBe(1);
     expect(fetchSpy).toHaveBeenCalledTimes(1);
   });
+});
+
+describe("Pushの呼出上限と繰越", () => {
+  it("40端末で区切り、次回は残りだけを送る", async () => {
+    sq = await migrated();
+    seedDue(sq, "bounded", "期限", Date.now() - DAY);
+    for (let i = 0; i < 45; i++) seedSubscription(sq, `sub-${i}`, "", `https://push.example.com/${i}`);
+    const env = makeTestEnv(dbOf(sq) as any, { OAUTH_KV: makeMemoryKV() });
+    const fetchSpy = mockFetchAlways(201);
+    expect((await pushDueItems(env, "")).sent).toBe(40);
+    expect((await pushDueItems(env, "")).sent).toBe(5);
+    expect((await pushDueItems(env, "")).sent).toBe(0);
+    expect(fetchSpy).toHaveBeenCalledTimes(45);
+    expect(new Set(fetchSpy.mock.calls.map(([url]) => url)).size).toBe(45);
+  });
+
+  it("4 workspaceずつ進み、末尾後は先頭へ戻る", async () => {
+    sq = await migrated();
+    for (let i = 0; i < 6; i++) {
+      seedDue(sq, `due-${i}`, "期限", Date.now() - DAY);
+      await sq.db.prepare("UPDATE entries SET workspace_id = ? WHERE id = ?").bind(`ws-${i}`, `due-${i}`).run();
+      seedSubscription(sq, `sub-${i}`, `ws-${i}`, `https://push.example.com/${i}`);
+    }
+    const env = makeTestEnv(dbOf(sq) as any, { OAUTH_KV: makeMemoryKV() });
+    const fetchSpy = mockFetchAlways(201);
+    expect((await pushDueItemsAllWorkspaces(env)).sent).toBe(4);
+    expect((await pushDueItemsAllWorkspaces(env)).sent).toBe(2);
+    expect((await pushDueItemsAllWorkspaces(env)).sent).toBe(0);
+    expect((await pushDueItemsAllWorkspaces(env)).sent).toBe(0);
+    expect(fetchSpy).toHaveBeenCalledTimes(6);
+  });
+});
+
+describe("境界調査の再現", () => {
+  it("先頭15件を越えて16件目にも配達し、巡回後も重複しない", async () => {
+    sq = await migrated();
+    for (let i=0;i<16;i++) seedDue(sq, `e${i}`, `期限${i}`, Date.now()-DAY+i*1000);
+    seedSubscription(sq,"s","","https://push.example.com/s");
+    const env=makeTestEnv(dbOf(sq) as any,{OAUTH_KV:makeMemoryKV()});
+    const spy=mockFetchAlways(201);
+    const counts=[];
+    for(let i=0;i<7;i++) counts.push((await pushDueItems(env, "")).sent);
+    expect(counts).toEqual([3,3,3,3,3,1,0]);
+    expect(spy).toHaveBeenCalledTimes(16);
+  });
+  it("31日前の期限も40端末から残り5端末へ繰り越す", async () => {
+    sq=await migrated();
+    seedDue(sq,"e","期限",Date.now()-31*DAY);
+    for(let i=0;i<45;i++) seedSubscription(sq,`s${i}`,"",`https://push.example.com/s${i}`);
+    const env=makeTestEnv(dbOf(sq) as any,{OAUTH_KV:makeMemoryKV()});
+    const spy=mockFetchAlways(201);
+    expect((await pushDueItems(env,"")).sent).toBe(40);
+    expect((await pushDueItems(env,"")).sent).toBe(5);
+    expect((await pushDueItems(env,"")).sent).toBe(0);
+    expect(new Set(spy.mock.calls.map(x=>x[0])).size).toBe(45);
+  });
+  it("503失敗は復旧後に再試行する",async()=>{
+    sq=await migrated();
+    seedDue(sq,"e","期限",Date.now()-DAY);
+    seedSubscription(sq,"s","","https://push.example.com/s");
+    const env=makeTestEnv(dbOf(sq) as any,{OAUTH_KV:makeMemoryKV()});
+    const spy=mockFetchAlways(503);
+    expect((await pushDueItems(env,"")).sent).toBe(0);
+    spy.mockResolvedValue(new Response(null,{status:201}));
+    expect((await pushDueItems(env,"")).sent).toBe(1);
+    expect((await pushDueItems(env,"")).sent).toBe(0);
+    expect(spy).toHaveBeenCalledTimes(2);
+  });
+});
+
+it("成功端末は再送せず、失敗端末だけ再試行する", async () => {
+  sq=await migrated();
+  seedDue(sq,"e","期限",Date.now()-DAY);
+  seedSubscription(sq,"a","","https://push.example.com/a");
+  seedSubscription(sq,"b","","https://push.example.com/b");
+  const env=makeTestEnv(dbOf(sq) as any,{OAUTH_KV:makeMemoryKV()});
+  const spy=vi.spyOn(globalThis,"fetch").mockImplementation(async url=>new Response(null,{status:String(url).endsWith("/a")?201:503}));
+  expect((await pushDueItems(env,"")).sent).toBe(1);
+  spy.mockResolvedValue(new Response(null,{status:201}));
+  expect((await pushDueItems(env,"")).sent).toBe(1);
+  expect(spy.mock.calls.map(x=>x[0])).toEqual(["https://push.example.com/a","https://push.example.com/b","https://push.example.com/b"]);
+});
+it("40送信を使い切ったworkspaceの後にも配達し、次の巡回で残りを再開する",async()=>{
+  sq=await migrated();
+  seedDue(sq,"a","古い期限",Date.now()-31*DAY);
+  seedDue(sq,"b","期限",Date.now()-DAY);
+  for (const id of ["a", "b"]) await sq.db.prepare("UPDATE entries SET workspace_id=? WHERE id=?").bind(id,id).run();
+  for(let i=0;i<45;i++) seedSubscription(sq,`a${i}`,"a",`https://push.example.com/a${i}`);
+  seedSubscription(sq,"b","b","https://push.example.com/b");
+  const env=makeTestEnv(dbOf(sq) as any,{OAUTH_KV:makeMemoryKV()});
+  const spy=mockFetchAlways(201);
+  expect((await pushDueItemsAllWorkspaces(env)).sent).toBe(40);
+  expect((await pushDueItemsAllWorkspaces(env)).sent).toBe(6);
+  expect((await pushDueItemsAllWorkspaces(env)).sent).toBe(0);
+  expect((await pushDueItemsAllWorkspaces(env)).sent).toBe(0);
+  expect(new Set(spy.mock.calls.map(x=>x[0])).size).toBe(46);
+});
+it("範囲外の既存期限と不正な購読でも正常な配達を止めない",async()=>{
+  sq=await migrated();
+  seedDue(sq,"bad","不正な期限",-9000000000000000);
+  seedDue(sq,"good","期限",Date.now()-DAY);
+  seedSubscription(sq,"bad","","https://push.example.com/bad");
+  await sq.db.prepare("UPDATE push_subscriptions SET subscription_json='{}' WHERE id='bad'").run();
+  seedSubscription(sq,"good","","https://push.example.com/good");
+  const env=makeTestEnv(dbOf(sq) as any,{OAUTH_KV:makeMemoryKV()});
+  const spy=mockFetchAlways(201);
+  expect((await pushDueItems(env,"")).sent).toBe(1);
+  expect(spy).toHaveBeenCalledTimes(1);
+});
+
+it("配達記録整理と3種類の結果更新を6 SQL以内で処理する",async()=>{
+  sq=await migrated();
+  const whenAt=Date.now()-DAY;
+  seedDue(sq,"e","期限",whenAt);
+  for(const id of ["ok","gone","failed"]) seedSubscription(sq,id,"",`https://push.example.com/${id}`);
+  const kv=makeMemoryKV();
+  await kv.put("pushed:",JSON.stringify({obsolete:whenAt}));
+  const env=makeTestEnv(dbOf(sq) as any,{OAUTH_KV:kv});
+  const {createNightlyD1Budget}=await import("../../src/runtime/d1-budget");
+  const budget=createNightlyD1Budget(env,6);
+  vi.spyOn(globalThis,"fetch").mockImplementation(async url=>new Response(null,{status:String(url).endsWith("/ok")?201:String(url).endsWith("/gone")?410:503}));
+  expect((await pushDueItems(budget.env,"")).sent).toBe(1);
+  expect(budget.stats()).toMatchObject({used:5,deferred:0});
+  expect(budget.stats().used).toBeLessThanOrEqual(6);
 });

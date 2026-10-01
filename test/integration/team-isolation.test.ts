@@ -25,6 +25,7 @@ import { resetDatabaseInit, initializeDatabase } from "../../src/db/init";
 import { resetVectorizeFilterState, vectorizeFilterState } from "../../src/vectorize/scope";
 import { ensureTenantBootstrap } from "../../src/lib/tenancy";
 import { createMember } from "../../src/lib/team-admin";
+import { embeddingMetadata } from "../../src/embedding/profile";
 import { nightSummaryKey } from "../../src/runtime/night-summary";
 import type { Env } from "../../src/env";
 
@@ -87,7 +88,7 @@ function digestAI(prompts: string[]): Ai {
   });
   return {
     run: vi.fn().mockImplementation(async (model: string, opts: any) => {
-      if (model === "@cf/baai/bge-small-en-v1.5") return { data: [new Array(384).fill(0.1)] };
+      if (model === "@cf/google/embeddinggemma-300m") return { data: [new Array(768).fill(0.1)] };
       if (opts?.stream) {
         prompts.push(String(opts?.messages?.[0]?.content ?? ""));
         return sse("A digest paragraph covering the period.");
@@ -99,9 +100,9 @@ function digestAI(prompts: string[]): Ai {
 
 /** An AI double that always reasons the pair into one given insight. */
 function insightAI(text: string): Ai {
-  const payload = JSON.stringify({ insight: true, shape: "throughline", text });
+  const payload = JSON.stringify({ insight: true, shape: "throughline", text, evidence: { a: "quarterly kitesurfing bookkeeping deadlines collide", b: "quarterly kitesurfing bookkeeping deadlines collide" } });
   return {
-    run: vi.fn().mockResolvedValue(new ReadableStream({
+    run: vi.fn().mockImplementation(async () => new ReadableStream({
       start(c) {
         c.enqueue(new TextEncoder().encode(`data: {"response":${JSON.stringify(payload)}}\n\n`));
         c.enqueue(new TextEncoder().encode("data: [DONE]\n\n"));
@@ -175,7 +176,7 @@ beforeEach(async () => {
     "Bob private: follow up with the immigration lawyer", ["task"]);
   seed("bob-due", bob.member.personalWorkspaceId, bob.member.userId,
     "Bob private: renew visa documents", []);
-  sqlite.db.prepare(`UPDATE entries SET when_at = ? WHERE id = 'bob-due'`).bind(Date.now() - 1000).run();
+  await sqlite.db.prepare(`UPDATE entries SET when_at = ? WHERE id = 'bob-due'`).bind(Date.now() - 1000).run();
 });
 
 afterEach(() => sqlite?.close());
@@ -197,11 +198,26 @@ describe("cross-user isolation, read surfaces", () => {
     expect((await jsonOf(await call("GET", "/count", bobToken))).count).toBe(6);
   });
 
-  it("GET /entry refuses a colleague's id outright", async () => {
-    const res = await call("GET", `/entry?id=${ids.alicePrivate}`, bobToken);
+  it("POST /entry refuses a colleague's id outright", async () => {
+    const res = await call("POST", "/entry", bobToken, { id: ids.alicePrivate });
     expect(res.status).toBe(404);
     // The company row is readable by both.
-    expect((await call("GET", `/entry?id=${ids.shared}`, bobToken)).status).toBe(200);
+    expect((await call("POST", "/entry", bobToken, { id: ids.shared })).status).toBe(200);
+  });
+
+  it("POST /history never reveals a colleague's private prior versions", async () => {
+    const update = await jsonOf(await call("POST", "/update", ALICE, {
+      id: ids.alicePrivate,
+      content: "Alice corrected private legal note",
+    }));
+    expect(update).toMatchObject({ ok: true, id: ids.alicePrivate });
+
+    const refused = await call("POST", "/history", bobToken, { id: ids.alicePrivate });
+    expect(refused.status).toBe(404);
+
+    const own = await jsonOf(await call("POST", "/history", ALICE, { id: ids.alicePrivate }));
+    expect(own.history.items).toEqual(expect.arrayContaining([expect.objectContaining({ reason: "update" })]));
+    expect(own.versions).toEqual([]);
   });
 
   it("GET /export backs up the member's readable set, not the deployment", async () => {
@@ -333,7 +349,7 @@ describe("cross-user isolation, read surfaces", () => {
     // insight drawn from the memories it cites. Neither is a licence to read a
     // colleague's personal workspace, nothing else in this codebase treats
     // "admin" that way.
-    expect((await call("GET", "/entry?id=bob-stale", ALICE)).status).toBe(404);
+    expect((await call("POST", "/entry", ALICE, { id: "bob-stale" })).status).toBe(404);
 
     const stale = await jsonOf(await call("GET", "/stale", ALICE));
     expect(JSON.stringify(stale)).not.toContain("therapist");
@@ -367,13 +383,12 @@ describe("cross-user isolation, read surfaces", () => {
     // Alice's own insight, drawn from a memory of Bob's.
     seed("alice-drawn", aliceWorkspaceId, aliceUserId,
       "Alice insight: two threads about the same negotiation", ["auto-insight"]);
-    sqlite.db.prepare(
+    seed("bob-source", bobWorkspaceId, bobUserId,
+      "Bob private: my psychiatrist raised the lithium dose", ["health"]);
+    await sqlite.db.prepare(
       `INSERT INTO edges (id, source_id, target_id, type, weight, provenance, metadata, created_at, updated_at, workspace_id)
        VALUES ('edge-1', 'alice-drawn', 'bob-source', 'drawn_from', 1, 'system', '{}', ?, ?, ?)`,
     ).bind(SEEDED_AT, SEEDED_AT, aliceWorkspaceId).run();
-    seed("bob-source", bobWorkspaceId, bobUserId,
-      "Bob private: my psychiatrist raised the lithium dose", ["health"]);
-
     const page = await jsonOf(await call("GET", "/patterns", ALICE));
     // The insight is hers and must still be listed.
     expect(page.patterns.map((p: any) => p.id)).toContain("alice-drawn");
@@ -388,7 +403,7 @@ describe("cross-user isolation, read surfaces", () => {
     // emptied the panel rather than scoped it.
     seed("alice-source", aliceWorkspaceId, aliceUserId,
       "Alice: the counterparty moved on the indemnity cap", ["deal"]);
-    sqlite.db.prepare(
+    await sqlite.db.prepare(
       `INSERT INTO edges (id, source_id, target_id, type, weight, provenance, metadata, created_at, updated_at, workspace_id)
        VALUES ('edge-2', 'alice-drawn', 'alice-source', 'drawn_from', 1, 'system', '{}', ?, ?, ?)`,
     ).bind(SEEDED_AT, SEEDED_AT, aliceWorkspaceId).run();
@@ -498,15 +513,36 @@ describe("cross-user isolation, read surfaces", () => {
     // Answers with text whose distinctive words are exactly those of the seeded
     // `bob-insight` row, so restatesRecent fires if, and only if, that row is
     // in the comparison list.
-    env.AI = insightAI(
-      "Considering leaving, that private company insight keeps returning to you.",
-    );
+    const privateInsight = "会社を離れることを考えており、非公開の社内方針について繰り返し考えるという状態が続いています。";
+    await sqlite.db.prepare("UPDATE entries SET content = ?, write_marker = ? WHERE id = 'bob-insight'")
+      .bind(privateInsight, sqlite.fixtureMarker()).run();
+    env.AI = insightAI(privateInsight);
 
     const body = await jsonOf(await call("GET", "/insights/dry-run", ALICE));
     expect(body.candidates.length).toBe(1);
     expect(body.candidates[0].outcome).toBe("insight");
     expect(body.candidates[0].reason).toBe(null);
     expect(body.candidates[0].would_write).toBe(true);
+  });
+
+  it("dry-runは再試行候補の検証失敗を理由付きで返し、候補と記憶を変更しない", async () => {
+    seed("alice-retry-a", aliceWorkspaceId, aliceUserId,
+      "Alice: chose predictable flat pricing at nine hundred a month", ["pricing"]);
+    seed("alice-retry-b", aliceWorkspaceId, aliceUserId,
+      "Alice: decided to change to hourly billing instead, not yet executed", ["pricing"]);
+    seedCandidate("cand-retry", "alice-retry-a", "alice-retry-b", 0.8);
+    await sqlite.db.prepare("UPDATE insight_candidates SET status = 'retry:evidence-v1', write_marker = ? WHERE id = 'cand-retry'")
+      .bind(sqlite.fixtureMarker()).run();
+    env.AI = insightAI("予測可能な固定料金を選ぶ判断から、利用時間に応じて請求する方針へ変更することを決めています。変更そのものは未実行です。");
+    const before = JSON.stringify(sqlite.rows());
+    for (let i = 0; i < 2; i++) {
+      const body = await jsonOf(await call("GET", "/insights/dry-run", ALICE));
+      expect(body.candidates).toHaveLength(1);
+      expect(body.candidates[0]).toMatchObject({ outcome: "invalid", reason: "validation failed: evidence", would_write: false });
+    }
+    expect(JSON.stringify(sqlite.rows())).toBe(before);
+    expect(await sqlite.db.prepare("SELECT status FROM insight_candidates WHERE id = 'cand-retry'").first())
+      .toMatchObject({ status: "retry:evidence-v1" });
   });
 
   it("GET /stats digest_candidates never names a colleague's private tag", async () => {
@@ -545,6 +581,15 @@ describe("cross-user isolation, write surfaces", () => {
 
   it("POST /append cannot touch a colleague's private row", async () => {
     const res = await call("POST", "/append", bobToken, { id: ids.alicePrivate, addition: "injected" });
+    expect(denied(res.status)).toBe(true);
+  });
+
+  it("POST /rollover cannot continue a colleague's private row", async () => {
+    const res = await call("POST", "/rollover", bobToken, {
+      id: ids.alicePrivate,
+      snapshot: "stolen continuation",
+      operation_id: "cross-user-rollover",
+    });
     expect(denied(res.status)).toBe(true);
   });
 
@@ -657,7 +702,7 @@ describe("cross-user isolation, maintenance passes", () => {
     vectors: { id: string; workspaceId?: string; score: number }[];
     absentFieldMatches: boolean;
     rejectFilters?: boolean;
-  }): VectorizeIndex {
+  }): Vectorize {
     return {
       ...env.VECTORIZE,
       query: vi.fn().mockImplementation(async (_values: number[], o: any) => {
@@ -675,13 +720,14 @@ describe("cross-user isolation, maintenance passes", () => {
             id: v.id,
             score: v.score,
             metadata: {
+              ...embeddingMetadata(),
               parentId: v.id,
               ...(v.workspaceId === undefined ? {} : { workspace_id: v.workspaceId }),
             },
           }));
         return { matches };
       }),
-    } as unknown as VectorizeIndex;
+    } as unknown as Vectorize;
   }
 
   /**
@@ -733,9 +779,9 @@ describe("cross-user isolation, maintenance passes", () => {
   }
 
   const nightly = async () => {
-    const { ctx: cronCtx, drain } = collectingCtx();
-    await worker.scheduled({ cron: NIGHTLY_CRON } as unknown as ScheduledEvent, env, cronCtx);
-    await drain();
+    const compression = collectingCtx();
+    await worker.scheduled({ cron: NIGHTLY_CRON } as unknown as ScheduledEvent, env, compression.ctx);
+    await compression.drain();
   };
 
   const cursor = async () => await sqlite.db.prepare(
@@ -973,7 +1019,7 @@ describe("cross-user isolation, maintenance passes", () => {
       "Renewal terms for the Ardent contract are unchanged this quarter", ["contracts"]);
     seed("bob-link", bobWorkspaceId, bobUserId,
       "Renewal terms for the Ardent contract are unchanged this quarter", ["contracts"]);
-    sqlite.db.prepare(
+    await sqlite.db.prepare(
       `INSERT INTO edges (id, source_id, target_id, type, weight, provenance, metadata, created_at, updated_at, workspace_id)
        VALUES ('stale-cross', 'alice-link', 'bob-link', 'relates_to', 0.96, 'inferred', '{}', ?, ?, ?)`,
     ).bind(SEEDED_AT, SEEDED_AT, aliceWorkspaceId).run();

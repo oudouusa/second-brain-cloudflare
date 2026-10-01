@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
-import { renderRecallText } from "../../src/recall/render";
+import { recallSnippet, renderRecallText } from "../../src/recall/render";
+import { DEFAULTS } from "../../src/config";
 import type { RecallMatch } from "../../src/recall/types";
 
 function m(over: Partial<RecallMatch> = {}): RecallMatch {
@@ -32,7 +33,8 @@ describe("renderRecallText", () => {
 
   it("still shows score and content", () => {
     const out = renderRecallText([m({ score: 1, content: "Hello world" })], "");
-    expect(out).toContain("100% match");
+    expect(out).toContain("relative score: 1.00");
+    expect(out).not.toContain("100% match");
     expect(out).toContain("Hello world");
   });
 
@@ -62,6 +64,15 @@ describe("renderRecallText", () => {
     it("distinguishes a user-made link ('you linked') from a system link ('system-linked')", () => {
       expect(renderRecallText([m({ hop: 1, viaProvenance: "explicit" })], "")).toContain("you linked");
       expect(renderRecallText([m({ hop: 1, viaProvenance: "system" })], "")).toContain("system-linked");
+    });
+
+    it("states whether traversal followed or opposed a directed edge", () => {
+      expect(renderRecallText([m({ hop: 1, viaProvenance: "explicit", viaDirection: "outgoing" })], ""))
+        .toContain("with edge direction");
+      expect(renderRecallText([m({ hop: 1, viaProvenance: "explicit", viaDirection: "incoming" })], ""))
+        .toContain("against edge direction");
+      expect(renderRecallText([m({ hop: 1, viaProvenance: "explicit", viaDirection: "undirected" })], ""))
+        .toContain("undirected");
     });
 
     it("omits the from-clause when the parent memory is not in the result set", () => {
@@ -127,5 +138,54 @@ describe("renderRecallText", () => {
       expect(out).toContain(content);
       expect(out).not.toContain("[truncated");
     });
+  });
+});
+
+
+describe("current-state preview evidence", () => {
+  const content = "Orion release journal. " + "Older context. ".repeat(100)
+    + "\n[Update Jan 1, 2026]: Orion rollout remains pending review. "
+    + "Previous review details. ".repeat(50)
+    + "\n[Update Feb 1, 2026]: Orion rollout completed. Live quality remains unverified.";
+
+  it("shows a relevant latest update together with its qualification", () => {
+    const currentQueryTokens = ["orion", "rollout"];
+    const memory = m({ content });
+    const result = recallSnippet(memory, 0, {
+      queryTokens: ["pending", "review"], currentQueryTokens,
+      config: { ...DEFAULTS, FULL_MATCH_MAX_CHARS: 500 },
+    });
+    expect(result.text).toContain("rollout completed");
+    expect(result.text).toContain("Live quality remains unverified");
+    expect(result.truncated).toBe(true);
+    expect(result.fullLength).toBe(content.length);
+    expect(result.text.length).toBeLessThanOrEqual(503);
+  });
+
+  it("keeps historical query evidence when current intent is absent", () => {
+    const result = recallSnippet(m({ content }), 0, {
+      queryTokens: ["pending", "review"], config: { ...DEFAULTS, FULL_MATCH_MAX_CHARS: 500 },
+    });
+    expect(result.text).toContain("pending review");
+    expect(result.text).not.toContain("rollout completed");
+  });
+
+  it.each([
+    ["Unrelated garden notes.", ["orion", "rollout"]],
+    ["Orion issue #149 is closed. Rollout completed.", ["orion", "rollout", "#14"]],
+    ["Orion rollout completed. " + "Padding. ".repeat(100) + "Issue #14 closed.", ["orion", "rollout", "#14"]],
+  ])("does not promote unrelated or hidden identifier evidence", (update, currentQueryTokens) => {
+    const memory = m({ content: content.slice(0, content.lastIndexOf("\n[Update ")) + "\n[Update Feb 1, 2026]: " + update });
+    const opts = { queryTokens: ["pending", "review"], config: { ...DEFAULTS, FULL_MATCH_MAX_CHARS: 500 } };
+    expect(recallSnippet(memory, 0, { ...opts, currentQueryTokens })).toEqual(recallSnippet(memory, 0, opts));
+  });
+
+  it("labels source updates with a date and preserves the get affordance", () => {
+    const out = renderRecallText([m({ content, isUpdate: true, updatedAt: Date.UTC(2026, 1, 1) })], "", {
+      queryTokens: ["pending", "review"], currentQueryTokens: ["orion", "rollout"],
+      config: { ...DEFAULTS, FULL_MATCH_MAX_CHARS: 500 },
+    });
+    expect(out).toContain("[updated Feb 1, 2026]");
+    expect(out).toContain('get("entry-123")');
   });
 });

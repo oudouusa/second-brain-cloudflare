@@ -37,7 +37,7 @@ import type { GoldenQuery, QueryCategory, QueryResult } from "./types";
 import type { makeReplayAi } from "./ai-replay";
 
 export const CORPUS_ID = "longmemeval";
-export const EMBEDDING_MODEL = "@cf/baai/bge-small-en-v1.5";
+export const EMBEDDING_MODEL = "@cf/google/embeddinggemma-300m";
 
 export function dataDir(root: string = process.env.SB_EVAL_ROOT ?? resolve(import.meta.dirname, "../..")): string {
   return resolve(root, ".eval-cache/public/longmemeval");

@@ -108,7 +108,7 @@ describe("vscode-copilot-hooks/session-start.js", () => {
     expect(parsed.hookSpecificOutput.additionalContext).not.toContain("Bearer");
     expect(parsed.hookSpecificOutput.additionalContext).not.toContain("test-token");
 
-    const recalls = captured.filter(c => c.url.startsWith("/recall?"));
+    const recalls = captured.filter(c => c.url === "/recall" && c.method === "POST");
     expect(recalls.length).toBeGreaterThanOrEqual(1);
   });
 

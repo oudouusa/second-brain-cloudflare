@@ -34,9 +34,9 @@ const ACTIVE = PROJECT_ROWS.filter((r) => r.status === "active");
 function world(over: Record<string, any> = {}) {
   return {
     "GET /projects": { body: { projects: ACTIVE } },
-    "GET /list": { body: [] },
+    "POST /list": { body: [] },
     "POST /capture": { body: { ok: true, id: "e1", tags: ["project:website"] } },
-    "GET /recall": { body: { ok: true, results: [] } },
+    "POST /recall": { body: { ok: true, results: [] } },
     ...over,
   } as Record<string, any>;
 }
@@ -312,8 +312,8 @@ describe("project filter", () => {
     await h.ctx.apiList(50, undefined, undefined, "", "website");
     await h.ctx.apiList(50);
     const [withProject, without] = h.calls.filter((c) => c.path === "/list");
-    expect(withProject.query.get("project")).toBe("website");
-    expect(without.query.has("project")).toBe(false);
+    expect(withProject.body?.project).toBe("website");
+    expect(without.body?.project).toBeUndefined();
   });
 
   it("narrows the Memories list on the server, and keeps both selects in step", async () => {
@@ -323,7 +323,7 @@ describe("project filter", () => {
     h.ctx.onProjectFilterChange("website");
     await drain();
     const list = h.calls.filter((c) => c.path === "/list").pop()!;
-    expect(list.query.get("project")).toBe("website");
+    expect(list.body?.project).toBe("website");
     expect(h.els.get("project-filter-recent").value).toBe("website");
     expect(h.els.get("project-filter-recall").value).toBe("website");
   });
@@ -336,8 +336,8 @@ describe("project filter", () => {
     h.ctx.onProjectFilterChange("website");
     await drain();
     const list = h.calls.filter((c) => c.path === "/list").pop()!;
-    expect(list.query.get("tag")).toBe("work");
-    expect(list.query.get("project")).toBe("website");
+    expect(list.body?.tag).toBe("work");
+    expect(list.body?.project).toBe("website");
   });
 
   it("All projects lifts the filter", async () => {
@@ -347,14 +347,14 @@ describe("project filter", () => {
     h.ctx.onProjectFilterChange("website");
     h.ctx.onProjectFilterChange("");
     await drain();
-    expect(h.calls.filter((c) => c.path === "/list").pop()!.query.has("project")).toBe(false);
+    expect(h.calls.filter((c) => c.path === "/list").pop()!.body?.project).toBeUndefined();
   });
 
   it("drops a project that has vanished, and shows the list without it", async () => {
     let gone = false;
     const h = boot({
-      "GET /list": (c: any) =>
-        c.query.get("project") && !gone
+      "POST /list": (c: any) =>
+        c.body?.project && !gone
           ? ((gone = true), { status: 404, body: { error: 'unknown project "website"', known_projects: ["trip-rome"] } })
           : { body: [] },
     });
@@ -365,7 +365,7 @@ describe("project filter", () => {
     await drain();
     expect(h.els.get("project-filter-recent").value).toBe("");
     const lists = h.calls.filter((c) => c.path === "/list");
-    expect(lists.at(-1)!.query.has("project")).toBe(false);
+    expect(lists.at(-1)!.body?.project).toBeUndefined();
   });
 
   describe("when the selected project is archived elsewhere", () => {
@@ -391,7 +391,7 @@ describe("project filter", () => {
 
       expect(h.els.get("project-filter-recent").value).toBe("");
       expect(lists(h).length).toBe(before + 1);
-      expect(lists(h).at(-1).query.has("project")).toBe(false);
+      expect(lists(h).at(-1).body?.project).toBeUndefined();
     });
 
     it("does not fetch a list when Memories is not the current tab", async () => {
@@ -428,18 +428,18 @@ describe("project filter", () => {
     h.els.get("recall-input").value = "what did we decide about hosting?";
     await h.ctx.sendRecall();
     const recall = h.calls.find((c) => c.path === "/recall")!;
-    expect(recall.query.get("project")).toBe("website");
+    expect(recall.body?.project).toBe("website");
   });
 
   it("does not add project= to a recall when none is chosen", async () => {
     const h = boot({}, { lenient: true });
     h.els.get("recall-input").value = "anything";
     await h.ctx.sendRecall();
-    expect(h.calls.find((c) => c.path === "/recall")!.query.has("project")).toBe(false);
+    expect(h.calls.find((c) => c.path === "/recall")!.body?.project).toBeUndefined();
   });
 
   it("clears a project the Worker no longer knows when a recall is refused", async () => {
-    const h = boot({ "GET /recall": { status: 404, body: { ok: false, error: 'unknown project "website"', known_projects: [] } } }, { lenient: true });
+    const h = boot({ "POST /recall": { status: 404, body: { ok: false, error: 'unknown project "website"', known_projects: [] } } }, { lenient: true });
     await h.ctx.loadComposerProjects();
     h.ctx.onProjectFilterChange("website");
     await drain();

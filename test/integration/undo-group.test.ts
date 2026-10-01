@@ -17,8 +17,8 @@ import { undoGroup, undoGroupMcpReply } from "../../src/memory/undo";
 import { DEFAULTS } from "../../src/config";
 import { initializeDatabase, resetDatabaseInit } from "../../src/db/init";
 import { buildMcpServer } from "../../src/mcp/server";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { Client } from "@modelcontextprotocol/client";
+import { InMemoryTransport } from "@modelcontextprotocol/client";
 
 const MIN = 60 * 1000;
 const HOUR = 60 * MIN;
@@ -33,9 +33,10 @@ describe("undoGroup() (S3)", () => {
 
   beforeEach(async () => {
     sqlite = makeSqliteD1();
-    env = makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV() });
+    env = sqlite.admitEnv(makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV() }));
     resetDatabaseInit();
     await initializeDatabase(env);
+  env = sqlite.admitEnv(env);
     now = Date.UTC(2026, 8, 27, 12, 0, 0);
     vi.spyOn(Date, "now").mockReturnValue(now);
   });
@@ -272,6 +273,7 @@ describe("undoGroup() (S3)", () => {
 
     // t1 is restored by someone else (an ordinary /undo or /restore call) before undo/group runs:
     // no longer in entries_trash, and back in entries.
+    await sqlite.db.prepare(`UPDATE entries_trash SET write_marker = ? WHERE id = 't1'`).bind(sqlite.fixtureMarker('delete')).run();
     await sqlite.db.prepare(`DELETE FROM entries_trash WHERE id = 't1'`).run();
     await seedEntry("t1", ["work"]);
 

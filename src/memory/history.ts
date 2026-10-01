@@ -1,3 +1,4 @@
+import { notHeldSqlFor } from "../quarantine/tags";
 import type { Env } from "../env";
 import { lookupActorLabels, resolveActorLabel } from "../lib/actors";
 import type { Identity } from "../lib/identity";
@@ -143,5 +144,196 @@ export async function readEntryHistory(env: Env, identity: Identity, id: string)
       .bind(id, id, id, ...edgeScope.bindings, ...otherScope.bindings).all<{ source_id: string; target_id: string }>(),
   ]);
   const history = await buildEntryHistoryFromReads(env, identity, historyRow, config, chain, timelineResult);
-  return { history, edges: edgeResult.results };
+  const legacyVersions = await listMemoryHistory(env, id, MEMORY_HISTORY_MAX_RESULTS, identity);
+  return { history, edges: edgeResult.results, legacyVersions };
+}
+
+import { edgeInsertStatement, sameWorkspaceEdge } from "../graph/edges";
+import { scopeWhere } from "../lib/scope";
+import { memoryWriteMarker } from "../migration/write-lock";
+
+export const MEMORY_HISTORY_MAX_RESULTS = 50;
+
+export type MemoryHistoryReason = "manual-update" | "smart-merge" | "smart-replace";
+
+export interface BeforeImageSource {
+  content: string;
+  tags: string;
+  source: string;
+  createdAt: number;
+  vectorIds: string;
+  workspaceId: string;
+}
+
+export interface BeforeImagePlan {
+  id: string;
+  sourceId: string;
+  archivedTags: string;
+  originalTags: string[];
+  reason: MemoryHistoryReason;
+  replacedAt: number;
+  source: BeforeImageSource;
+}
+
+export interface MemoryHistoryVersion {
+  id: string;
+  content: string;
+  tags: string[];
+  source: string;
+  createdAt: number;
+  replacedAt: number;
+  reason: MemoryHistoryReason;
+}
+
+function parseTags(raw: string): string[] {
+  try {
+    const value = JSON.parse(raw) as unknown;
+    return Array.isArray(value) ? value.filter((tag): tag is string => typeof tag === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Describe an immutable before-image. The archived row is deprecated/cold so it
+ * cannot compete with the corrected current entry in recall, while edge metadata
+ * retains the exact original tag set for inspection or restoration.
+ */
+export function planBeforeImage(
+  sourceId: string,
+  source: BeforeImageSource,
+  reason: MemoryHistoryReason,
+  replacedAt: number,
+): BeforeImagePlan {
+  const originalTags = parseTags(source.tags);
+  return {
+    id: `history-${crypto.randomUUID()}`,
+    sourceId,
+    // Only the lifecycle marker lives on the archive row. The exact original
+    // tags are in edge metadata and returned by history(); leaving topic tags
+    // here would make old versions eligible for tag listings and compression.
+    archivedTags: JSON.stringify(["status:deprecated"]),
+    originalTags,
+    reason,
+    replacedAt,
+    source,
+  };
+}
+
+/**
+ * Insert the prior version only while the source still matches the fields used
+ * by the replacement CAS. This statement, the source UPDATE and the provenance
+ * edge must run in one D1 batch; the edge's endpoint guard aborts the batch if
+ * the conditional INSERT lost a race.
+ */
+export function beforeImageInsertStatement(plan: BeforeImagePlan, env: Env): D1PreparedStatement {
+  return env.DB.prepare(
+    // versioning: exempt: immutable legacy before-image, paired with source CAS
+    // validity: any: 原本CASと同じbatchで変更前の状態を履歴に保持する。
+    `INSERT INTO entries
+       (id, content, tags, source, created_at, updated_at, vector_ids, recall_count,
+        importance_score, contradiction_wins, contradiction_losses, memory_tier, pinned,
+        last_recalled_at, write_marker, workspace_id, actor_id)
+     SELECT ?, content, ?, source, created_at, ?, '[]', recall_count,
+            importance_score, contradiction_wins, contradiction_losses, 'cold', 0,
+            last_recalled_at, ?, workspace_id, actor_id
+       FROM entries
+      WHERE id = ? AND content = ? AND tags = ? AND source = ? AND created_at = ?
+        AND vector_ids = ? AND workspace_id = ?`,
+  ).bind(
+    plan.id,
+    plan.archivedTags,
+    plan.replacedAt,
+    memoryWriteMarker(env),
+    plan.sourceId,
+    plan.source.content,
+    plan.source.tags,
+    plan.source.source,
+    plan.source.createdAt,
+    plan.source.vectorIds,
+    plan.source.workspaceId,
+  );
+}
+
+export function beforeImageEdgeStatement(plan: BeforeImagePlan, env: Env): D1PreparedStatement {
+  const statement = edgeInsertStatement(plan.sourceId, plan.id, "supersedes", {
+    provenance: "system",
+    weight: 1,
+    ...sameWorkspaceEdge(plan.source.workspaceId),
+    created_at: plan.replacedAt,
+    metadata: {
+      before_image: {
+        version: 1,
+        reason: plan.reason,
+        original_tags: plan.originalTags,
+      },
+    },
+  }, env);
+  if (!statement) throw new Error("could not create before-image provenance link");
+  return statement;
+}
+
+/**
+ * The shared history transaction for both indexed and keyword-only replacements.
+ * The caller prepares the source CAS before entering here and still interprets
+ * its result. Keep the original statement order and return only that source
+ * result, never a sum of archive/edge writes. Without a before-image, preserve
+ * the direct run path. No retries, provider calls or new write authority here.
+ */
+export async function commitSourceWithHistory(
+  env: Env,
+  sourceUpdate: D1PreparedStatement,
+  beforeImage?: BeforeImagePlan,
+): Promise<D1Result> {
+  if (!beforeImage) return sourceUpdate.run();
+  const results = await env.DB.batch([
+    beforeImageInsertStatement(beforeImage, env),
+    sourceUpdate,
+    beforeImageEdgeStatement(beforeImage, env),
+  ]);
+  return results[1];
+}
+
+/** Read-only version history; the current entry is authorized by the caller first. */
+export async function listMemoryHistory(
+  env: Env,
+  currentId: string,
+  limit: number,
+  identity?: Identity,
+): Promise<MemoryHistoryVersion[]> {
+  const bounded = Math.max(1, Math.min(MEMORY_HISTORY_MAX_RESULTS, Math.floor(limit)));
+  const scope = identity ? scopeWhere(identity, undefined, "h.workspace_id") : null;
+  const { results } = await env.DB.prepare(
+    // scope-checked: authenticated history rows are constrained to the caller's readable workspaces; identity-less callers are the explicit legacy/internal MCP path
+    `SELECT h.id, h.content, h.tags, h.source, h.created_at,
+            e.created_at AS replaced_at, e.metadata
+       FROM edges e
+       JOIN entries h ON h.id = e.target_id
+      WHERE e.source_id = ? AND e.type = 'supersedes' AND ${notHeldSqlFor("h")}
+        AND CASE WHEN json_valid(e.metadata)
+              THEN json_extract(e.metadata, '$.before_image.version')
+              ELSE NULL
+            END = 1
+        ${scope ? `AND ${scope.clause}` : ""}
+      ORDER BY e.created_at DESC, h.id ASC
+      LIMIT ?`,
+  ).bind(currentId, ...(scope?.bindings ?? []), bounded).all<Record<string, unknown>>();
+
+  return (results ?? []).map(row => {
+    let metadata: { before_image?: { reason?: unknown; original_tags?: unknown } } = {};
+    try { metadata = JSON.parse(String(row.metadata ?? "{}")); } catch { /* use safe defaults */ }
+    const originalTags = metadata.before_image?.original_tags;
+    const reason = metadata.before_image?.reason;
+    return {
+      id: String(row.id),
+      content: String(row.content ?? ""),
+      tags: Array.isArray(originalTags)
+        ? originalTags.filter((tag): tag is string => typeof tag === "string")
+        : parseTags(String(row.tags ?? "[]")).filter(tag => tag !== "status:deprecated"),
+      source: String(row.source ?? "api"),
+      createdAt: Number(row.created_at),
+      replacedAt: Number(row.replaced_at),
+      reason: reason === "smart-merge" || reason === "smart-replace" ? reason : "manual-update",
+    };
+  });
 }

@@ -29,8 +29,11 @@ const entry = (id: string, createdAt: number, content = `alpha bravo charlie not
 
 /** Import a payload the way the settings page does: the same file, page after page. */
 async function restore(entries: ReturnType<typeof entry>[], limit = 100) {
-  for (let offset = 0; offset < entries.length; offset += limit) {
-    await importExportPayload(env, { entries, edges: [], projects: [] } as never, { limit, offset });
+  let offset = 0;
+  while (offset < entries.length) {
+    const result = await importExportPayload(env, { entries, edges: [], projects: [] } as never, { limit, offset });
+    expect(result.next_offset).toBeGreaterThan(offset);
+    offset = result.next_offset;
   }
 }
 
@@ -53,6 +56,7 @@ beforeEach(async () => {
     VECTORIZE: makeVectorizeMock({ query: vi.fn().mockRejectedValue(new Error("index unavailable")) }),
   });
   await initializeDatabase(env);
+  env = sqlite.admitEnv(env);
   await env.OAUTH_KV.put(FTS_READY_KV_KEY, "1");
   resetFtsReadyMemo();
 });
@@ -107,8 +111,14 @@ describe("export -> import round trip", () => {
   it("returns the newest all-token rows first from the restored brain", async () => {
     const db = makeTestDb();
     for (let i = 0; i < 800; i++) db.entries.push({ id: `r${i}`, content: `alpha bravo charlie note ${i}`, tags: "[]", source: "api", created_at: 1000 + i, vector_ids: "[]", recall_count: 0, importance_score: 0, contradiction_wins: 0, contradiction_losses: 0 });
-    const res = await worker.fetch(req("GET", "/export"), makeTestEnv(db), ctx);
-    const exported = await res.json() as { entries: ReturnType<typeof entry>[] };
+    const exportEnv = makeTestEnv(db);
+    const exported = { entries: [] as ReturnType<typeof entry>[] };
+    for (let offset = 0; offset < 800; offset += 100) {
+      const res = await worker.fetch(req("GET", `/export?paged=1&offset=${offset}&limit=100`), exportEnv, ctx);
+      expect(res.status).toBe(200);
+      const page = await res.json() as { entries: ReturnType<typeof entry>[] };
+      exported.entries.push(...page.entries);
+    }
 
     await restore(exported.entries, 300);
 

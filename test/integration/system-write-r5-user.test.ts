@@ -15,16 +15,16 @@ async function setup(score: number, decision: string) {
   resetDatabaseInit();
   const sqlite = makeSqliteD1();
   const vectors = new Map<string, any>();
-  const env = makeTestEnv(undefined, {
+  const env = sqlite.admitEnv(makeTestEnv(undefined, {
     DB: sqlite.db as any,
     OAUTH_KV: makeMemoryKV(),
     VECTORIZE: makeVectorizeMock({
       query: vi.fn().mockResolvedValue({ matches: [{ id: "old", score, metadata: { parentId: "old" } }] }),
       upsert: vi.fn(async (rows: any[]): Promise<any> => { for (const row of rows) vectors.set(row.id, row.metadata); return { mutationId: "m" }; }),
     }),
-    AI: { run: vi.fn(async (model: string) => model.startsWith("@cf/baai/bge")
-      ? { data: [new Array(384).fill(0.1)] } : stream(decision)) } as any,
-  }) as Env;
+    AI: { run: vi.fn(async (model: string) => model === "@cf/google/embeddinggemma-300m"
+      ? { data: [new Array(768).fill(0.1)] } : stream(decision)) } as any,
+  })) as Env;
   await initializeDatabase(env);
   sqlite.seed({ id: "old", content: "Old digest", tags: ["synthesized"], source: "system", createdAt: 1000 });
   return { sqlite, env, vectors };

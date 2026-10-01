@@ -1,8 +1,8 @@
 import { VECTORIZE_TOP_K_MULTIPLIER } from "../constants";
-import { edgeScanBatchSize } from "../graph/traverse";
-import type { EdgeProvenance, EdgeType } from "../graph/types";
+import type { EdgeDirection, EdgeProvenance, EdgeType } from "../graph/types";
 import type { DistilledQuery } from "./distill";
-import { edgeIntentCompatibility, type RecallIntent } from "./query-profile";
+import { edgeIntentCompatibility, type GraphQueryDirection, type RecallIntent } from "./query-profile";
+import { edgeScanBatchSize } from "../graph/traverse";
 import { VIEW_SHARE } from "./root-selector";
 import { queryRelevantWindow } from "./snippet";
 
@@ -34,6 +34,8 @@ export interface LinkedEvidenceInput {
   replacementCoverage: number;
   intent: RecallIntent;
   edgeType: EdgeType;
+  edgeDirection?: EdgeDirection;
+  queryDirection?: GraphQueryDirection;
 }
 
 export interface NeighborhoodEvidenceScore {
@@ -136,35 +138,30 @@ export function queryCoverage(
   tokens: string[],
   corpus: Pick<DistilledQuery, "df" | "total">,
 ): CoverageDetail {
-  const dedupedTokens = [...new Set(tokens.filter(Boolean))];
-  if (!dedupedTokens.length) return { score: 0, exactHighIdf: false };
+  const normalizedTokens = [...new Set(
+    tokens.map(t => t.normalize("NFKC").toLowerCase()).filter(Boolean)
+  )];
+  if (!normalizedTokens.length) return { score: 0, exactHighIdf: false };
 
-  // Matched against lowercased content, so lowercased here too. corpus.df is
-  // keyed by the ORIGINAL token casing (raw-surface probes, #326, are never
-  // lowercased by the tokenizer), so df lookups must use the original token —
-  // mirrors the needle pattern in fuseDenseAndKeyword (search.ts).
-  const needle = new Map(dedupedTokens.map(t => [t, t.toLowerCase()]));
-
-  const hasCorpusIdf = !!corpus.df && !!corpus.total && dedupedTokens.every(t => corpus.df!.has(t));
+  const hasCorpusIdf = !!corpus.df && !!corpus.total && normalizedTokens.every(t => corpus.df!.has(t));
   const weightOf = (token: string) => hasCorpusIdf
     ? Math.log(1 + corpus.total! / ((corpus.df!.get(token) ?? 0) + 1))
     : 1;
-  const lower = content.toLowerCase();
+  const lower = content.normalize("NFKC").toLowerCase();
   let matched = 0;
   let total = 0;
   let exactHighIdf = false;
 
-  for (const t of dedupedTokens) {
-    const weight = weightOf(t);
+  for (const token of normalizedTokens) {
+    const weight = weightOf(token);
     total += weight;
-    const lc = needle.get(t)!;
-    const isExactMatch = new RegExp(`(?<![\\w])${escapeRegExp(lc)}(?![\\w])`).test(lower);
+    const isExactMatch = new RegExp(`(?<![\\w])${escapeRegExp(token)}(?![\\w])`).test(lower);
     if (isExactMatch) {
       matched += weight;
       exactHighIdf ||= !!corpus.df
         && !!corpus.total
-        && (corpus.df.get(t) ?? Number.POSITIVE_INFINITY) <= corpus.total * 0.1;
-    } else if (lower.includes(lc)) {
+        && (corpus.df.get(token) ?? Number.POSITIVE_INFINITY) <= corpus.total * 0.1;
+    } else if (lower.includes(token)) {
       matched += weight * SUBSTRING_WEIGHT;
     }
   }
@@ -175,8 +172,10 @@ export function queryCoverage(
 const clamp = (value: number) => Math.max(0, Math.min(1, value));
 
 export function exactQueryMatchCount(content: string, tokens: string[]): number {
-  const lower = content.toLowerCase();
-  return [...new Set(tokens.map(token => token.toLowerCase()).filter(Boolean))]
+  const lower = content.normalize("NFKC").toLowerCase();
+  return [...new Set(
+    tokens.map(token => token.normalize("NFKC").toLowerCase()).filter(Boolean)
+  )]
     .filter(token => new RegExp(`(?<![\\w])${escapeRegExp(token)}(?![\\w])`).test(lower)).length;
 }
 
@@ -204,7 +203,18 @@ export function scoreLinkedEvidence(input: LinkedEvidenceInput): NeighborhoodEvi
     ).score,
   );
   const coverageGain = Math.max(0, unionCoverage - parentCoverage);
-  if (linkedCoverage === 0) {
+  const structuredTypeCompatible = (input.intent === "causal" && input.edgeType === "caused_by")
+    || (input.intent === "chronology" && ["follows", "supersedes"].includes(input.edgeType));
+  const structuredEdgeEvidence = input.hop === 1
+    && input.provenance !== "inferred"
+    && input.edgeWeight >= 0.5
+    && structuredTypeCompatible
+    && input.edgeDirection !== undefined
+    && input.edgeDirection !== "undirected"
+    && (input.queryDirection === undefined
+      || input.queryDirection === "either"
+      || input.queryDirection === input.edgeDirection);
+  if (linkedCoverage === 0 && !structuredEdgeEvidence) {
     return { eligible: false, score: 0, coverage: linkedCoverage, coverageGain, rejection: "no-linked-evidence" };
   }
 
@@ -224,6 +234,14 @@ export function scoreLinkedEvidence(input: LinkedEvidenceInput): NeighborhoodEvi
     + WEIGHT.provenance * provenanceFactor
     + WEIGHT.intent * edgeIntentCompatibility(input.intent, input.edgeType),
   );
+  if (structuredEdgeEvidence) {
+    return {
+      eligible: true,
+      score: Math.max(MIN_NEIGHBORHOOD_SCORE, score),
+      coverage: linkedCoverage,
+      coverageGain,
+    };
+  }
   const meetsPrecisionGate = precision.exactHighIdf || exactQueryMatchCount(linkedEvidence, input.queryTokens) >= 2;
   const meetsLinkedEvidenceGate = (linkedCoverage >= MIN_LINKED_COVERAGE || precision.exactHighIdf)
     && meetsPrecisionGate;

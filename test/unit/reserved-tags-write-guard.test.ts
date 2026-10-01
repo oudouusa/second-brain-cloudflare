@@ -131,14 +131,14 @@ describe("append never receives a caller-supplied tag, so it needs no strip", ()
     const appendBlock = source.slice(source.indexOf('"append"'), source.indexOf('"update"'));
     expect(appendBlock).not.toMatch(/tags:\s*z\./);
     // It reads tags from the row it already has, never from the request.
-    expect(appendBlock).toContain('const tags: string[] = JSON.parse(row.tags ?? "[]")');
+    expect(appendBlock).toContain('const tags: string[] = JSON.parse(row.tags as string)');
   });
 
   it("POST /append's body type carries no tags field", () => {
     const source = readFileSync(resolve(ROOT, "src/routes/capture.ts"), "utf8");
     const appendBlock = source.slice(source.indexOf('"/append"'), source.indexOf('"/update"'));
     expect(appendBlock).not.toMatch(/body\.tags/);
-    expect(appendBlock).toContain('const tags: string[] = JSON.parse(row.tags ?? "[]")');
+    expect(appendBlock).toContain('const tags: string[] = JSON.parse(row.tags as string)');
   });
 });
 

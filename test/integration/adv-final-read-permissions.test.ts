@@ -10,8 +10,9 @@ afterEach(() => t?.close());
 
 const ctx = { waitUntil: (_: Promise<unknown>) => {} } as ExecutionContext;
 const getVersion = (token: string, id: string) => worker.fetch(
-  new Request(`http://localhost/entry/version?id=${id}&seq=1`, {
-    headers: { Authorization: `Bearer ${token}` },
+  new Request("http://localhost/entry/version", {
+    method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ id, seq: 1 }),
   }), t.env, ctx,
 );
 const restore = (token: string, id: string) => worker.fetch(

@@ -29,7 +29,7 @@ const ctx = { waitUntil: () => {} } as unknown as ExecutionContext;
 beforeEach(async () => {
   resetDatabaseInit();
   sqlite = makeSqliteD1();
-  env = makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV(), VECTORIZE: makeVectorizeMock(), AI: makeAIMock() });
+  env = sqlite.admitEnv(makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV(), VECTORIZE: makeVectorizeMock(), AI: makeAIMock() }));
   await initializeDatabase(env);
   const roots = await ensureTenantBootstrap(env);
   owner = (await resolveIdentityByUserId(env, roots.ownerUserId))!;
@@ -117,13 +117,13 @@ describe("budget auditor R20 (T-0089.4.2, T-0089.5.9): a single Release stays we
     let aiCalls = 0;
     const ai = { run: vi.fn(async (model: string, input: any) => {
       aiCalls++;
-      if (model.startsWith("@cf/baai/bge")) {
+      if (model === "@cf/google/embeddinggemma-300m") {
         const list = Array.isArray(input?.text) ? input.text : [input?.text];
-        return { data: list.map(() => new Array(384).fill(0.1)) };
+        return { data: list.map(() => new Array(768).fill(0.1)) };
       }
       return { response: "ok" };
     }) } as any;
-    const releaseEnv = { ...env, AI: ai } as Env;
+    const releaseEnv = { ...env, WRITE_ADMISSION_TOKEN: env.WRITE_ADMISSION_TOKEN, AI: ai } as Env;
 
     const result = await revertEntry(releaseEnv, owner, "huge", change(), DEFAULTS, undefined, owner.personalWorkspaceId);
 

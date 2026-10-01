@@ -1,3 +1,5 @@
+import { syntheticGemmaPricing } from "../fork-synthetic";
+syntheticGemmaPricing();
 import { parentIdOfVectorId } from "../../../src/vectorize/ids";
 import { describe, expect, it, vi } from "vitest";
 import type { storeEntry } from "../../../src/capture/store";
@@ -34,7 +36,7 @@ const spec: CorpusSpec = {
   queries: [],
 };
 const dry = () => makeReplayAi({ store: new ReplayStore([]), mode: "dry" });
-const MODEL = "@cf/baai/bge-small-en-v1.5";
+const MODEL = "@cf/google/embeddinggemma-300m";
 
 describe("loadCorpus (sqlite backend)", () => {
   it("indexes through the real write path: rows, FTS, counters, vectors, edges, and the ready flag", async () => {
@@ -48,8 +50,8 @@ describe("loadCorpus (sqlite backend)", () => {
       expect(hit.results).toHaveLength(1);
       expect(await corpus.env.OAUTH_KV.get(FTS_READY_KV_KEY)).toBe("1");
       // The long entry is multi-chunk, exactly as storeEntry writes it.
-      const ids = (await corpus.vectorize.query(new Array(384).fill(0.01), { topK: 50, returnMetadata: "all" })).matches.map(m => m.id);
-      expect(ids.filter(id => parentIdOfVectorId(id) === "d").length).toBeGreaterThan(1);
+      const ids = (await corpus.vectorize.query(new Array(128).fill(0.01), { topK: 50, returnMetadata: "all" })).matches.filter(m => m.metadata?.parentId === "d").map(m => m.id);
+      expect(ids.length).toBeGreaterThan(1);
       const stored = await corpus.env.DB.prepare(`SELECT vector_ids FROM entries WHERE id = 'd'`).first<{ vector_ids: string }>();
       expect(JSON.parse(stored!.vector_ids).length).toBeGreaterThan(1);
       expect(corpus.workspaceOf.get("c")).toBe(WORKSPACES.company);
@@ -63,8 +65,8 @@ describe("loadCorpus (sqlite backend)", () => {
   it("stamps workspace_id on every vector so the scoped Vectorize filter can work", async () => {
     const corpus = await loadCorpus({ spec, backend: "sqlite", replay: dry(), embeddingModel: MODEL });
     try {
-      const scoped = await corpus.vectorize.query(new Array(384).fill(0.01), { topK: 50, returnMetadata: "all", filter: { workspace_id: { $in: [WORKSPACES.company] } } });
-      expect(scoped.matches.map(m => parentIdOfVectorId(m.id))).toEqual(["c"]);
+      const scoped = await corpus.vectorize.query(new Array(128).fill(0.01), { topK: 50, returnMetadata: "all", filter: { workspace_id: { $in: [WORKSPACES.company] } } });
+      expect(scoped.matches.map(m => m.metadata?.parentId)).toEqual(["c"]);
     } finally {
       await corpus.close();
     }
@@ -164,7 +166,7 @@ describe("loadCorpus normalization", () => {
       expect(row.content).toBe("the quote landed");
       expect(JSON.parse(row.tags as string)).toEqual(["work", "task", "renovation"]);
       // The vectors are written from the normalized text and tags too.
-      const [hit] = (await corpus.vectorize.query(new Array(384).fill(0.01), { topK: 5, returnMetadata: "all" })).matches;
+      const [hit] = (await corpus.vectorize.query(new Array(128).fill(0.01), { topK: 5, returnMetadata: "all" })).matches;
       expect(hit.metadata).toMatchObject({ content: "the quote landed", tag_renovation: true, tag_work: true });
     } finally {
       await corpus.close();
@@ -181,12 +183,12 @@ describe("loadCorpus safety nets", () => {
     return stored;
   };
   it.each([
-    ["FTS rows", "DELETE FROM entries_fts WHERE id = ?"],
-    ["entry counters", "UPDATE entry_counts SET n = n + 1 WHERE ? IS NOT NULL"],
-    ["entries rows", "DELETE FROM entries WHERE id = ?"],
-  ])("throws on index drift in the %s instead of flagging the corpus ready", async (_leg, sql) => {
+    ["FTS rows", "DELETE FROM entries_fts WHERE id = ?", "index drift"],
+    ["entry counters", "UPDATE entry_counts SET n = n + 1 WHERE ? IS NOT NULL", "index drift"],
+    ["削除receiptのないentries削除", "DELETE FROM entries WHERE id = ?", "memory-write-locked"],
+  ])("throws on index drift in the %s instead of flagging the corpus ready", async (_leg, sql, expected) => {
     const before = opened.length;
-    await expect(load(spec, { index: { id: "drift", storeEntry: drifting(sql) } })).rejects.toThrow(/index drift/);
+    await expect(load(spec, { index: { id: "drift", storeEntry: drifting(sql) } })).rejects.toThrow(expected);
     expect(opened[before].closes).toBe(1);
   });
 
@@ -216,9 +218,7 @@ describe("loadCorpus safety nets", () => {
       };
       const corpus = await load(many, { concurrency, index: { id: "tracked", storeEntry: tracked }, onProgress: (done, total) => progress.push(done * 1000 + total) });
       try {
-        // Vector ids are minted per upload (T-0089.1.1): compare how many each row lists, not the ids.
-        const rows = (await rowsOf(corpus, "SELECT id, vector_ids FROM entries ORDER BY id") as { id: string; vector_ids: string }[])
-          .map(r => ({ id: r.id, vectors: (JSON.parse(r.vector_ids) as string[]).length }));
+        const rows = await rowsOf(corpus, "SELECT id, json_array_length(vector_ids) AS vector_count FROM entries ORDER BY id");
         return { peak, progress, rows, size: corpus.vectorize.size };
       } finally {
         await corpus.close();

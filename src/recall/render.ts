@@ -3,6 +3,7 @@ import { formatAsOfQualifier } from "../memory/stale";
 import { getStatus } from "../memory/status";
 import { DEFAULTS, type Config } from "../config";
 import { allowanceFor, snippetOf, truncationNote, type Snippet } from "./snippet";
+import { exactQueryMatchCount } from "./neighborhood";
 import { computeCompoundStale } from "./compound-stale";
 import type { CompoundStaleSignal } from "./types";
 import { sourceClass } from "./source-trust";
@@ -116,10 +117,33 @@ function asOfMarkers(m: RecallMatch, timezone: string): string {
   return parts.join("");
 }
 
+/** Reuse upstream snippet selection; current previews may prefer its latest-update fallback. */
+export function recallSnippet(
+  match: Pick<RecallMatch, "content" | "score">,
+  index: number,
+  opts: { queryTokens?: string[]; currentQueryTokens?: string[]; config?: Readonly<Config> } = {},
+): Snippet {
+  const max = allowanceFor(index, match.score, opts.config ?? DEFAULTS);
+  const ordinary = snippetOf(match.content, max, { queryTokens: opts.queryTokens });
+  const evidence = opts.currentQueryTokens;
+  if (!ordinary.truncated || !evidence?.length || !match.content.includes("\n[Update ")) return ordinary;
+  const latest = snippetOf(match.content, max);
+  const identifiers = evidence.filter(token => /\d/.test(token));
+  // Do not exchange an identifier-specific passage for a newer unrelated update.
+  // The caller excludes corpus-saturated words from this evidence set.
+  // Check the latest block itself, not the shared head of both previews.
+  const separator = latest.text.lastIndexOf("\n…\n");
+  const latestBlock = separator >= 0 ? latest.text.slice(separator + 3) : latest.text;
+  if (exactQueryMatchCount(latestBlock, identifiers) < identifiers.length) return ordinary;
+  const latestCoverage = exactQueryMatchCount(latestBlock, evidence);
+  return latestCoverage >= 2
+    ? latest : ordinary;
+}
+
 export function renderRecallText(
   matches: RecallMatch[],
   insight: string,
-  opts: { full?: boolean; queryTokens?: string[]; config?: Readonly<Config>; compoundStale?: CompoundStaleSignal; asOf?: { at: number; notRecordedBefore: number | null }; standing?: readonly StandingFire[]; receipt?: string } = {},
+  opts: { full?: boolean; queryTokens?: string[]; currentQueryTokens?: string[]; config?: Readonly<Config>; compoundStale?: CompoundStaleSignal; asOf?: { at: number; notRecordedBefore: number | null }; standing?: readonly StandingFire[]; receipt?: string } = {},
 ): string {
   const cfg = opts.config ?? DEFAULTS;
   const beliefs = opts.asOf ? matches.filter(m => m.retractedBelief) : [];
@@ -138,8 +162,9 @@ export function renderRecallText(
     // Spelled month: this text is read by assistants, and a numeric date is
     // ambiguous between US and international order.
     const header = memoryHeader(m);
-    const score = (m.score * 100).toFixed(0);
-    const updateLabel = m.isUpdate ? " [updated]" : "";
+    const score = m.score.toFixed(2);
+    const updateLabel = m.isUpdate
+      ? ` [updated ${new Date(m.updatedAt).toLocaleDateString("en-US", { year: "numeric", month: "short", day: "numeric" })}]` : "";
     const hopLabel = m.hop > 0 ? ` [related · ${hopProvenance(m, contentById)}]` : "";
     const staleLabel = m.staleAsOf ? ` · ${formatAsOfQualifier(m.updatedAt)}` : "";
     // T-0089.2.1 (spec 5.9): a stated start, and a flag for a dependent built
@@ -157,13 +182,13 @@ export function renderRecallText(
 
     const s: Snippet = opts.full
       ? { text: (m.content ?? "").trim(), truncated: false, fullLength: (m.content ?? "").length }
-      : snippetOf(m.content, allowanceFor(i, m.score, cfg), { queryTokens: opts.queryTokens });
+      : recallSnippet(m, i, opts);
     const body = s.truncated ? `${s.text}${truncationNote(m.id, s)}` : s.text;
     // A belief attached to this result renders under it (5.9), inside the same block so it
     // travels (and is budgeted) with the result it explains rather than as a separate entry.
     const attached = attachedBelief.get(m.id);
     const bodyWithBelief = attached ? `${body}\n${beliefLine(attached, cfg.TIMEZONE)}` : body;
-    const block = `${i + 1}. [${header}] (${score}% match)${updateLabel}${hopLabel}${staleLabel}${trueSinceLabel}${asOfLabel}${retractedSourceLabel}${similarLabel}\nID: ${m.id}\n${bodyWithBelief}`;
+    const block = `${i + 1}. [${header}] (relative score: ${score})${updateLabel}${hopLabel}${staleLabel}${trueSinceLabel}${asOfLabel}${retractedSourceLabel}${similarLabel}\nID: ${m.id}\n${bodyWithBelief}`;
     // The why line rides outside the budget: asking for an explanation must not change which memories come back.
     const whyLine = m.why ? `why: ${whyText(m, m.why, contentById)}\n` : "";
     const extraLines = `${whyLine}${similarIdsLine}`;
@@ -255,9 +280,13 @@ function hopProvenance(m: RecallMatch, contentById: Map<string, string>): string
     m.viaProvenance === "system" ? "system-linked" :
     "auto-linked";
   const when = m.viaLinkedAt ? ` · ${new Date(m.viaLinkedAt).toLocaleDateString("en-US", { year: "numeric", month: "short", day: "numeric" })}` : "";
+  const direction =
+    m.viaDirection === "outgoing" ? " · with edge direction" :
+    m.viaDirection === "incoming" ? " · against edge direction" :
+    m.viaDirection === "undirected" ? " · undirected" : "";
   const fromContent = m.viaFrom ? contentById.get(m.viaFrom) : undefined;
   const from = fromContent ? ` · from "${snippet(fromContent)}"` : "";
-  return `${who}${when}${from}`;
+  return `${who}${when}${direction}${from}`;
 }
 
 function snippet(text: string): string {

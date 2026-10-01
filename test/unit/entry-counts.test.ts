@@ -54,6 +54,7 @@ describe("entry_counts triggers, against real SQLite", () => {
     insertEntry(d1, "a1", "ws-a");
     insertEntry(d1, "a2", "ws-a");
 
+    await d1.db.prepare(`UPDATE entries SET write_marker = ? WHERE id = 'a1'`).bind(d1.fixtureMarker("delete")).run();
     await d1.db.prepare(`DELETE FROM entries WHERE id = 'a1'`).run();
 
     expect(await countsOf(d1)).toEqual({ "ws-a": 1 });
@@ -128,6 +129,7 @@ describe("entry_counts triggers, against real SQLite", () => {
     insertEntry(d1, "a2", "ws-team");
     insertEntry(d1, "b1", "ws-b");
 
+    await d1.db.prepare(`UPDATE entries SET write_marker = ? WHERE workspace_id = 'ws-team'`).bind(d1.fixtureMarker("delete")).run();
     await d1.db.prepare(`DELETE FROM entries WHERE workspace_id = 'ws-team'`).run();
 
     const row = await d1.db.prepare(`SELECT n FROM entry_counts WHERE workspace_id = 'ws-team'`).first() as { n: number } | null;
@@ -153,31 +155,34 @@ describe("entry_counts triggers, against real SQLite", () => {
 
     expect(result.meta.rows_written).toBe(1); // the statement's own count — undercounts on purpose, see above
     // Measured directly against this brain's real schema.sql, every sync
-    // trigger live: a single INSERT INTO entries writes 9 rows total.
+    // trigger live: this fork's additional write-fence bookkeeping makes a
+    // single INSERT INTO entries write 10 rows total.
     // Reconciles with the reviewer's probe (final-review.probe.test.ts):
-    // 8 total_changes with entry_counts' table and triggers dropped, 9 with
-    // them present — this brain has them present, so 9 is the expected value.
-    expect(after - before).toBe(9);
+    // 9 total_changes with entry_counts' table and triggers dropped, 10 with
+    // them present — this brain has them present, so 10 is the expected value.
+    expect(after - before).toBe(10);
     expect((await d1.db.prepare(`SELECT n FROM entry_counts WHERE workspace_id = 'ws-a'`).first() as { n: number }).n).toBe(1); // the row is really there
   });
 
   it("a capsule-tagged capture writes one row more than a plain one (MINOR 4a, final review)", async () => {
     // The prompt_capsule_entry_insert trigger adds exactly one more row
-    // (prompt_capsule_revisions) on top of the plain-capture cost measured
-    // above. Reconciles with the reviewer's probe: 10 for a capsule capture.
-    const beforePlain = (await d1.db.prepare(`SELECT total_changes() AS n`).first() as { n: number }).n;
-    await d1.db.prepare(
-      `INSERT INTO entries (id, content, tags, source, created_at, vector_ids, workspace_id) VALUES ('plain', 'memory', '[]', 'api', 1, '[]', 'ws-a')`,
-    ).run();
-    const afterPlain = (await d1.db.prepare(`SELECT total_changes() AS n`).first() as { n: number }).n;
-
-    await d1.db.prepare(
-      `INSERT INTO entries (id, content, tags, source, created_at, vector_ids, workspace_id) VALUES ('capsule', 'memory', '["capsule:test"]', 'api', 2, '[]', 'ws-a')`,
-    ).run();
-    const afterCapsule = (await d1.db.prepare(`SELECT total_changes() AS n`).first() as { n: number }).n;
-
-    expect(afterPlain - beforePlain).toBe(9);
-    expect(afterCapsule - afterPlain).toBe(10);
+    // (prompt_capsule_revisions). Use two identical fresh databases: FTS5's
+    // first insert has a different internal write count than later inserts.
+    const capsuleDb = makeSqliteD1();
+    try {
+      const delta = async (db: SqliteD1, tags: string) => {
+        const before = (await db.db.prepare(`SELECT total_changes() AS n`).first() as { n: number }).n;
+        await db.db.prepare(
+          `INSERT INTO entries (id, content, tags, source, created_at, vector_ids, workspace_id) VALUES ('same', 'memory', ?, 'api', 1, '[]', 'ws-a')`,
+        ).bind(tags).run();
+        const after = (await db.db.prepare(`SELECT total_changes() AS n`).first() as { n: number }).n;
+        return after - before;
+      };
+      const plainWrites = await delta(d1, "[]");
+      const capsuleWrites = await delta(capsuleDb, '["capsule:test"]');
+      expect(plainWrites).toBe(10);
+      expect(capsuleWrites).toBe(11);
+    } finally { capsuleDb.close(); }
   });
 });
 
@@ -197,6 +202,7 @@ describe("entry_counts seed, against real SQLite", () => {
     insertEntry(d1, "a2", "ws-a");
     insertEntry(d1, "b1", "ws-b");
     insertEntry(d1, "legacy", "");
+    await d1.db.prepare("UPDATE schema_meta SET version = 7 WHERE id = 'current'").run();
 
     await initializeDatabase(envFor(d1));
 
@@ -210,6 +216,7 @@ describe("entry_counts seed, against real SQLite", () => {
       `DROP TRIGGER IF EXISTS entry_counts_delete; DROP TABLE IF EXISTS entry_counts;`,
     );
     for (let i = 0; i < 20; i++) insertEntry(d1, `pre-${i}`, "ws-a", i);
+    await d1.db.prepare("UPDATE schema_meta SET version = 7 WHERE id = 'current'").run();
 
     const env = envFor(d1);
     // Targets the one window that matters: the sqlite-d1 helper serializes
@@ -282,7 +289,8 @@ describe("T-0065 nightly per-workspace check (FIX 1, final review)", () => {
     await d1.db.exec(
       `CREATE TRIGGER entry_counts_insert AFTER INSERT ON entries BEGIN SELECT 1; END`,
     );
-    expect(await countsOf(d1)).toEqual({}); // tampered body never wrote a row
+    insertEntry(d1, "e2", "ws-a");
+    expect(await countsOf(d1)).toEqual({ "ws-a": 1 }); // tampered body missed e2
 
     expect(await checkFtsIntegrity(envFor(d1))).toEqual({ healthy: true });
 
@@ -291,10 +299,10 @@ describe("T-0065 nightly per-workspace check (FIX 1, final review)", () => {
     ).first() as { sql: string };
     expect(tamperedGone.sql).toContain("INSERT INTO entry_counts");
     expect(tamperedGone.sql).not.toContain("SELECT 1");
-    // The repair reseeds via GROUP BY, so the one real row still counts.
-    expect(await countsOf(d1)).toEqual({ "ws-a": 1 });
-    insertEntry(d1, "e2", "ws-a");
-    expect(await countsOf(d1)).toEqual({ "ws-a": 2 }); // the restored trigger fires on the next write
+    // The repair reseeds via GROUP BY, including both real rows.
+    expect(await countsOf(d1)).toEqual({ "ws-a": 2 });
+    insertEntry(d1, "e3", "ws-a");
+    expect(await countsOf(d1)).toEqual({ "ws-a": 3 }); // the restored trigger fires on the next write
   });
 
   // Mutation-killer, isolated from the trigger-liveness check: both

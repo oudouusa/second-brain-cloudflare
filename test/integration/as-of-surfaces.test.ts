@@ -3,8 +3,8 @@
  * markers, belief block, refusal of a future or unparseable date, and REST/MCP parity.
  */
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { Client } from "@modelcontextprotocol/client";
+import { InMemoryTransport } from "@modelcontextprotocol/client";
 import { buildMcpServer, RECALL_DESCRIPTION } from "../../src/mcp/server";
 import worker from "../../src/index";
 import { req } from "../helpers/make-request";
@@ -26,11 +26,11 @@ async function migrated(): Promise<SqliteD1> {
 }
 
 function envOf(s: SqliteD1, matches: { id: string; score: number }[]): Env {
-  return makeTestEnv(undefined, {
+  return s.admitEnv(makeTestEnv(undefined, {
     DB: s.db as unknown as Env["DB"],
     OAUTH_KV: makeMemoryKV(),
     VECTORIZE: makeVectorizeMock({ query: vi.fn().mockResolvedValue({ matches: matches.map(m => ({ id: m.id, score: m.score, metadata: { parentId: m.id } })) }) }),
-  });
+  }));
 }
 
 async function mcpRecall(env: Env, args: Record<string, unknown>): Promise<string> {
@@ -85,7 +85,7 @@ describe("as-of surfaces: MCP recall and GET /recall (5.9)", () => {
     const env = envOf(sqlite, [{ id: "current", score: 0.9 }, { id: "old", score: 0.5 }]);
 
     const asOf = NOW - 20 * DAY;
-    const res = await worker.fetch(req("GET", `/recall?query=${encodeURIComponent("cellar wine racks kayak river")}&as_of=${encodeURIComponent(new Date(asOf).toISOString().slice(0, 10))}`), env, ctx);
+    const res = await worker.fetch(req("POST", `/recall?query=${encodeURIComponent("cellar wine racks kayak river")}&as_of=${encodeURIComponent(new Date(asOf).toISOString().slice(0, 10))}`), env, ctx);
     const data = await res.json() as any;
 
     expect(res.status).toBe(200);
@@ -107,7 +107,7 @@ describe("as-of surfaces: MCP recall and GET /recall (5.9)", () => {
     const mcpText = await mcpRecall(env, { query: "marina slip", as_of: future });
     expect(mcpText.toLowerCase()).toMatch(/future/);
 
-    const res = await worker.fetch(req("GET", `/recall?query=marina+slip&as_of=${future}`), env, ctx);
+    const res = await worker.fetch(req("POST", `/recall?query=marina+slip&as_of=${future}`), env, ctx);
     expect(res.status).toBe(400);
     const data = await res.json() as any;
     expect(data.ok).toBe(false);
@@ -121,7 +121,7 @@ describe("as-of surfaces: MCP recall and GET /recall (5.9)", () => {
     const mcpText = await mcpRecall(env, { query: "marina slip", as_of: "not a date" });
     expect(mcpText.toLowerCase()).toMatch(/date/);
 
-    const res = await worker.fetch(req("GET", `/recall?query=marina+slip&as_of=not-a-date`), env, ctx);
+    const res = await worker.fetch(req("POST", `/recall?query=marina+slip&as_of=not-a-date`), env, ctx);
     expect(res.status).toBe(400);
   });
 
@@ -135,7 +135,7 @@ describe("as-of surfaces: MCP recall and GET /recall (5.9)", () => {
     expect(mcpText).toBe("Pass as_of, or after/before, not both.");
     expect(mcpText).not.toContain("—");
 
-    const res = await worker.fetch(req("GET", `/recall?query=marina+slip&as_of=${isoDate}&after=${NOW - 30 * DAY}`), env, ctx);
+    const res = await worker.fetch(req("POST", `/recall?query=marina+slip&as_of=${isoDate}&after=${NOW - 30 * DAY}`), env, ctx);
     expect(res.status).toBe(400);
     const data = await res.json() as any;
     expect(data.error).toBe("Pass as_of, or after/before, not both.");
@@ -155,7 +155,7 @@ describe("as-of surfaces: MCP recall and GET /recall (5.9)", () => {
     const mcpIds = [...mcpText.matchAll(/^ID: (\S+)$/gm)].map(m => m[1]);
 
     const envForRest = envOf(sqlite, [{ id: "current", score: 0.9 }, { id: "old", score: 0.5 }]);
-    const res = await worker.fetch(req("GET", `/recall?query=${encodeURIComponent("cellar wine racks kayak river")}&as_of=${isoDate}`), envForRest, ctx);
+    const res = await worker.fetch(req("POST", `/recall?query=${encodeURIComponent("cellar wine racks kayak river")}&as_of=${isoDate}`), envForRest, ctx);
     const data = await res.json() as any;
     const restIds = data.results.filter((r: any) => !r.retracted_belief).map((r: any) => r.id);
 
@@ -185,7 +185,7 @@ describe("as-of surfaces: MCP recall and GET /recall (5.9)", () => {
     expect(asOfSection).not.toContain("—");
 
     const envForRest = envOf(sqlite, [{ id: "current", score: 0.9 }, { id: "old", score: 0.5 }]);
-    const res = await worker.fetch(req("GET", `/recall?query=${encodeURIComponent("cellar wine racks kayak river")}&as_of=${isoDate}`), envForRest, ctx);
+    const res = await worker.fetch(req("POST", `/recall?query=${encodeURIComponent("cellar wine racks kayak river")}&as_of=${isoDate}`), envForRest, ctx);
     const raw = await res.text();
     expect(raw).not.toContain("—");
   });

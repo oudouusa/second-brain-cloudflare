@@ -175,7 +175,7 @@ export async function handleProjectsRoutes(
         name: body.name as string,
         description: body.description as string | undefined,
         aliases: body.aliases as string[] | undefined,
-      });
+      }, env);
       adminAuditEvent(env, ctx, { actorId: auth.userId, workspaceId: row.workspace_id, event: "project_created", payload: { slug: row.id } });
       return json({ ok: true, project: view(auth, row) }, 201);
     } catch (e) {
@@ -201,7 +201,7 @@ export async function handleProjectsRoutes(
       if (body[key] !== undefined) (patch as Record<string, unknown>)[key] = body[key];
     }
     try {
-      const row = await updateProject(env.DB, target, slug, patch);
+      const row = await updateProject(env.DB, target, slug, patch, env);
       adminAuditEvent(env, ctx, { actorId: auth.userId, workspaceId: row.workspace_id, event: "project_updated", payload: { slug, fields: Object.keys(patch) } });
       return json({ ok: true, project: view(auth, row) });
     } catch (e) {
@@ -218,7 +218,7 @@ export async function handleProjectsRoutes(
     const target = await targetWorkspace(env, auth, url, slug);
     if (target instanceof Response) return target;
 
-    if (!(await deleteProject(env.DB, target, slug))) return json({ ok: false, error: `unknown project "${slug}"` }, 404);
+    if (!(await deleteProject(env.DB, target, slug, env))) return json({ ok: false, error: `unknown project "${slug}"` }, 404);
     adminAuditEvent(env, ctx, { actorId: auth.userId, workspaceId: target, event: "project_deleted", payload: { slug } });
     return json({ ok: true, deleted: true });
   }

@@ -26,7 +26,7 @@ describe("recall root selection", () => {
       edge(db, "dense-root", "weak");
       const prepare = db.prepare.bind(db);
       (db as any).prepare = (sql: string) => {
-        if (sql.includes("WHERE content LIKE") && sql.includes("ORDER BY created_at DESC LIMIT")) {
+        if (/WHERE \(?content LIKE/.test(sql) && /ORDER BY (?:\(CASE WHEN content LIKE|created_at DESC LIMIT)/.test(sql)) {
           return { bind: () => ({ all: async () => ({ results: db.entries
             .filter(entry => ["dense-root", "keyword-root"].includes(entry.id))
             .map(({ id, content, tags, source, created_at }) => ({ id, content, tags, source, created_at })) }) }) };
@@ -102,7 +102,7 @@ describe("recall root selection", () => {
     seed(db, "ledger-answer", "The ledger reconciliation decision fixed the status", ["work"]);
     edge(db, "ledger-root", "ledger-answer");
     const prepare = db.prepare.bind(db);
-    (db as any).prepare = (sql: string) => sql.includes("WHERE content LIKE") && sql.includes("ORDER BY created_at DESC LIMIT")
+    (db as any).prepare = (sql: string) => /WHERE \(?content LIKE/.test(sql) && /ORDER BY (?:\(CASE WHEN content LIKE|created_at DESC LIMIT)/.test(sql)
       ? { bind: () => ({ all: async () => ({ results: [] }) }) }
       : prepare(sql);
     const diagnostics: RecallDiagnostics = {};
@@ -130,13 +130,106 @@ describe("recall root selection", () => {
     expect(result.matches.map(x => x.id)).not.toContain("unrelated-neighbor");
   });
 
+  it("promotes a graph-supported candidate already present below the direct result cutoff", async () => {
+    const db = new D1Mock();
+    seed(db, "root", "alpha decision root");
+    for (let i = 1; i < 5; i++) seed(db, `direct-${i}`, `unrelated direct note ${i}`);
+    seed(db, "linked-answer", "alpha beta causal explanation");
+    seed(db, "omitted-distractor", "unrelated omitted note");
+    edge(db, "root", "linked-answer");
+    const prepare = db.prepare.bind(db);
+    (db as any).prepare = (sql: string) => /WHERE \(?content LIKE/.test(sql) && /ORDER BY (?:\(CASE WHEN content LIKE|created_at DESC LIMIT)/.test(sql)
+      ? { bind: () => ({ all: async () => ({ results: [] }) }) }
+      : prepare(sql);
+    const matches = [
+      { id: "root", score: .95, metadata: { parentId: "root" } },
+      ...Array.from({ length: 4 }, (_, index) => ({
+        id: `direct-${index + 1}`,
+        score: .9 - index * .05,
+        metadata: { parentId: `direct-${index + 1}` },
+      })),
+      { id: "omitted-distractor", score: .25, metadata: { parentId: "omitted-distractor" } },
+      { id: "linked-answer", score: .2, metadata: { parentId: "linked-answer" } },
+    ];
+    const env = makeTestEnv(db, { VECTORIZE: makeVectorizeMock({ query: vi.fn().mockResolvedValue({ matches }) }) });
+
+    const direct = await recallEntries(
+      { query: "alpha beta", topK: 5, hops: 0, synthesize: false },
+      env,
+      ctx,
+    );
+    const graph = await recallEntries(
+      { query: "alpha beta", topK: 5, hops: 1, synthesize: false },
+      env,
+      ctx,
+    );
+
+    expect(direct.matches.map(match => match.id)).not.toContain("linked-answer");
+    expect(graph.matches.map(match => match.id)).toContain("linked-answer");
+    expect(graph.matches.find(match => match.id === "linked-answer")).toMatchObject({
+      hop: 1,
+      viaFrom: "root",
+      viaType: "decided",
+    });
+    expect(graph.graphContribution).toMatchObject({ eligibleCount: 1, selectedCount: 1 });
+    expect(new Set(graph.matches.map(match => match.id)).size).toBe(graph.matches.length);
+  });
+
+  it("follows an explicit directed edge for a Japanese chronology question", async () => {
+    const db = new D1Mock();
+    seed(db, "check", "Worlddoc の Second Brain 動作確認");
+    for (let i = 1; i < 5; i++) seed(db, `direct-${i}`, `unrelated direct note ${i}`);
+    seed(db, "omitted-distractor", "unrelated omitted note");
+    seed(db, "followup", "ダッシュボード修正が完了した");
+    db.edges.push({
+      id: "followup-check",
+      source_id: "followup",
+      target_id: "check",
+      type: "follows",
+      weight: 1,
+      provenance: "explicit",
+      metadata: "{}",
+      created_at: 1,
+      updated_at: 1,
+    });
+    const prepare = db.prepare.bind(db);
+    (db as any).prepare = (sql: string) => /WHERE \(?content LIKE/.test(sql) && /ORDER BY (?:\(CASE WHEN content LIKE|created_at DESC LIMIT)/.test(sql)
+      ? { bind: () => ({ all: async () => ({ results: [] }) }) }
+      : prepare(sql);
+    const matches = [
+      { id: "check", score: .95, metadata: { parentId: "check" } },
+      ...Array.from({ length: 4 }, (_, index) => ({
+        id: `direct-${index + 1}`,
+        score: .9 - index * .05,
+        metadata: { parentId: `direct-${index + 1}` },
+      })),
+      { id: "omitted-distractor", score: .25, metadata: { parentId: "omitted-distractor" } },
+      { id: "followup", score: .2, metadata: { parentId: "followup" } },
+    ];
+    const env = makeTestEnv(db, { VECTORIZE: makeVectorizeMock({ query: vi.fn().mockResolvedValue({ matches }) }) });
+
+    const result = await recallEntries(
+      { query: "Worlddoc の確認後に何が起きたか", topK: 5, hops: 1, synthesize: false },
+      env,
+      ctx,
+    );
+
+    expect(result.matches.find(match => match.id === "followup")).toMatchObject({
+      hop: 1,
+      viaFrom: "check",
+      viaType: "follows",
+      viaDirection: "incoming",
+    });
+    expect(result.graphContribution.selectedCount).toBe(1);
+  });
+
   it("uses one omitted strong root only for the fifth slot", async () => {
     const db = new D1Mock();
     for (let i = 0; i < 4; i++) seed(db, `direct-${i}`, `quartz ledger protocol result ${i}`);
     seed(db, "weak-fifth", "quartz archive note");
     seed(db, "strong-root", "quartz ledger protocol decision record", ["status:canonical"]);
     const prepare = db.prepare.bind(db);
-    (db as any).prepare = (sql: string) => sql.includes("WHERE content LIKE") && sql.includes("ORDER BY created_at DESC LIMIT")
+    (db as any).prepare = (sql: string) => /WHERE \(?content LIKE/.test(sql) && /ORDER BY (?:\(CASE WHEN content LIKE|created_at DESC LIMIT)/.test(sql)
       ? { bind: () => ({ all: async () => ({ results: [] }) }) }
       : prepare(sql);
     const env = makeTestEnv(db, { VECTORIZE: makeVectorizeMock({ query: vi.fn().mockResolvedValue({ matches: [
@@ -165,7 +258,7 @@ describe("recall root selection", () => {
       (db.entries.at(-1) as any).recall_count = 10_000;
     }
     const prepare = db.prepare.bind(db);
-    (db as any).prepare = (sql: string) => sql.includes("WHERE content LIKE") && sql.includes("ORDER BY created_at DESC LIMIT")
+    (db as any).prepare = (sql: string) => /WHERE \(?content LIKE/.test(sql) && /ORDER BY (?:\(CASE WHEN content LIKE|created_at DESC LIMIT)/.test(sql)
       ? { bind: () => ({ all: async () => ({ results: [] }) }) }
       : prepare(sql);
     const vectorQuery = vi.fn().mockResolvedValue({ matches: [
@@ -205,7 +298,7 @@ describe("recall root selection", () => {
       if (i <= 4 || i === 17) (db.entries.at(-1) as any).recall_count = 10_000;
     }
     const prepare = db.prepare.bind(db);
-    (db as any).prepare = (sql: string) => sql.includes("WHERE content LIKE") && sql.includes("ORDER BY created_at DESC LIMIT")
+    (db as any).prepare = (sql: string) => /WHERE \(?content LIKE/.test(sql) && /ORDER BY (?:\(CASE WHEN content LIKE|created_at DESC LIMIT)/.test(sql)
       ? { bind: () => ({ all: async () => ({ results: [] }) }) }
       : prepare(sql);
     const query = vi.fn().mockResolvedValue({ matches: Array.from({ length: 17 }, (_, index) => ({
@@ -246,7 +339,7 @@ describe("recall root selection", () => {
         // The recall observer runs first() as all() to count rows_read, so the double answers both the same way.
         return { bind: () => ({ first: async () => row, all: async () => ({ results: [row], meta: {} }) }) };
       }
-      if (sql.includes("WHERE content LIKE") && sql.includes("ORDER BY created_at DESC LIMIT")) {
+      if (/WHERE \(?content LIKE/.test(sql) && /ORDER BY (?:\(CASE WHEN content LIKE|created_at DESC LIMIT)/.test(sql)) {
         const row = db.entries.find(entry => entry.id === "anchor-root")!;
         return { bind: (...bindings: unknown[]) => ({
           all: async () => ({
@@ -254,6 +347,8 @@ describe("recall root selection", () => {
               ? [row]
               : [],
           }),
+          // 上流のrare/rest窓はbatch経由でも同じ読取りを実行する。
+          run: async () => ({ results: bindings.some(value => ["%quartz%", "%protocol%", "%compass%"].includes(String(value))) ? [row] : [] }),
         }) };
       }
       return prepare(sql);
@@ -342,7 +437,7 @@ describe("recall root selection", () => {
     edge(db, "chunk-root", "unrelated-neighbor");
     for (let i = 0; i < 5; i++) seed(db, `direct-${i}`, "alpha beta gamma direct evidence");
     const prepare = db.prepare.bind(db);
-    (db as any).prepare = (sql: string) => sql.includes("WHERE content LIKE") && sql.includes("ORDER BY created_at DESC LIMIT")
+    (db as any).prepare = (sql: string) => /WHERE \(?content LIKE/.test(sql) && /ORDER BY (?:\(CASE WHEN content LIKE|created_at DESC LIMIT)/.test(sql)
       ? { bind: () => ({ all: async () => ({ results: [] }) }) }
       : prepare(sql);
     const env = makeTestEnv(db, { VECTORIZE: makeVectorizeMock({ query: vi.fn().mockResolvedValue({ matches: [
@@ -364,7 +459,7 @@ describe("recall root selection", () => {
     seed(db, "long-neighbor", `alpha ${noise} beta ${noise} gamma`);
     edge(db, "long-root", "long-neighbor");
     const prepare = db.prepare.bind(db);
-    (db as any).prepare = (sql: string) => sql.includes("WHERE content LIKE") && sql.includes("ORDER BY created_at DESC LIMIT")
+    (db as any).prepare = (sql: string) => /WHERE \(?content LIKE/.test(sql) && /ORDER BY (?:\(CASE WHEN content LIKE|created_at DESC LIMIT)/.test(sql)
       ? { bind: () => ({ all: async () => ({ results: [] }) }) }
       : prepare(sql);
     const diagnostics: RecallDiagnostics = {};
@@ -391,7 +486,7 @@ describe("recall root selection", () => {
     seed(db, "localized-neighbor", content);
     edge(db, "localized-root", "localized-neighbor");
     const prepare = db.prepare.bind(db);
-    (db as any).prepare = (sql: string) => sql.includes("WHERE content LIKE") && sql.includes("ORDER BY created_at DESC LIMIT")
+    (db as any).prepare = (sql: string) => /WHERE \(?content LIKE/.test(sql) && /ORDER BY (?:\(CASE WHEN content LIKE|created_at DESC LIMIT)/.test(sql)
       ? { bind: () => ({ all: async () => ({ results: [] }) }) }
       : prepare(sql);
     const diagnostics: RecallDiagnostics = {};
@@ -455,7 +550,7 @@ describe("recall root selection", () => {
 
     expect(env.AI.run).toHaveBeenCalledTimes(1);
     expect(env.AI.run).toHaveBeenCalledWith(DEFAULTS.EMBEDDING_MODEL, {
-      text: [expectedInput[DEFAULT_EMBEDDING_QUERY_MODE]],
+      text: [`task: search result | query: ${expectedInput[DEFAULT_EMBEDDING_QUERY_MODE]}`],
     });
     expect(diagnostics.embeddingMode).toBe(DEFAULT_EMBEDDING_QUERY_MODE);
   });
@@ -471,7 +566,9 @@ describe("recall root selection", () => {
     const env = makeTestEnv(db, { VECTORIZE: makeVectorizeMock({ query }) });
 
     await recallEntries({ query: "why ledger", topK: 5, synthesize: false }, env, ctx, undefined, { embeddingQueryMode });
-    expect(env.AI.run).toHaveBeenCalledWith(DEFAULTS.EMBEDDING_MODEL, { text: [expectedInput] });
+    expect(env.AI.run).toHaveBeenCalledWith(DEFAULTS.EMBEDDING_MODEL, {
+      text: [`task: search result | query: ${expectedInput}`],
+    });
     expect(query).toHaveBeenCalledTimes(1);
     expect((env.AI.run as ReturnType<typeof vi.fn>).mock.calls.map(call => call[0])).toEqual([DEFAULTS.EMBEDDING_MODEL]);
   });

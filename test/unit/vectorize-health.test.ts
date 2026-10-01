@@ -76,7 +76,7 @@ describe("checkVectorizeHealth", () => {
     // and the README verify step expect.
     const health = await checkVectorizeHealth(envDescribing({ dimensions: 384 }));
     expect(health.indexName).toBe(FALLBACK_VECTORIZE_INDEX_NAME);
-    expect(health.indexName).toBe("second-brain-vectors");
+    expect(health.indexName).toBe("second-brain-cf-eg128-v1");
   });
 
   it("falls back when describe() reports an empty or non-string name", async () => {

@@ -22,7 +22,7 @@ async function migrated(): Promise<SqliteD1> {
 }
 
 function envOf(s: SqliteD1): Env {
-  return makeTestEnv(undefined, { DB: s.db as unknown as Env["DB"] });
+  return s.admitEnv(makeTestEnv(undefined, { DB: s.db as unknown as Env["DB"] }));
 }
 
 function matchOf(over: Partial<RecallMatch> & { id: string; content: string; createdAt: number }): RecallMatch {

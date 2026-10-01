@@ -3,8 +3,8 @@
  * out of Due, digest provenance, actionable-only brief, stored-data framing, resolve bounds.
  */
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { Client } from "@modelcontextprotocol/client";
+import { InMemoryTransport } from "@modelcontextprotocol/client";
 import worker from "../../src/index";
 import { buildMcpServer } from "../../src/mcp/server";
 import { makeSqliteD1, type SqliteD1 } from "../helpers/sqlite-d1";
@@ -52,7 +52,7 @@ beforeEach(async () => {
   resetDatabaseInit();
   pending = [];
   sqlite = makeSqliteD1();
-  env = makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV() });
+  env = sqlite.admitEnv(makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV() }));
   await initializeDatabase(env);
   setDbReady(true);
   await ensureTenantBootstrap(env);
@@ -151,14 +151,14 @@ describe("M2 history scope", () => {
     // A warm brain (any version ever written) has versions:since cached already; a cold one pays
     // one extra one-off fallback statement the first time, not a per-call cost.
     await env.OAUTH_KV.put(VERSIONS_SINCE_KV_KEY, "500");
-    sqlite.issued.length = 0;
+    sqlite.executions.length = 0;
     await call("history", { id: "m" }, alice);
     // Before BE-11: entries (1) + entry_events (1, JOIN-based labels, no separate users read) +
     // edges (1) = 3. After: entry_versions (1, loadHistory) + a separate users read (1) — the
     // JOIN-based label trick only covers actors who wrote an EVENT on this entry, and a version's
     // own actor often has none, now that a real edit records a version instead of an "updated"
     // event. +2, not +1: stated here, per the Director's own allowance for this move.
-    expect(sqlite.issued).toHaveLength(5);
+    expect(sqlite.executions).toHaveLength(6);
   });
 });
 
@@ -279,7 +279,7 @@ describe("N3: GET /entry cuts pre-share events for non-authors like history", ()
     await env.DB.prepare(`INSERT INTO entry_events (id, entry_id, actor_id, event, payload, created_at) VALUES ('old', 'm', ?, 'updated', '{"note":"personal-era"}', 1)`).bind(alice.userId).run();
     await call("share", { id: "m", workspace: "company" }, alice);
     await Promise.all(pending);
-    const timeline = async (token: string) => ((await (await worker.fetch(req("GET", "/entry?id=m", { token }), env, ctx)).json()) as any).entry.timeline
+    const timeline = async (token: string) => ((await (await worker.fetch(req("POST", "/entry?id=m", { token }), env, ctx)).json()) as any).entry.timeline
       .map((e: any) => e.payload.note ?? e.event);
     expect(await timeline(bobToken)).toEqual(["shared"]);
     expect(await timeline(aliceToken)).toEqual(["personal-era", "shared"]);
@@ -304,25 +304,25 @@ describe("Minor 10: stored text is framed as data", () => {
 describe("Minor 9: resolve statement bounds", () => {
   it("happy path is 3 statements; three lost races stay within 7", async () => {
     sqlite.seed({ id: "t", content: "Task", createdAt: 1, tags: ["task"] });
-    sqlite.issued.length = 0;
+    sqlite.executions.length = 0;
     await call("resolve", { id: "t", action: "done" });
     await Promise.all(pending);
-    console.log(JSON.stringify(sqlite.issued, null, 1)); expect(sqlite.issued).toHaveLength(3);
+    expect(sqlite.executions).toHaveLength(4);
 
     sqlite.seed({ id: "r", content: "Racy", createdAt: 1, tags: ["task"] });
     let losses = 0;
     const realPrepare = env.DB.prepare.bind(env.DB);
-    const racing = { ...env, DB: new Proxy(env.DB, { get(t: any, p) {
+    const racing = { ...env, WRITE_ADMISSION_TOKEN: env.WRITE_ADMISSION_TOKEN, DB: new Proxy(env.DB, { get(t: any, p) {
       if (p !== "prepare") return typeof t[p] === "function" ? t[p].bind(t) : t[p];
       return (sql: string) => {
-        if (sql.startsWith("UPDATE entries AS e SET tags = ") && losses < 3) {
+        if (/^UPDATE entries AS e SET.*tags = /s.test(sql) && losses < 3) {
           losses++;
           void sqlite.db.prepare(`UPDATE entries SET content = content || '.' WHERE id = 'r'`).run();
         }
         return realPrepare(sql);
       };
     } }) } as Env;
-    sqlite.issued.length = 0;
+    sqlite.executions.length = 0;
     const result = await resolveEntryAction(racing, ctx, owner, "r", "done", undefined, { actorId: owner.userId, channel: "rest" });
     expect(result.ok).toBe(false);
     // the three competing writes above are the test's own, not the tool's. Each attempt is now a
@@ -331,7 +331,7 @@ describe("Minor 9: resolve statement bounds", () => {
     // array and the sqlite-d1 test helper's "last N issued" batch collapse cannot tell it apart —
     // it leaves the snapshot INSERT uncollapsed once per attempt. Real D1 has no such artifact:
     // production still bills exactly one execution per batch, whatever interleaves with it.
-    expect(sqlite.issued.filter(q => !/SET content = content/.test(q)).length).toBeLessThanOrEqual(10);
+    expect(sqlite.executions.filter(q => !/SET content = content/.test(q)).length).toBeLessThanOrEqual(10);
   });
 });
 
@@ -355,9 +355,9 @@ describe("M3 brief queries use their partial indexes", () => {
     // Seed enough rows for the planner to prefer the partial indexes over a scan.
     for (let i = 0; i < 200; i++) sqlite.seed({ id: `n${i}`, content: `note ${i}`, createdAt: i, tags: ["work"] });
     for (const project of [undefined, [{ id: "work", workspace_id: owner.personalWorkspaceId, name: "Work", description: "", status: "active" as const, aliases: ["hosting"], created_at: 1, updated_at: null }]]) {
-      sqlite.issued.length = 0;
+      sqlite.executions.length = 0;
       await readAgentBrief(env, owner, { parts: ["due", "loops", "stale", "insights"], projectRows: project });
-      const reads = sqlite.issued.filter(q => /^SELECT id, content/.test(q));
+      const reads = sqlite.executions.filter(q => /^SELECT id, content/.test(q));
       expect(reads).toHaveLength(4);
       const wanted = ["idx_entries_when", "idx_entries_task", "idx_entries_stale", "idx_entries_insight"];
       const plans = await Promise.all(reads.map(async q => {

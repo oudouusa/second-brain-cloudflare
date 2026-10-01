@@ -3,8 +3,8 @@
  * for every resolve action, and history edge scoping.
  */
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { Client } from "@modelcontextprotocol/client";
+import { InMemoryTransport } from "@modelcontextprotocol/client";
 import worker from "../../src/index";
 import { buildMcpServer } from "../../src/mcp/server";
 import { makeSqliteD1, type SqliteD1 } from "../helpers/sqlite-d1";
@@ -43,8 +43,9 @@ beforeEach(async () => {
   resetDatabaseInit();
   pending = [];
   sqlite = makeSqliteD1();
-  env = makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV() });
+  env = sqlite.admitEnv(makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV() }));
   await initializeDatabase(env);
+  env = sqlite.admitEnv(env);
   setDbReady(true);
   await ensureTenantBootstrap(env);
   identity = (await resolveIdentityFromToken("test-token", env))!;
@@ -126,12 +127,13 @@ describe("resolve: one item per call, statement pins", () => {
     ["done", ["task"], {}], ["not_a_task", ["task"], {}], ["snooze", ["task"], { until: future }],
     ["clear_date", ["task"], {}], ["still_true", ["stale:as-of"], {}], ["confirm_insight", ["auto-insight"], {}], ["dismiss_insight", ["auto-insight"], {}],
   ] as [string, string[], Record<string, unknown>][]) {
-    it(`${action} stays within four D1 statements`, async () => {
+    it(`${action} keeps a fixed D1 statement budget with history`, async () => {
       sqlite.seed({ id: "x", content: "X", createdAt: 1, tags });
       sqlite.issued.length = 0;
       expect(await mcp("resolve", { id: "x", action, ...extra })).toMatch(/^Resolved x/);
       await Promise.all(pending);
-      expect(sqlite.issued.length).toBeLessThanOrEqual(4);
+      // 履歴snapshot/pruneと、dismiss時はvalidity復帰・vector後処理も計上。
+      expect(sqlite.issued.length).toBe(action === "dismiss_insight" ? 13 : 6);
     });
   }
 });
@@ -139,6 +141,7 @@ describe("resolve: one item per call, statement pins", () => {
 describe("history: edge scope", () => {
   it("does not show supersedes edges owned by another workspace", async () => {
     const other = await createMember(env, { name: "Other" });
+    sqlite.seed({ id: "secret-target", content: "private", createdAt: 1, workspaceId: other.member.personalWorkspaceId });
     sqlite.seed({ id: "mine", content: "Mine", createdAt: 1, tags: ["work"] });
     await env.DB.prepare(`INSERT INTO edges (id, source_id, target_id, type, weight, provenance, metadata, created_at, updated_at, workspace_id)
       VALUES ('foreign', 'mine', 'secret-target', 'supersedes', 1, 'explicit', '{}', 1, 1, ?)`).bind(other.member.personalWorkspaceId).run();

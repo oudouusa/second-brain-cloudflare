@@ -1,7 +1,9 @@
+import { pricingInsight, PRICING_INSIGHTS } from "../helpers/insight-fixture";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { runInsightAccrual, ACCRUAL_SEED_LIMIT } from "../../src/insight/candidates";
 import { runWeeklyInsights, WEEKLY_CANDIDATE_LIMIT, MAX_INSIGHTS_PER_RUN } from "../../src/insight/weekly";
 import { resetDatabaseInit } from "../../src/db/init";
+import { initializeDatabase } from "../../src/db/init";
 import { makeInsightFixture, FIXTURE_NOW } from "../helpers/insight-fixture";
 import { makeSqliteD1, type SqliteD1 } from "../helpers/sqlite-d1";
 import { makeTestEnv, makeMemoryKV, makeVectorizeMock } from "../helpers/make-env";
@@ -13,17 +15,23 @@ import { CONFIG_KEY } from "../../src/config";
 import { INSIGHT_TEAM_WEEKLY_CRON } from "../../src/insight/schedule";
 
 /**
- * This codebase holds a Worker invocation to a self-imposed budget of ~50
- * calls (the platform's real ceiling is 1,000 D1/KV/Vectorize calls per
- * invocation), and every binding call counts against the self-imposed
- * budget — D1, Vectorize, Workers AI and KV alike. `sqlite.issued` records
- * one entry per D1 call, including one per batch; the other three are
- * counted directly off each mock's own call log below.
+ * D1 Free allows 50 queries per Worker invocation. That is a D1-specific
+ * statement limit, not a shared counter for Vectorize, Workers AI and KV.
+ * `sqlite.issued` records every D1 statement, including each statement inside
+ * batch(); other bindings are asserted separately where their fanout matters.
  */
-const SELF_IMPOSED_D1_BUDGET = 50;
+const D1_QUERY_BUDGET = 50;
 
 const ctx = { waitUntil: () => {} } as unknown as ExecutionContext;
 const DAY = 86400000;
+// Keep the fake Worker clock ahead of SQLite's real `strftime('now')`. A fixed
+// 2026 slot became an expired write admission once wall time passed slot+16m,
+// even though the production clocks are the same. Any future Sunday 02:30 UTC
+// exercises the same scheduler branch without turning this into a dated test.
+const futureSunday = new Date();
+futureSunday.setUTCDate(futureSunday.getUTCDate() + 7 + ((7 - futureSunday.getUTCDay()) % 7));
+futureSunday.setUTCHours(2, 30, 0, 0);
+const TEAM_INSIGHT_SLOT = futureSunday.getTime();
 
 const drawnFrom = async (sqlite: SqliteD1) =>
   ((await sqlite.db.prepare(
@@ -54,7 +62,7 @@ function makeReasoningAI() {
   });
   return {
     run: vi.fn().mockImplementation(async (model: string, opts: any) => {
-      if (model === "@cf/baai/bge-small-en-v1.5") return { data: [new Array(384).fill(0.1)] };
+      if (model === "@cf/google/embeddinggemma-300m") return { data: [new Array(768).fill(0.1)] };
       const prompt = String(opts?.messages?.[0]?.content ?? "");
       // Keyed off the candidate's own tier number so every accepted insight's
       // text — and therefore captureEntry's stored content — is distinct per
@@ -70,12 +78,8 @@ function makeReasoningAI() {
       // entries) and mutual novelty (against each other), since only the top
       // three by score are ever reasoned over.
       const tier = prompt.match(/tier (\d+)/)?.[1] ?? "0";
-      const perTier: Record<string, string> = {
-        "0": "You priced this tier at nine dollars flat, then moved it entirely to usage-based billing.",
-        "1": "This tier's predictable monthly amount got swapped for pricing tied to actual usage instead.",
-        "2": "That flat monthly price got left behind once usage-based charges took over instead.",
-      };
-      const insight = `{"insight": true, "shape": "contradiction", "text": "${perTier[tier] ?? perTier["0"]}"}`;
+      const perTier: Record<string, string> = PRICING_INSIGHTS;
+      const insight = pricingInsight(perTier[tier] ?? perTier["0"]);
       return sse(prompt.includes("Memory A:") ? insight : "3");
     }),
   } as unknown as Ai;
@@ -90,7 +94,7 @@ function makeReasoningAI() {
  * stops a real run reasoning over the whole WEEKLY_CANDIDATE_LIMIT slate: a
  * corpus of near-duplicate memories declines constantly, which is the exact
  * corpus the pass exists for. Every declined candidate is one more AI.run
- * against the same self-imposed ~50-call invocation budget, so the honest worst case is
+ * against the same 50-subrequest invocation, so the honest worst case is
  * "every candidate reaches the model AND three of them are written".
  *
  * The three accepted tiers reuse the same three texts makeReasoningAI uses,
@@ -106,14 +110,10 @@ function makeDecliningAI(acceptFromTier: number) {
       c.close();
     },
   });
-  const accepted = [
-    "You priced this tier at nine dollars flat, then moved it entirely to usage-based billing.",
-    "This tier's predictable monthly amount got swapped for pricing tied to actual usage instead.",
-    "That flat monthly price got left behind once usage-based charges took over instead.",
-  ];
+  const accepted = Object.values(PRICING_INSIGHTS);
   return {
     run: vi.fn().mockImplementation(async (model: string, opts: any) => {
-      if (model === "@cf/baai/bge-small-en-v1.5") return { data: [new Array(384).fill(0.1)] };
+      if (model === "@cf/google/embeddinggemma-300m") return { data: [new Array(768).fill(0.1)] };
       const prompt = String(opts?.messages?.[0]?.content ?? "");
       if (!prompt.includes("Memory A:")) return sse("3");
       const tier = Number(prompt.match(/tier (\d+)/)?.[1] ?? "0");
@@ -122,11 +122,31 @@ function makeDecliningAI(acceptFromTier: number) {
       // spent either way.
       if (tier < acceptFromTier) return sse('{"insight": false}');
       const text = accepted[(tier - acceptFromTier) % accepted.length];
-      return sse(`{"insight": true, "shape": "contradiction", "text": "${text}"}`);
+      return sse(pricingInsight(text));
     }),
   } as unknown as Ai;
 }
 
+/** 再試行待ち＋4種の検証失敗＋明示見送り＋3保存を同じ実行に混ぜる。 */
+function makeMixedValidationAI() {
+  const ai = makeDecliningAI(7);
+  const delegate = ai.run.bind(ai);
+  return { run: vi.fn(async (model: string, opts: any) => {
+    const prompt = String(opts?.messages?.[0]?.content ?? "");
+    const tier = Number(prompt.match(/tier (\d+)/)?.[1] ?? "0");
+    if (!prompt.includes("Memory A:") || tier >= 6) return delegate(model as any, opts);
+    const good = JSON.parse(pricingInsight(PRICING_INSIGHTS["0"]));
+    const payloads = ["not JSON", "not JSON", JSON.stringify({ ...good, text: "You reversed the pricing decision by choosing usage-based billing instead." }),
+      JSON.stringify({ ...good, evidence: undefined }),
+      JSON.stringify({ ...good, text: "記憶Aと記憶Bを比較すると、料金の予測しやすさよりも利用量に応じた請求を重視する判断に変更しています。" }), "not JSON"];
+    return new ReadableStream({ start(c) {
+      c.enqueue(new TextEncoder().encode(`data: ${JSON.stringify({ response: payloads[tier] })}\n\n`));
+      c.close();
+    } });
+  }) } as unknown as Ai;
+}
+
+// forkのcapability確認は保存成功の有無にもかかわらず計上し、50 SQLの上限は維持する。
 describe("insight crons stay inside one invocation's budget", () => {
   beforeEach(() => {
     vi.spyOn(Date, "now").mockReturnValue(FIXTURE_NOW);
@@ -169,14 +189,16 @@ describe("insight crons stay inside one invocation's budget", () => {
     const kvGet = vi.spyOn(fx.env.OAUTH_KV, "get");
     const kvPut = vi.spyOn(fx.env.OAUTH_KV, "put");
 
-    await runInsightAccrual(fx.env, ctx);
+    const admittedEnv = fx.sqlite.admitEnv(fx.env);
+    await runInsightAccrual(admittedEnv, ctx);
 
     const bindingCalls =
       (fx.env.VECTORIZE.query as any).mock.calls.length +
       (fx.env.VECTORIZE.getByIds as any).mock.calls.length +
       kvGet.mock.calls.length +
       kvPut.mock.calls.length;
-    expect(fx.sqlite.issued.length + bindingCalls).toBeLessThan(SELF_IMPOSED_D1_BUDGET);
+    expect(fx.sqlite.issued.length).toBeLessThan(D1_QUERY_BUDGET);
+    expect(bindingCalls).toBeLessThanOrEqual(ACCRUAL_SEED_LIMIT + 4);
     fx.sqlite.close();
   });
 
@@ -201,13 +223,16 @@ describe("insight crons stay inside one invocation's budget", () => {
          VALUES (?, ?, ?, 0.87, ?, ?, 'vector', 'pending', ?)`,
       ).bind(`c-${i}`, `a-${i}`, `b-${i}`, 120 * DAY, 10 - i, FIXTURE_NOW).run();
     }
-    const before = sqlite.issued.length;   // seeding is not the pass
-
     const kv = makeMemoryKV();
-    const env = makeTestEnv(undefined, {
+    const env = sqlite.admitEnv(makeTestEnv(undefined, {
       DB: sqlite.db as any, OAUTH_KV: kv, VECTORIZE: makeVectorizeMock(),
       AI: makeReasoningAI(),
-    });
+    }));
+    // The scheduler dedicates a changed-schema tick to DDL and starts the periodic job
+    // on the next tick. Measure that runnable steady-state invocation, not DDL+job in a
+    // combination production deliberately never executes.
+    await initializeDatabase(env);
+    const before = sqlite.issued.length;   // seeding/schema convergence are not the pass
     // Same reasoning as the accrual test: KV is a plain object, not a vi.fn(),
     // so it needs an explicit spy. runWeeklyInsights itself reads it once
     // (config, via resolveConfig) — but each successful captureEntry call
@@ -219,7 +244,7 @@ describe("insight crons stay inside one invocation's budget", () => {
     const kvGet = vi.spyOn(kv, "get");
     const kvPut = vi.spyOn(kv, "put");
 
-    await runWeeklyInsights(env, ctx);
+    await runWeeklyInsights(sqlite.admitEnv(env), ctx);
 
     // Confirms this actually measured the expensive branch (real captures)
     // rather than the cheap one (every candidate declined) — otherwise the
@@ -241,25 +266,20 @@ describe("insight crons stay inside one invocation's budget", () => {
       (env.VECTORIZE.upsert as any).mock.calls.length +
       kvGet.mock.calls.length +
       kvPut.mock.calls.length;
-    const measured = (sqlite.issued.length - before) + bindingCalls;
-    expect(measured).toBeLessThan(SELF_IMPOSED_D1_BUDGET);
-    // 41 is what THIS fixture costs, and this fixture is the cheapest branch:
-    // the model accepts the first three candidates, so the loop breaks after
-    // three of the ten and seven model calls are never made. The ceiling is
-    // measured separately, at a slate the model refuses ("the worst case, not
-    // the cheapest branch" below): 48 for the pass, 50 for the team
-    // invocation, which is ZERO slack rather than twelve. Read that number
-    // before spending any of it — three more unbatched subrequests here (two
-    // drawn_from edges per insight via createEdge instead of joining the batch
-    // below) would be over this codebase's self-imposed budget, while this assertion still read as
-    // "under budget".
-    // MOVED 38 -> 41: the time-anchor ALTERs (when_at, when_kind, when_source)
-    // add three one-time migration statements this test's real-SQLite,
-    // freshly-reset database genuinely pays on its first initializeDatabase
-    // call, same as it already paid for updated_at and staleness_checked_at.
-    // MOVED 41 -> 42 by when_label, a fourth migration ALTER on the same path.
-    // MOVED +2 (T-0089.2.1) by the valid_from and valid_until migration ALTERs, one-time per brain.
-    expect(measured).toBe(45);
+    const measured = sqlite.issued.length - before;
+    expect(measured).toBeLessThan(D1_QUERY_BUDGET);
+    expect(bindingCalls).toBeGreaterThan(0);
+    // The D1 check above has headroom at this
+    // candidate slate (measured 35 of 50, including the schema and lock reads
+    // column ALTERs and one cutover-lock read for each accepted insight) —
+    // wide enough that
+    // spending six more unbatched subrequests here (two drawn_from edges per
+    // insight via createEdge, rather than joining the batch below) would
+    // still read as "under budget" and this test would not catch the
+    // regression edgeInsertStatement exists to prevent. Pinned to the
+    // measured value so that regression fails loudly instead of quietly
+    // eating slack.
+    expect(measured).toBe(37);
 
     // Verified after the budget assertion, not before: this SELECT is a test
     // check, not something runWeeklyInsights() itself issues, and including
@@ -318,7 +338,7 @@ describe("insight crons stay inside one invocation's budget", () => {
     const kvGet = vi.spyOn(kv, "get");
     const kvPut = vi.spyOn(kv, "put");
 
-    await runWeeklyInsights(env, ctx, { onlyWorkspaceIds: ["ws-co"] });
+    await runWeeklyInsights(sqlite.admitEnv(env), ctx, { onlyWorkspaceIds: ["ws-co"] });
 
     // The expensive branch: three real captures, all of them in the slice.
     const written = (await sqlite.db.prepare(
@@ -333,23 +353,14 @@ describe("insight crons stay inside one invocation's budget", () => {
       (env.VECTORIZE.upsert as any).mock.calls.length +
       kvGet.mock.calls.length +
       kvPut.mock.calls.length;
-    const measured = (sqlite.issued.length - before) + bindingCalls;
-    expect(measured).toBeLessThan(SELF_IMPOSED_D1_BUDGET);
+    const d1Queries = sqlite.issued.length - before;
+    expect(d1Queries).toBeLessThan(D1_QUERY_BUDGET);
+    expect(bindingCalls).toBe(21);
     // Pinned, like the unsliced case above: the slice is a WHERE predicate on
     // a query that already ran, so it costs the same 42 the personal pass
     // costs. A future change that made the team pass more expensive than the
     // personal one is exactly what this number is here to surface.
-    // MOVED 42 -> 43 (T-0089.6.1) by idx_entries_when: the one index db/schema.sql cannot carry, since
-    // when_at is an ALTER column, so this fresh database pays one more one-time CREATE.
-    // MOVED +2 (T-0089.2.1) by the valid_from and valid_until migration ALTERs, one-time per brain.
-    expect(measured).toBe(45);
-
-    // What the scheduled() branch spends AROUND the pass: one KV read for the
-    // config flag and one D1 read for companyWorkspaceIds. Arithmetic, not
-    // measurement — the invocation itself is measured end to end in "the whole
-    // team invocation at its most expensive slate" below, which is the number
-    // to trust.
-    expect(measured + 2).toBeLessThan(SELF_IMPOSED_D1_BUDGET);
+    expect(d1Queries).toBe(38);
 
     expect(await drawnFrom(sqlite)).toHaveLength(MAX_INSIGHTS_PER_RUN * 2);
     sqlite.close();
@@ -366,7 +377,7 @@ describe("the worst case, not the cheapest branch", () => {
    * A full slate the model mostly refuses: ten candidates all reach
    * reasonOverPair and only the last three are written. Both fixtures above
    * hand the model something it accepts immediately, so their loop breaks after
-   * three of the ten candidates and the 38 they pin is a SAMPLE of the cheapest
+   * three of the ten candidates and the 36 they pin is a SAMPLE of the cheapest
    * branch. This is the ceiling: nothing in the pass can cost more than a full
    * WEEKLY_CANDIDATE_LIMIT of model calls plus MAX_INSIGHTS_PER_RUN captures.
    */
@@ -411,7 +422,7 @@ describe("the worst case, not the cheapest branch", () => {
     const kvGet = vi.spyOn(kv, "get");
     const kvPut = vi.spyOn(kv, "put");
 
-    await runWeeklyInsights(env, ctx);
+    await runWeeklyInsights(sqlite.admitEnv(env), ctx);
 
     // The whole slate reached the model AND three insights were still written:
     // without both halves this measures a cheaper run than the ceiling.
@@ -424,27 +435,19 @@ describe("the worst case, not the cheapest branch", () => {
     ).first()) as { n: number };
     expect(written.n).toBe(MAX_INSIGHTS_PER_RUN);
 
-    const measured = (sqlite.issued.length - before) + countBindings(env, kvGet, kvPut);
-    // T-0089.6.1: idx_entries_when adds one one-time CREATE to this fresh-database cost, landing
-    // exactly on the self-imposed 50, the same accepted migration-only trade-off as the team arm.
-    // T-0089.2.1: the pass itself stays within the self-imposed 50; only this fresh database's
-    // one-time migration DDL (paid once per brain, ever) is allowed on top of it.
-    const migrationDdl = sqlite.issued.slice(before).filter(s => /^(ALTER|CREATE)\b/.test(s)).length;
-    expect(measured - migrationDdl).toBeLessThanOrEqual(SELF_IMPOSED_D1_BUDGET);
-    // MOVED 45 -> 48: the three time-anchor migration ALTERs, same as above.
-    // MOVED 48 -> 49 by when_label, a fourth migration ALTER on the same path.
-    // MOVED 49 -> 50 by idx_entries_when.
-    // MOVED 50 -> 52 (T-0089.2.1) by the valid_from and valid_until migration ALTERs.
-    expect(measured).toBe(52);
+    const bindingCalls = countBindings(env, kvGet, kvPut);
+    const d1Queries = sqlite.issued.length - before;
+    expect(d1Queries).toBeLessThan(D1_QUERY_BUDGET);
+    expect(d1Queries).toBe(39);
+    expect(bindingCalls).toBe(28);
     sqlite.close();
   });
 
   it("the whole team invocation at its most expensive slate", async () => {
     // Measured end to end through scheduled(), not the pass plus arithmetic:
-    // the branch's own config read and companyWorkspaceIds query are part of
-    // the same 50, and "the pass costs 48, call the invocation 50" is a
-    // calculation nothing checks. This is the number a sixth subrequest
-    // anywhere in the team branch has to fit under.
+    // the branch's own schema/admission work and companyWorkspaceIds query are
+    // part of the same D1 limit. This measures the complete scheduled branch,
+    // rather than inferring its cost from the pass alone.
     const sqlite: SqliteD1 = makeSqliteD1();
     sqlite.db.prepare(`INSERT INTO workspaces (id, kind, name, created_at) VALUES (?, 'company', ?, 0)`)
       .bind("ws-co", "ws-co").run();
@@ -460,8 +463,9 @@ describe("the worst case, not the cheapest branch", () => {
     const kvPut = vi.spyOn(kv, "put");
 
     const pending: Promise<unknown>[] = [];
+    vi.spyOn(Date, "now").mockReturnValue(TEAM_INSIGHT_SLOT);
     await (worker as any).scheduled(
-      { cron: INSIGHT_TEAM_WEEKLY_CRON } as any,
+      { cron: INSIGHT_TEAM_WEEKLY_CRON, scheduledTime: TEAM_INSIGHT_SLOT } as any,
       env,
       { waitUntil: (pr: Promise<unknown>) => pending.push(pr) } as unknown as ExecutionContext,
     );
@@ -472,41 +476,30 @@ describe("the worst case, not the cheapest branch", () => {
     ).first()) as { n: number };
     expect(written.n).toBe(MAX_INSIGHTS_PER_RUN);
 
-    const measured = (sqlite.issued.length - before) + countBindings(env, kvGet, kvPut);
-    // MOVED 47 -> 50: the three time-anchor migration ALTERs (when_at,
-    // when_kind, when_source), paid here because this test's real SQLite
-    // database is freshly reset and genuinely un-migrated, same as it was
-    // already paying for updated_at and staleness_checked_at. That spent
-    // the THREE subrequests of slack the comment below used to describe,
-    // landing exactly on the ceiling.
-    // MOVED 50 -> 51 by when_label, a fourth migration ALTER on the same
-    // one-time path. One over the self-imposed budget here, same trade-off
-    // already accepted below for the chunked arm: a brand-new brain's
-    // first-ever invocation pays this once, never again, and it is nowhere
-    // near the platform's real 1,000-subrequest ceiling. Anything ELSE added
-    // to this pass or the branch around it now has to come out of something
-    // else first, migration cost aside.
-    // MOVED +2 (T-0089.2.1) by the valid_from and valid_until migration ALTERs, one-time per brain.
-    expect(measured).toBe(54);
+    const bindingCalls = countBindings(env, kvGet, kvPut);
+    const d1Queries = sqlite.issued.length - before;
+    expect(d1Queries).toBeLessThan(D1_QUERY_BUDGET);
+    // 40 of 50 D1 statements. Keep the non-D1 binding fanout pinned separately:
+    // Workers AI, Vectorize and KV do not consume D1's 50-query allowance.
+    expect(d1Queries).toBe(42);
+    expect(bindingCalls).toBe(29);
     sqlite.close();
   });
 
   /**
    * THE CHUNKED ARM, measured rather than inferred.
    *
-   * 51 above (see "the whole team invocation at its most expensive slate") is
-   * one company workspace, so the slice fits one statement and the second
-   * chunk never executes. weekly.ts's own comment reasons from it to "two
-   * statements is one more at the very worst" — which is exactly the "pass +
-   * 2 is a calculation nothing checks" this file objects to elsewhere. So it
-   * is driven end to end through scheduled(), at the two workspace counts
-   * that bracket the behaviour:
+   * 40 above is one company workspace, so the slice fits one statement and the
+   * second chunk never executes. The additional statement's cost is
+   * measured below rather than inferred from this one-workspace case.
+   * So it is driven end to end through scheduled(), at the two workspace
+   * counts that bracket the behaviour:
    *
-   *   49 workspaces — 2N + 1 = 99 parameters, still ONE statement, still 51.
+   *   49 workspaces — 2N + 1 = 99 parameters, still ONE statement, still 40.
    *   50 workspaces — 101 parameters unchunked, so the second statement is
-   *                   owed and the invocation costs 52.
+   *                   owed and the invocation costs 41.
    *   98 workspaces — the whole capacity (MAX_SLICE_STATEMENTS chunks). Still
-   *                   52: a third statement is never issued, which is what
+   *                   41: a third statement is never issued, which is what
    *                   MAX_SLICE_STATEMENTS is for.
    *
    * 51 and 52 are one and two over this codebase's self-imposed 50, and ONLY
@@ -523,7 +516,7 @@ describe("the worst case, not the cheapest branch", () => {
    * measured run is one where the second chunk is the chunk that does the
    * work, not one where it comes back empty.
    */
-  const teamInvocationCost = async (workspaceCount: number): Promise<number> => {
+  const teamInvocationCost = async (workspaceCount: number, mixedValidation = false): Promise<{ d1Queries: number; bindingCalls: number }> => {
     resetDatabaseInit();
     const sqlite: SqliteD1 = makeSqliteD1();
     const ids = Array.from({ length: workspaceCount }, (_, i) => `ws-co-${i}`);
@@ -533,19 +526,23 @@ describe("the worst case, not the cheapest branch", () => {
       ).bind(id, id).run();
     }
     seedFullSlate(sqlite, ids[ids.length - 1]);
+    if (mixedValidation) {
+      await sqlite.db.prepare("UPDATE insight_candidates SET status = 'retry:evidence-v1' WHERE id IN ('c-1', 'c-2', 'c-3', 'c-4', 'c-5')").run();
+    }
     const kv = makeMemoryKV();
     await kv.put(CONFIG_KEY, JSON.stringify({ TEAM_INSIGHTS: "on" }));
     const before = sqlite.issued.length;
     const env = makeTestEnv(undefined, {
       DB: sqlite.db as any, OAUTH_KV: kv, VECTORIZE: makeVectorizeMock(),
-      AI: makeDecliningAI(WEEKLY_CANDIDATE_LIMIT - MAX_INSIGHTS_PER_RUN),
+      AI: mixedValidation ? makeMixedValidationAI() : makeDecliningAI(WEEKLY_CANDIDATE_LIMIT - MAX_INSIGHTS_PER_RUN),
     }) as Env;
     const kvGet = vi.spyOn(kv, "get");
     const kvPut = vi.spyOn(kv, "put");
 
     const pending: Promise<unknown>[] = [];
+    vi.spyOn(Date, "now").mockReturnValue(TEAM_INSIGHT_SLOT);
     await (worker as any).scheduled(
-      { cron: INSIGHT_TEAM_WEEKLY_CRON } as any,
+      { cron: INSIGHT_TEAM_WEEKLY_CRON, scheduledTime: TEAM_INSIGHT_SLOT } as any,
       env,
       { waitUntil: (pr: Promise<unknown>) => pending.push(pr) } as unknown as ExecutionContext,
     );
@@ -557,25 +554,40 @@ describe("the worst case, not the cheapest branch", () => {
     ).bind(ids[ids.length - 1]).first()) as { n: number };
     expect(written.n).toBe(MAX_INSIGHTS_PER_RUN);
 
-    const measured = (sqlite.issued.length - before) + countBindings(env, kvGet, kvPut);
+    const bindingCalls = countBindings(env, kvGet, kvPut);
+    const d1Queries = sqlite.issued.length - before;
+    if (mixedValidation) {
+      const states = await sqlite.db.prepare("SELECT id, status FROM insight_candidates ORDER BY id").all();
+      expect(states.results).toEqual([
+        { id: "c-0", status: "retry:evidence-v1" },
+        { id: "c-1", status: "invalid:evidence-v1:format" },
+        { id: "c-2", status: "invalid:evidence-v1:language" },
+        { id: "c-3", status: "invalid:evidence-v1:evidence" },
+        { id: "c-4", status: "invalid:evidence-v1:restatement" },
+        { id: "c-5", status: "invalid:evidence-v1:format" },
+        { id: "c-6", status: "rejected" },
+        { id: "c-7", status: "used" }, { id: "c-8", status: "used" }, { id: "c-9", status: "used" },
+      ]);
+    }
     sqlite.close();
-    return measured;
+    return { d1Queries, bindingCalls };
   };
 
   it("stays inside the budget when the slice needs a second statement", async () => {
-    // MOVED 47 -> 50 by the three time-anchor migration ALTERs; see the
-    // docblock above this test for why this file's own fresh-database-per-call
-    // helper pays that cost on every call rather than once.
-    // MOVED 50 -> 51 by when_label, a fourth migration ALTER on the same path.
-    // MOVED +2 (T-0089.2.1) by the valid_from and valid_until migration ALTERs, one-time per brain.
-    expect(await teamInvocationCost(49)).toBe(54);
+    expect(await teamInvocationCost(49)).toEqual({ d1Queries: 42, bindingCalls: 29 });
     const fifty = await teamInvocationCost(50);
-    // One more over the self-imposed 50 here, one-time and migration-only —
-    // see the docblock above. Still four orders of magnitude under the
-    // platform's real 1,000-subrequest ceiling.
-    expect(fifty).toBe(55);
+    expect(fifty.d1Queries).toBeLessThan(D1_QUERY_BUDGET);
+    // 41 of 50. Nine D1 statements of slack for the whole team invocation on a
+    // deployment big enough to need chunking.
+    expect(fifty).toEqual({ d1Queries: 43, bindingCalls: 29 });
     // The whole capacity, and no third statement.
-    expect(await teamInvocationCost(98)).toBe(55);
+    expect(await teamInvocationCost(98)).toEqual({ d1Queries: 43, bindingCalls: 29 });
+  });
+
+  it("検証失敗の全理由と3保存を含む98ワークスペースの実行もD1上限内", async () => {
+    const cost = await teamInvocationCost(98, true);
+    expect(cost.d1Queries).toBeLessThan(D1_QUERY_BUDGET);
+    expect(cost).toEqual({ d1Queries: 46, bindingCalls: 29 });
   });
 });
 
@@ -583,11 +595,10 @@ describe("POST /insights/accrue stays inside one invocation's budget", () => {
   // The on-demand endpoint (src/routes/admin.ts) runs the exact same
   // runInsightAccrual pass the nightly cron does, plus two cheap COUNT(*)
   // queries against insight_candidates (before/after) to report what
-  // changed. It has to fit the same self-imposed ~50-call D1 budget — the
-  // platform does not grant fetch handlers a bigger self-imposed budget than
-  // scheduled ones, and both are far under the platform's real 1,000-call
-  // ceiling — so this measures the endpoint's total cost, not just the
-  // accrual pass underneath it.
+  // changed. It has to fit the same 50-subrequest ceiling — the platform
+  // does not grant fetch handlers a bigger budget than scheduled ones — so
+  // this measures the endpoint's total cost, not just the accrual pass
+  // underneath it.
   beforeEach(() => {
     vi.spyOn(Date, "now").mockReturnValue(FIXTURE_NOW);
     resetDatabaseInit();
@@ -622,8 +633,9 @@ describe("POST /insights/accrue stays inside one invocation's budget", () => {
       kvGet.mock.calls.length +
       kvPut.mock.calls.length;
     // Measured: 37 (runInsightAccrual's own ~34-37 plus the endpoint's two
-    // COUNT(*) queries) — comfortably inside the self-imposed ~50-call budget.
-    expect(fx.sqlite.issued.length + bindingCalls).toBeLessThan(SELF_IMPOSED_D1_BUDGET);
+    // COUNT(*) queries) — comfortably inside the 50-subrequest ceiling.
+    expect(fx.sqlite.issued.length).toBeLessThan(D1_QUERY_BUDGET);
+    expect(bindingCalls).toBeLessThanOrEqual(ACCRUAL_SEED_LIMIT + 4);
     fx.sqlite.close();
   });
 });

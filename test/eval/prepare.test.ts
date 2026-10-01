@@ -1,3 +1,5 @@
+import { syntheticGemmaPricing } from "./fork-synthetic";
+syntheticGemmaPricing();
 import { mkdirSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -12,7 +14,7 @@ import { cleanTemp } from "../helpers/tmp";
 
 afterEach(cleanTemp);
 
-const MODEL = "@cf/baai/bge-small-en-v1.5";
+const MODEL = "@cf/google/embeddinggemma-300m";
 const entry = (id: string, content: string): CorpusEntry => ({ id, content, tags: [], source: "api", createdAt: EVAL_NOW - 86_400_000, workspaceId: WORKSPACES.avery, actorId: ACTORS.avery });
 const spec: CorpusSpec = {
   id: "tiny-prepare", intent: "tie",
@@ -24,7 +26,7 @@ const PRODUCER = { kind: "local-transformers-js", library: "@huggingface/transfo
 const live = (): LiveAi & { run: ReturnType<typeof vi.fn> } => ({
   producer: () => PRODUCER,
   run: vi.fn(async (_model: string, input: unknown) => ({
-    data: (input as { text: string[] }).text.map(t => hashVector(t, 384)),
+    data: (input as { text: string[] }).text.map(t => hashVector(t, 768)),
     usage: { prompt_tokens: 4, total_tokens: 4 },
   })),
 });
@@ -109,7 +111,7 @@ describe("prepare", () => {
           const n = (input as { contexts: unknown[] }).contexts.length;
           return { response: Array.from({ length: n }, (_, id) => ({ id, score: n - id })), usage: { prompt_tokens: 12, total_tokens: 12 } };
         }
-        return { data: (input as { text: string[] }).text.map(t => hashVector(t, 384)), usage: { prompt_tokens: 4, total_tokens: 4 } };
+        return { data: (input as { text: string[] }).text.map(t => hashVector(t, 768)), usage: { prompt_tokens: 4, total_tokens: 4 } };
       }),
     });
 

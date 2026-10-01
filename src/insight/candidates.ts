@@ -2,11 +2,9 @@
  * Nightly candidate accrual.
  *
  * Search and reasoning are split because coverage, not token cost, is what
- * binds. This codebase holds a weekly job to a self-imposed D1 budget of ~50
- * calls per invocation (well under the platform's real 1,000-call ceiling,
- * but kept tight for cost and 10 ms-CPU reasons), which buys about 25
- * Vectorize seeds — 97 weeks to cross a 1,940-entry brain once. Accruing
- * nightly from the
+ * binds. A bounded nightly pass examines 15 Vectorize seeds at a time. Accruing
+ * from the entries just written turns a slow weekly backfill into continuous
+ * coverage; new entries are
  * entries just written turns that into continuous coverage, and new entries are
  * where new tension appears: a memory written today is the one most likely to
  * contradict or extend something from March.
@@ -29,6 +27,7 @@ import { VECTORIZE_GET_BY_IDS_BATCH, D1_MAX_BOUND_PARAMS } from "../constants";
 import { isInsightEligible, isAssistantAuthored } from "./eligibility";
 import { NOT_HELD_SQL, notHeldSqlFor } from "../quarantine/tags";
 import { MIN_GAP_MS, MIN_SIMILARITY, normalisePair, scoreCandidate, type ScorableEntry } from "./score";
+import { memoryWriteMarker, readDerivedStateGeneration } from "../migration/write-lock";
 
 /**
  * Authorship is a property of the PAIR, not the entry.
@@ -47,17 +46,11 @@ export function isEligiblePair(a: { tags: string[] }, b: { tags: string[] }): bo
 export const ACCRUAL_CURSOR_KEY = "insight:accrual-cursor";
 
 /**
- * Seeds per run. Each costs one Vectorize query, and the self-imposed budget
- * is 50 D1/Vectorize calls for the whole invocation (the platform's real
- * ceiling is 1,000; this codebase keeps it far tighter for cost and CPU
- * reasons). Measured at a full 25-seed batch
- * (steady-state, already-migrated schema): 1 schema probe + 1 seed select +
- * 2 getByIds batches + 25 queries + 1 D1 hydration lookup + 1 batched insert
- * + 1 supersedes select + 1 supersedes batched insert + 1 KV read + 1 KV
- * write is ~34-37 depending on how many distinct neighbours need hydrating
- * (chunked at D1_MAX_BOUND_PARAMS). See task-6-report.md for the measurement.
+ * Seeds per run. Each costs one Vectorize query. D1 has its own 50-query Free
+ * ceiling, so candidate INSERTs are packed below and separately measured in
+ * test/integration/insight-cron-budget.test.ts.
  */
-export const ACCRUAL_SEED_LIMIT = 25;
+export const ACCRUAL_SEED_LIMIT = 15;
 
 /** Neighbours considered per seed. */
 const NEIGHBOUR_TOP_K = 10;
@@ -93,6 +86,7 @@ const isCurrent = (validUntil: number | null, now: number): boolean => validUnti
 interface AccrualCursor {
   createdAt: number;
   id: string;
+  generation: string;
 }
 
 /**
@@ -112,12 +106,13 @@ export const parseTags = (raw: string): string[] => {
  * bad cursor could skip entries silently, which is worse. Mirrors
  * `readMigration`'s tolerance in src/migration/embedding.ts.
  */
-function parseCursor(raw: string | null): AccrualCursor | null {
+function parseCursor(raw: string | null, generation: string): AccrualCursor | null {
   if (!raw) return null;
   try {
     const parsed = JSON.parse(raw);
-    if (typeof parsed?.createdAt === "number" && typeof parsed?.id === "string") {
-      return { createdAt: parsed.createdAt, id: parsed.id };
+    if (typeof parsed?.createdAt === "number" && typeof parsed?.id === "string"
+      && parsed?.generation === generation) {
+      return { createdAt: parsed.createdAt, id: parsed.id, generation };
     }
   } catch {
     // fall through to null
@@ -125,12 +120,93 @@ function parseCursor(raw: string | null): AccrualCursor | null {
   return null;
 }
 
-async function writeCursor(env: Env, row: { created_at: number; id: string }): Promise<void> {
+async function writeCursor(
+  env: Env,
+  row: { created_at: number; id: string },
+  generation: string,
+): Promise<void> {
   try {
-    const cursor: AccrualCursor = { createdAt: row.created_at, id: row.id };
+    const cursor: AccrualCursor = { createdAt: row.created_at, id: row.id, generation };
     await env.OAUTH_KV.put(ACCRUAL_CURSOR_KEY, JSON.stringify(cursor));
   } catch (e) {
     console.error("Insight accrual cursor write failed (non-fatal):", e);
+  }
+}
+
+interface CandidateInsertRow {
+  id: string;
+  a: string;
+  b: string;
+  similarity: number;
+  gap: number;
+  score: number;
+}
+
+// Eight binds per row; D1 accepts at most 100 bound parameters per query.
+const CANDIDATE_ROWS_PER_STATEMENT = Math.floor(D1_MAX_BOUND_PARAMS / 8);
+
+async function insertCandidateRows(
+  env: Env,
+  rows: CandidateInsertRow[],
+  signal: "vector" | "supersedes",
+): Promise<void> {
+  const now = Date.now();
+  for (let i = 0; i < rows.length; i += CANDIDATE_ROWS_PER_STATEMENT) {
+    const chunk = rows.slice(i, i + CANDIDATE_ROWS_PER_STATEMENT);
+    const values = chunk.map(() => `(?, ?, ?, ?, ?, ?, '${signal}', 'pending', ?, ?)`).join(", ");
+    await env.DB.prepare(
+      `INSERT INTO insight_candidates
+         (id, a_id, b_id, similarity, gap_ms, score, signal, status, created_at, write_marker)
+       VALUES ${values}
+       ON CONFLICT(a_id, b_id) DO NOTHING`,
+    ).bind(...chunk.flatMap(row => [
+      row.id, row.a, row.b, row.similarity, row.gap, row.score, now, memoryWriteMarker(env),
+    ])).run();
+  }
+}
+
+/** Accrue explicit supersessions independently of Vectorize seed availability. */
+async function accrueSupersedes(env: Env): Promise<void> {
+  try {
+    const { results } = await env.DB.prepare(
+      // scope-exempt: this bounded scheduled insight-maintenance pass accrues candidates across the deployment and exposes no source rows directly to a caller
+      `SELECT e.source_id, e.target_id,
+              a.created_at AS a_created, a.content AS a_content, a.tags AS a_tags, a.source AS a_source,
+              b.created_at AS b_created, b.content AS b_content, b.tags AS b_tags, b.source AS b_source
+       FROM edges e
+       JOIN entries a ON a.id = e.source_id
+       JOIN entries b ON b.id = e.target_id
+       WHERE e.type = 'supersedes'
+         AND ABS(a.created_at - b.created_at) >= ?
+         AND (a.valid_until IS NULL OR a.valid_until > ${Date.now()})
+         AND ${notHeldSqlFor("a")}
+         AND a.tags NOT LIKE '%"status:deprecated"%'
+         AND (b.valid_until IS NULL OR b.valid_until > ${Date.now()})
+         AND ${notHeldSqlFor("b")}
+         AND b.tags NOT LIKE '%"status:deprecated"%'
+       ORDER BY e.created_at DESC
+       LIMIT 10`,
+    ).bind(MIN_GAP_MS).all() as {
+      results: {
+        source_id: string; target_id: string;
+        a_created: number; a_content: string; a_tags: string; a_source: string;
+        b_created: number; b_content: string; b_tags: string; b_source: string;
+      }[];
+    };
+    const rows = results.flatMap(row => {
+      if (!isInsightEligible({ content: row.a_content, tags: parseTags(row.a_tags), source: row.a_source })
+        || !isInsightEligible({ content: row.b_content, tags: parseTags(row.b_tags), source: row.b_source })
+        || !isEligiblePair({ tags: parseTags(row.a_tags) }, { tags: parseTags(row.b_tags) })) return [];
+      const [a, b] = normalisePair(row.source_id, row.target_id);
+      const gap = Math.abs(row.a_created - row.b_created);
+      return [{
+        id: crypto.randomUUID(), a, b, gap, similarity: 1,
+        score: Math.log1p(gap / 86400000),
+      }];
+    });
+    await insertCandidateRows(env, rows, "supersedes");
+  } catch (e) {
+    console.error("Supersedes candidate accrual failed (non-fatal):", e);
   }
 }
 
@@ -181,10 +257,11 @@ export async function runInsightAccrual(env: Env, ctx: ExecutionContext): Promis
   const now = Date.now();
   try {
     await initializeDatabase(env);
+    const generation = await readDerivedStateGeneration(env);
 
     let cursor: AccrualCursor | null = null;
     try {
-      cursor = parseCursor(await env.OAUTH_KV.get(ACCRUAL_CURSOR_KEY));
+      cursor = parseCursor(await env.OAUTH_KV.get(ACCRUAL_CURSOR_KEY), generation);
     } catch (e) {
       console.error("Insight accrual cursor read failed; starting from the top (non-fatal):", e);
     }
@@ -205,13 +282,17 @@ export async function runInsightAccrual(env: Env, ctx: ExecutionContext): Promis
       && isCurrent(r.valid_until, now)
     );
 
+    // This high-precision D1 signal must not disappear merely because Vectorize has no
+    // eligible seed or is still catching up. Its INSERTs are idempotent on the pair key.
+    await accrueSupersedes(env);
+
     if (!seeds.length) {
       // Every row in the window was examined and correctly rejected — none of
       // them qualified as a seed (too short, machine-tagged, no vector yet).
       // Unlike the vectorById case below, these rows WERE looked at, so
       // holding the cursor buys nothing: it would just re-read the same
       // rejected window every night, wedging accrual permanently.
-      if (results.length) await writeCursor(env, results[results.length - 1]);
+      if (results.length) await writeCursor(env, results[results.length - 1], generation);
       return { seedsExamined };
     }
 
@@ -273,7 +354,7 @@ export async function runInsightAccrual(env: Env, ctx: ExecutionContext): Promis
       }
     }
 
-    // One hydration lookup (chunked at D1_MAX_BOUND_PARAMS — 25 seeds x topK 10
+    // One hydration lookup (chunked at D1_MAX_BOUND_PARAMS — 15 seeds x topK 10
     // can exceed 100 distinct ids, D1's bound-parameter ceiling) instead of one
     // per candidate. A neighbour missing here — deleted, or a race with a
     // delete — has nothing authoritative to check it against, so it is
@@ -354,114 +435,12 @@ export async function runInsightAccrual(env: Env, ctx: ExecutionContext): Promis
       });
     }
 
-    if (rows.length) {
-      const now = Date.now();
-      // One batch is one subrequest whatever it carries — the same argument
-      // src/compression/digest.ts makes for its rolled-up marks.
-      await env.DB.batch(rows.map(r => env.DB.prepare(
-        `INSERT INTO insight_candidates
-           (id, a_id, b_id, similarity, gap_ms, score, signal, status, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, 'vector', 'pending', ?)
-         ON CONFLICT(a_id, b_id) DO NOTHING`,
-      ).bind(r.id, r.a, r.b, r.similarity, r.gap, r.score, now)));
-    }
-
-    // Explicitly recorded supersessions. One query, and the pairs it yields are
-    // the highest-precision input available — but only about half of the
-    // system-provenance edges are genuine, so these are proposals for the
-    // reasoning step to accept or decline, never claims.
-    try {
-      // validity: current: a replaced side of a supersedes pair is not insight material (5.5)
-      const { results: superseded } = await env.DB.prepare(
-        // scope-exempt: cron: no caller to scope to; a.workspace_id = b.workspace_id is the constraint that matters here — it keeps a proposed pair inside one workspace
-        `SELECT e.source_id, e.target_id,
-                a.created_at AS a_created, a.content AS a_content, a.tags AS a_tags, a.source AS a_source,
-                b.created_at AS b_created, b.content AS b_content, b.tags AS b_tags, b.source AS b_source
-         FROM edges e
-         JOIN entries a ON a.id = e.source_id
-         JOIN entries b ON b.id = e.target_id
-         WHERE e.type = 'supersedes'
-           AND a.workspace_id = b.workspace_id
-           AND ABS(a.created_at - b.created_at) >= ?
-           AND a.tags NOT LIKE '%"status:deprecated"%'
-           AND b.tags NOT LIKE '%"status:deprecated"%'
-           AND (a.valid_until IS NULL OR a.valid_until > ${now})
-           AND (b.valid_until IS NULL OR b.valid_until > ${now})
-           AND ${notHeldSqlFor("a")}
-           AND ${notHeldSqlFor("b")}
-         ORDER BY e.created_at DESC
-         LIMIT 10`,
-      ).bind(MIN_GAP_MS).all() as {
-        results: {
-          source_id: string; target_id: string;
-          a_created: number; a_content: string; a_tags: string; a_source: string;
-          b_created: number; b_content: string; b_tags: string; b_source: string;
-        }[];
-      };
-
-      // The deprecation half of eligibility is filtered here, in SQL, rather
-      // than left to the JS pass below — because LIMIT 10 runs before that
-      // pass ever sees a row. Before T-0089.2.1 a system-provenance supersedes
-      // edge always deprecated its target the instant it was created; a
-      // contradiction now closes the target's validity window instead
-      // (src/capture/entry.ts, keeping its status and vectors per D2.1), so
-      // the valid_until check above is what excludes it today — the
-      // status:deprecated check still catches the other, still-live
-      // deprecation paths (set_status, insight dismiss, an explicit forget).
-      // System edges outnumber explicit ones roughly 3:1 and are usually the
-      // newest either way. Unfiltered, an
-      // `ORDER BY e.created_at DESC LIMIT 10` window fills entirely with rows
-      // that isInsightEligible was always going to reject, and the rare
-      // user-authored supersedes edge between two still-live entries gets
-      // crowded out before it is ever examined. This query has no cursor, so
-      // that crowding-out is permanent — the same dead rows win the window
-      // again on every later run, not just this one.
-      //
-      // This does NOT resurrect system-provenance candidates: the deprecated
-      // side's vectors are already deleted and that signal is genuinely
-      // unusable, so those rows are excluded exactly as before. All this
-      // buys is that they no longer consume every slot in the window, so a
-      // pair that could actually qualify has a chance to be one of the ten
-      // rows examined.
-      //
-      // isInsightEligible still has to run below: it also checks machine
-      // tags, integration sources and the content floor, none of which this
-      // predicate touches. SQL narrows the window to rows that CAN pass;
-      // JS remains the authority on whether they DO.
-      // An explicit supersedes link (src/mcp/server.ts, src/routes/graph.ts)
-      // never runs deprecateEntry the way a system-detected contradiction
-      // does (src/capture/entry.ts), so both sides can independently clear
-      // isInsightEligible above while still both being assistant-authored.
-      // The pair-level rule applies here exactly as it does to the
-      // vector-neighbour path above — authorship is a property of the pair,
-      // not of which accrual path found it.
-      const eligible = superseded.filter(row =>
-        isInsightEligible({ content: row.a_content, tags: parseTags(row.a_tags), source: row.a_source })
-        && isInsightEligible({ content: row.b_content, tags: parseTags(row.b_tags), source: row.b_source })
-        && isEligiblePair({ tags: parseTags(row.a_tags) }, { tags: parseTags(row.b_tags) }),
-      );
-
-      if (eligible.length) {
-        const now = Date.now();
-        await env.DB.batch(eligible.map(row => {
-          const [a, b] = normalisePair(row.source_id, row.target_id);
-          const gap = Math.abs(row.a_created - row.b_created);
-          return env.DB.prepare(
-            `INSERT INTO insight_candidates
-               (id, a_id, b_id, similarity, gap_ms, score, signal, status, created_at)
-             VALUES (?, ?, ?, 1.0, ?, ?, 'supersedes', 'pending', ?)
-             ON CONFLICT(a_id, b_id) DO NOTHING`,
-          ).bind(crypto.randomUUID(), a, b, gap, Math.log1p(gap / 86400000), now);
-        }));
-      }
-    } catch (e) {
-      console.error("Supersedes candidate accrual failed (non-fatal):", e);
-    }
+    await insertCandidateRows(env, rows, "vector");
 
     // Advanced only after the work landed. A failure above leaves the cursor
     // where it was, so tomorrow re-examines this slice rather than skipping it —
     // and the UNIQUE constraint makes the repeat a no-op.
-    await writeCursor(env, seeds[seeds.length - 1]);
+    await writeCursor(env, seeds[seeds.length - 1], generation);
     return { seedsExamined };
   } catch (e) {
     console.error("Insight accrual failed (non-fatal):", e);

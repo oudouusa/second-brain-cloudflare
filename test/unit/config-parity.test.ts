@@ -7,6 +7,8 @@
  * refactor must not introduce. This test is the tripwire.
  */
 import { describe, it, expect } from "vitest";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { DEFAULTS, RULES } from "../../src/config";
 import * as constants from "../../src/constants";
 import { RECENCY_FLOOR, RECENCY_FLOOR_DURABLE, RECENCY_FLOOR_VOLATILE, MMR_LAMBDA } from "../../src/recall/math";
@@ -32,6 +34,7 @@ describe("DEFAULTS parity with shipped constants", () => {
     ["MMR_LAMBDA", DEFAULTS.MMR_LAMBDA, MMR_LAMBDA],
     ["DUPLICATE_BLOCK_THRESHOLD", DEFAULTS.DUPLICATE_BLOCK_THRESHOLD, constants.DUPLICATE_BLOCK_THRESHOLD],
     ["DUPLICATE_FLAG_THRESHOLD", DEFAULTS.DUPLICATE_FLAG_THRESHOLD, constants.DUPLICATE_FLAG_THRESHOLD],
+    ["RECALL_WIDEN_THRESHOLD", DEFAULTS.RECALL_WIDEN_THRESHOLD, constants.RECALL_WIDEN_THRESHOLD],
     ["GRAPH_MAX_HOPS", DEFAULTS.GRAPH_MAX_HOPS, GRAPH_MAX_HOPS],
     ["GRAPH_HOP_DECAY", DEFAULTS.GRAPH_HOP_DECAY, GRAPH_HOP_DECAY],
     ["RECALL_OUTPUT_BUDGET", DEFAULTS.RECALL_OUTPUT_BUDGET, RECALL_OUTPUT_BUDGET],
@@ -58,11 +61,8 @@ describe("DEFAULTS parity with shipped constants", () => {
     });
   }
 
-  // The split introduced by #245: recall widening used to read
-  // DUPLICATE_FLAG_THRESHOLD. It must start life at the same value, or recall
-  // widening changes for every existing user.
-  it("RECALL_WIDEN_THRESHOLD starts equal to DUPLICATE_FLAG_THRESHOLD", () => {
-    expect(DEFAULTS.RECALL_WIDEN_THRESHOLD).toBe(constants.DUPLICATE_FLAG_THRESHOLD);
+  it("keeps recall widening independent from duplicate flagging after Gemma calibration", () => {
+    expect(DEFAULTS.RECALL_WIDEN_THRESHOLD).not.toBe(DEFAULTS.DUPLICATE_FLAG_THRESHOLD);
   });
 
   // Brief v2's when-extraction pass defaults to the same model the weekly
@@ -105,6 +105,10 @@ describe("config rule coverage", () => {
     const violations: string[] = [];
     for (const [key, rule] of Object.entries(RULES)) {
       const v = (DEFAULTS as Record<string, unknown>)[key];
+      if (rule.kind === "fixed") {
+        if (v !== rule.value) violations.push(`${key}: does not match fixed value`);
+        continue;
+      }
       if (rule.kind === "string") {
         // PUSH_CONTACT is the one string setting whose default IS empty —
         // see the config.ts comment on its DEFAULTS entry.
@@ -126,5 +130,16 @@ describe("config rule coverage", () => {
     for (const forbidden of ["VECTORIZE_GET_BY_IDS_BATCH", "D1_MAX_BOUND_PARAMS", "EDGE_QUERY_BATCH", "KEYWORD_MAX_TOKENS"]) {
       expect(DEFAULTS).not.toHaveProperty(forbidden);
     }
+  });
+});
+
+describe("OAuth compatibility boundary", () => {
+  it("keeps strict-public fetch routing as an explicit fork exception", () => {
+    const raw = readFileSync(resolve(import.meta.dirname, "../../wrangler.jsonc"), "utf8");
+    const config = JSON.parse(raw.replace(/^\s*\/\/.*$/gm, "")) as {
+      compatibility_flags?: string[];
+    };
+
+    expect(config.compatibility_flags).toContain("global_fetch_strictly_public");
   });
 });

@@ -47,7 +47,7 @@ describe("reranker with the block layout", () => {
         // A scrambling model: unrelated to the heuristic order, so any reorder it causes is visible.
         return { response: input.contexts.map((c: { text: string }, id: number) => ({ id, score: hash(c.text) * 10 - 5 })) };
       }
-      return { data: [new Array(384).fill(0.1)] };
+      return { data: [new Array(768).fill(0.1)] };
     }) } as unknown as Ai;
     const env = makeTestEnv(undefined, { DB: DB as unknown as Env["DB"], OAUTH_KV: kv, AI: ai }) as Env;
     await initializeDatabase(env);

@@ -51,6 +51,9 @@ function scan(): Hit[] {
  * fragment of the statement (not by line, which other lanes shift), each with the reason it is "any".
  */
 const ANY_READERS: { file: string; has: string; why: string }[] = [
+  { file: "src/graph/pass.ts", has: "SELECT e.id, e.content, e.created_at FROM entries e", why: "回転する夜間グラフ再計算は履歴もリンクする。保留本文はnotHeldSqlForで除外する。" },
+  { file: "src/graph/pass.ts", has: "SELECT e.id, e.content FROM entries e", why: "旧推論辺の再計算は履歴も対象にする。保留本文はnotHeldSqlForで除外する。" },
+  { file: "src/recall/search.ts", has: "AND tags NOT LIKE '%\"auto-pattern\"%' AND tags NOT LIKE", why: "keyword用のsystem除外fragment。実行SQLはvaliditySql／asOfPredicateSqlを別途付加する。" },
   { file: "src/capture/lifecycle.ts", has: "tags NOT LIKE '%\"status:deprecated\"%'", why: "INDEXABLE_SQL: superseded rows keep their vectors and must be re-indexed (P11)" },
   { file: "src/capture/lifecycle.ts", has: "x.tags NOT LIKE", why: "the un-retraction hook's landed guard over the retracted row itself, not a reader" },
   { file: "src/memory/trash.ts", has: "x.tags NOT LIKE", why: "restore's un-retraction landed guard over the restored row itself, not a reader" },
@@ -62,7 +65,7 @@ const ANY_READERS: { file: string; has: string; why: string }[] = [
   { file: "src/graph/pass.ts", has: "id NOT IN (SELECT source_id FROM edges)", why: "nightly edge backfill links history too (spec 4.5: any)" },
   { file: "src/insight/candidates.ts", has: "WHERE (created_at > ? OR (created_at = ? AND id > ?)) AND ${NOT_HELD_SQL}", why: "seed scan fragment; isCurrent() drops replaced rows in JS on the rows it returns" },
   { file: "src/insight/candidates.ts", has: "WHERE ${NOT_HELD_SQL}", why: "seed scan fragment; isCurrent() drops replaced rows in JS on the rows it returns" },
-  { file: "src/recall/search.ts", has: "${tagScopeSql} AND ${NOT_HELD_SQL}", why: "tag/project member ids; the final hydration's d1Filters is the current-only predicate" },
+  { file: "src/recall/search.ts", has: "${tagScopeSql}${tagEligibilitySql} AND ${NOT_HELD_SQL}", why: "tag/project member ids; the final hydration's d1Filters is the current-only predicate" },
   { file: "src/staleness/pass.ts", has: "tags NOT LIKE '%\"status:deprecated\"%'", why: "SYSTEM_TAG_EXCLUSIONS fragment; the candidate query adds currentValidityAt itself" },
   { file: "src/recall/as-of.ts", has: "v.tags NOT LIKE '%\"status:deprecated\"%'", why: "retracted_at: the newest version whose PRIOR tags were not deprecated, i.e. when a belief was last marked wrong (5.7 item 5) — a version-history lookup, not a current-facts reader" },
   { file: "src/brief/compute.ts", has: "AND tags LIKE '%\"standing:active\"%' AND tags NOT LIKE '%\"status:deprecated\"%'", why: "hydrates ids readStandingCaches already picked with its own currentValidityAt filter (Design 2.x); nothing here can be replaced" },

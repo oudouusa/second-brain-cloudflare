@@ -10,8 +10,9 @@ export async function makeTrashEnv(overrides: Partial<Env> = {}) {
   resetDatabaseInit();
   setDbReady(false);
   const sqlite: SqliteD1 = makeSqliteD1();
-  const env = makeTestEnv(undefined, { DB: sqlite.db as unknown as D1Database, OAUTH_KV: makeMemoryKV(), ...overrides }) as Env;
+  let env = sqlite.admitEnv(makeTestEnv(undefined, { DB: sqlite.db as unknown as D1Database, OAUTH_KV: makeMemoryKV(), ...overrides })) as Env;
   await initializeDatabase(env);
+  env = sqlite.admitEnv(env);
   const roots = await ensureTenantBootstrap(env);
   const raw = sqlite.db as any;
   let closed = false;
@@ -54,8 +55,8 @@ export async function seedTrashRows(t: TrashEnv, n: number, opts: { prefix?: str
   const { prefix = "t", deletedAt = 1, workspaceId = t.roots.ownerPersonalWorkspaceId, reason = "forget", vectorIds = "[]" } = opts;
   await t.sqlite.db.exec(`
     WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM n WHERE i < ${n - 1})
-    INSERT INTO entries_trash (id, workspace_id, actor_id, content, row_json, edges_json, vector_ids, deleted_at, deleted_by, channel, reason)
-    SELECT '${prefix}' || i, '${workspaceId}', '', 'c', '{"created_at":1}', '[]', '${vectorIds}', ${deletedAt}, '', 'rest', '${reason}' FROM n`);
+    INSERT INTO entries_trash (id, workspace_id, actor_id, content, row_json, edges_json, vector_ids, deleted_at, deleted_by, channel, reason, write_marker)
+    SELECT '${prefix}' || i, '${workspaceId}', '', 'c', '{"created_at":1}', '[]', '${vectorIds}', ${deletedAt}, '', 'rest', '${reason}', '${t.sqlite.fixtureMarker()}' FROM n`);
 }
 
 /** Give every trash row with the prefix `k` versions (seq 1..k), inserted in one statement. */
@@ -63,8 +64,8 @@ export async function seedVersionsFor(t: TrashEnv, entryIds: string[], k: number
   for (const id of entryIds) {
     await t.sqlite.db.exec(`
       WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ${k})
-      INSERT INTO entry_versions (entry_id, workspace_id, seq, content, prior_length, tags, actor_id, channel, reason, created_at)
-      SELECT '${id}', '${t.roots.ownerPersonalWorkspaceId}', i, 'v' || i, NULL, '[]', '', 'rest', 'update', i FROM n`);
+      INSERT INTO entry_versions (entry_id, workspace_id, seq, content, prior_length, tags, actor_id, channel, reason, created_at, write_marker)
+      SELECT '${id}', '${t.roots.ownerPersonalWorkspaceId}', i, 'v' || i, NULL, '[]', '', 'rest', 'update', i, '${t.sqlite.fixtureMarker()}' FROM n`);
   }
 }
 

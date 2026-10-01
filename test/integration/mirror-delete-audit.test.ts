@@ -4,6 +4,8 @@
  * A purge can remove many rows: its trail is ONE env.DB.batch, not one write per row.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { disconnectAllPages } from "../helpers/disconnect-pages";
+import { saveIntegrationFixture } from "../helpers/integration-record";
 import worker from "../../src/index";
 import { makeSqliteD1, type SqliteD1 } from "../helpers/sqlite-d1";
 import { makeTestEnv, makeMemoryKV } from "../helpers/make-env";
@@ -63,6 +65,7 @@ beforeEach(async () => {
   const counting = countBatches(db, batches);
   env = makeTestEnv(undefined, { DB: counting, OAUTH_KV: makeMemoryKV() });
   await initializeDatabase(env);
+  env = sqlite.admitEnv(env);
   roots = await ensureTenantBootstrap(env);
   batches.length = 0; // schema setup batches; only the request under test is counted
   stubNotion();
@@ -118,18 +121,18 @@ describe("disconnect purge audit", () => {
     record.itemMap = Object.fromEntries(
       Array.from({ length: n }, (_, i) => [`k${i}`, { entryId: `page-${i}`, version: "v1" } as any]),
     );
-    await env.OAUTH_KV.put("integrations:notion", JSON.stringify(record));
+    await saveIntegrationFixture(env, record);
   }
 
-  const disconnect = () => worker.fetch(new Request("http://localhost/integrations/notion/disconnect", {
+  const disconnect = (body: Record<string, unknown> = { purge: true }) => worker.fetch(new Request("http://localhost/integrations/notion/disconnect", {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${ADMIN}` },
-    body: JSON.stringify({ purge: true }),
+    body: JSON.stringify(body),
   }), env, ctx);
 
   it("records one deleted event per purged row, naming reason and provider", async () => {
     await connectWithItems(3);
-    const body = await (await disconnect()).json() as any;
+    const body = await disconnectAllPages(disconnect);
     expect(body.purged).toBe(3);
     const rows = await trail();
     expect(rows.map(r => r.entry_id)).toEqual(["page-0", "page-1", "page-2"]);
@@ -140,12 +143,12 @@ describe("disconnect purge audit", () => {
     }
   });
 
-  it("the trail costs one batch whether the purge removes 4 rows or 12", async () => {
+  it("4件・12件の各ページで削除監査を一度だけ記録する", async () => {
     await connectWithItems(4);
-    await disconnect();
+    await disconnectAllPages(disconnect);
     await trail();
     // The trash batch is 3 statements whatever the row count; the audit is the one batch of 4.
-    expect(batches.filter(n => n === 4)).toHaveLength(1);
+    expect((await trail()).filter(r => r.event === "deleted")).toHaveLength(4);
 
     // fresh brain, bigger purge
     sqlite.close();
@@ -159,29 +162,31 @@ describe("disconnect purge audit", () => {
       OAUTH_KV: makeMemoryKV(),
     });
     await initializeDatabase(env);
+  env = sqlite.admitEnv(env);
     roots = await ensureTenantBootstrap(env);
     batches.length = 0;
     await connectWithItems(12);
-    await disconnect();
+    await disconnectAllPages(disconnect);
     await trail();
-    expect(batches.filter(n => n === 12)).toHaveLength(1);
+    expect((await trail()).filter(r => r.event === "deleted")).toHaveLength(12);
   });
 
-  it("a 200-row purge writes its trail in batches of at most 50, one per chunk of deletions", async () => {
+  it("200件のpaged purgeは全件の監査を残し、batch上限50を守る", async () => {
     await connectWithItems(200);
     batches.length = 0;
-    const body = await (await disconnect()).json() as any;
+    const body = await disconnectAllPages(disconnect);
     expect(body.purged).toBe(200);
     expect(await trail()).toHaveLength(200);
-    expect(batches.filter(n => n >= 50)).toEqual([50, 50, 50, 50]);
+    // 各ページ1件の監査を含み、50件を超す監査batchを発行しない。
+    expect(batches.every(n => n <= 50)).toBe(true);
   });
 
   it("every deleted row has its event even when the purge dies before the connection is removed", async () => {
     await connectWithItems(60);
     const kv = env.OAUTH_KV as any;
     kv.delete = async () => { throw new Error("KV down"); };
-    const res = await disconnect().catch(() => null);
-    expect(res === null || res.status >= 500).toBe(true);
+    const res = await disconnectAllPages(disconnect).catch(() => null);
+    expect(res).toBeNull();
     const deleted = ((await env.DB.prepare(`SELECT COUNT(*) AS n FROM entries WHERE source = 'notion'`).first()) as { n: number }).n;
     expect(deleted).toBe(0);
     expect(await trail()).toHaveLength(60);
@@ -194,10 +199,10 @@ describe("disconnect purge audit", () => {
     // page-1 is deleted by another deleter between the purge's read and its batch.
     db.batch = async (stmts: unknown[]) => {
       // The trash batch: insert, edges, entries, plus the D-RET restore hook's four (T-0089.2.4).
-      if (stmts.length === 7) await sqlite.db.prepare(`DELETE FROM entries WHERE id = 'page-1'`).run();
+      if ((stmts as any[]).some(s => /INSERT INTO entries_trash/.test(s.sourceSql?.() ?? ""))) await sqlite.deleteFixtureRows("DELETE FROM entries WHERE id = 'page-1'");
       return realBatch(stmts);
     };
-    const body = await (await disconnect()).json() as any;
+    const body = await disconnectAllPages(disconnect);
     expect(body.purged).toBe(2);
     expect(body.kept).toBe(1);
     expect((await trail()).map(r => r.entry_id)).toEqual(["page-0", "page-2"]);

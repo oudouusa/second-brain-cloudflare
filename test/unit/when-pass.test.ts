@@ -127,9 +127,9 @@ describe("judgeCommitment()", () => {
     expect(await judgeCommitment(content, REFERENCE_DATE, env)).toEqual({ outcome: "failed" });
   });
 
-  it("declines output with no is_commitment field", async () => {
+  it("is_commitmentのない応答は判断失敗として再試行する", async () => {
     const env = makeTestEnv(makeTestDb(), { AI: makeAI(`{"what": "x", "due_at": "2026-01-30"}`) });
-    expect(await judgeCommitment(content, REFERENCE_DATE, env)).toEqual({ outcome: "declined" });
+    expect(await judgeCommitment(content, REFERENCE_DATE, env)).toEqual({ outcome: "failed" });
   });
 
   it("reports failed, not declined, when the model call itself throws", async () => {

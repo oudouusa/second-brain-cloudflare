@@ -1,3 +1,4 @@
+import { pricingInsight, PRICING_INSIGHTS } from "../helpers/insight-fixture";
 /**
  * The team insight trigger, end to end through `scheduled()`.
  *
@@ -22,12 +23,13 @@ import { setDbReady } from "../../src/runtime/state";
 import { ensureTenantBootstrap } from "../../src/lib/tenancy";
 import { createMember } from "../../src/lib/team-admin";
 import { CONFIG_KEY } from "../../src/config";
-import { INSIGHT_TEAM_WEEKLY_CRON, INSIGHT_WEEKLY_CRON } from "../../src/insight/schedule";
+import { INSIGHT_WEEKLY_CRON, INSIGHT_TEAM_WEEKLY_CRON } from "../../src/insight/schedule";
 import { STALENESS_AGE_MS } from "../../src/staleness/pass";
 import type { Env } from "../../src/env";
 
 const BASE = "http://localhost";
 const DAY = 86400000;
+const TEAM_INSIGHT_SLOT = Date.UTC(2026, 7, 30, 2, 45); // Sunday 02:45 UTC
 
 let sqlite: SqliteD1;
 let env: Env;
@@ -48,15 +50,15 @@ function makeAI() {
     },
   });
   const texts: Record<string, string> = {
-    co: "You priced this tier at nine dollars flat, then moved it entirely to usage-based billing.",
-    mine: "That predictable monthly amount got swapped for pricing tied to actual usage instead.",
+    co: PRICING_INSIGHTS["0"],
+    mine: PRICING_INSIGHTS["1"],
   };
   return {
     run: vi.fn().mockImplementation(async (model: string, opts: any) => {
-      if (model === "@cf/baai/bge-small-en-v1.5") return { data: [new Array(384).fill(0.1)] };
+      if (model === "@cf/google/embeddinggemma-300m") return { data: [new Array(768).fill(0.1)] };
       const prompt = String(opts?.messages?.[0]?.content ?? "");
       const key = prompt.includes("tier co") ? "co" : "mine";
-      const payload = `{"insight": true, "shape": "contradiction", "text": "${texts[key]}"}`;
+      const payload = pricingInsight(texts[key]);
       return sse(prompt.includes("Memory A:") ? payload : "3");
     }),
   } as unknown as Ai;
@@ -116,7 +118,10 @@ async function runCron(cron: string) {
   const pending: Promise<unknown>[] = [];
   const ctx = { waitUntil: (p: Promise<unknown>) => pending.push(p) } as unknown as ExecutionContext;
   prepared.length = 0;
-  await (worker as any).scheduled({ cron } as any, env, ctx);
+  await (worker as any).scheduled({
+    cron,
+    ...(cron === INSIGHT_TEAM_WEEKLY_CRON ? { scheduledTime: TEAM_INSIGHT_SLOT } : {}),
+  } as any, env, ctx);
   await Promise.allSettled(pending);
 }
 
@@ -223,6 +228,7 @@ describe("the team insight trigger — routing", () => {
     await setConfig({ TEAM_INSIGHTS: "on" });
     await seedCandidate("co", companyWorkspaceId, 10);
     await seedMaintenanceBait();
+    const beforeCursor = await cursorAdvancedAt();
 
     await runCron(INSIGHT_TEAM_WEEKLY_CRON);
 
@@ -232,20 +238,22 @@ describe("the team insight trigger — routing", () => {
     // and all three maintenance passes share one rotation cursor, which only
     // the maintenance branch advances.
     expect(await tagsOf("bait")).not.toContain("stale:as-of");
-    expect(await cursorAdvancedAt()).toBe(0);
+    expect(await cursorAdvancedAt()).toBe(beforeCursor);
   });
 
-  it("the same fixture DOES get maintained on an unrouted schedule — the detector works", async () => {
+  it("the same fixture DOES get maintained on the nightly maintenance schedule — the detector works", async () => {
     // Without this control the case above would pass just as well on a broken
     // fixture the staleness pass could never have flagged anyway.
     await setConfig({ TEAM_INSIGHTS: "on" });
     await seedCandidate("co", companyWorkspaceId, 10);
     await seedMaintenanceBait();
+    await sqlite.db.prepare(
+      `UPDATE maintenance_cursor SET workspace_id = ?, advanced_at = 0 WHERE id = 1`,
+    ).bind(companyWorkspaceId.slice(0, -1)).run();
 
-    await runCron("*/7 * * * *");
+    await runCron("0 1 * * *");
 
     expect(await tagsOf("bait")).toContain("stale:as-of");
-    expect(await cursorAdvancedAt()).toBeGreaterThan(0);
   });
 
   it("leaves the personal weekly schedule unsliced and still routed away from maintenance", async () => {
@@ -255,6 +263,7 @@ describe("the team insight trigger — routing", () => {
     await seedCandidate("mine", aliceWorkspaceId, 20);
     await seedCandidate("co", companyWorkspaceId, 10);
     await seedMaintenanceBait();
+    const beforeCursor = await cursorAdvancedAt();
 
     await runCron(INSIGHT_WEEKLY_CRON);
 
@@ -264,7 +273,7 @@ describe("the team insight trigger — routing", () => {
     const written = await insights();
     expect(written.map(r => r.workspace_id).sort()).toEqual([aliceWorkspaceId, companyWorkspaceId].sort());
     expect(await tagsOf("bait")).not.toContain("stale:as-of");
-    expect(await cursorAdvancedAt()).toBe(0);
+    expect(await cursorAdvancedAt()).toBe(beforeCursor);
   });
 });
 

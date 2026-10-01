@@ -1,9 +1,9 @@
-import type { EdgeProvenance, EdgeType } from "../graph/types";
-import type { Identity } from "../lib/identity";
+import type { EdgeDirection, EdgeProvenance, EdgeType } from "../graph/types";
 import type { MemoryStatus } from "../memory/status";
 import type { EmbeddingQueryMode } from "./query-profile";
 import type { RankMultipliers } from "./math";
 import type { RootView } from "./root-selector";
+import type { Identity } from "../lib/identity";
 import type { SupersededBy, ValidityState } from "./validity-view";
 
 /** A deprecated memory found at as-of time T: what was believed then, later retracted (spec 14 5.7). */
@@ -66,6 +66,9 @@ export interface RecallMatch {
   viaType?: EdgeType;
   viaLinkedAt?: number;           // when the edge was formed
   viaFrom?: string;               // id of the memory this one was reached from
+  viaSourceId?: string;           // stored edge source
+  viaTargetId?: string;           // stored edge target
+  viaDirection?: EdgeDirection;   // direction from viaFrom toward this memory
   /** Present only when the caller asked to explain the ranking. */
   why?: WhyTrace;
   /** Recurring notices this row's near-duplicate collapse absorbed, newest first, up to 5 (4.4). */
@@ -110,15 +113,31 @@ export interface StandingFire {
   why?: string;
 }
 
+export interface RecallGraphContribution {
+  requestedHops: number;
+  seedCount: number;
+  expandedCount: number;
+  eligibleCount: number;
+  selectedCount: number;
+}
+
 export interface RecallSearchResult {
   matches: RecallMatch[];
   insight: string;
+  querySignalCacheHit: boolean;
+  /** True when the advisory rollover-lineage lookup failed and recall kept the legacy ranking. */
+  lineageFallbackUsed: boolean;
   semanticUnavailable: boolean;
+  semanticUnavailableReason?: "workers_ai_quota_exhausted" | "embedding_unavailable" | "vectorize_unavailable";
+  semanticRetryAt?: number;
   queryUsed?: string;
   // Distilled query terms, reused to pick a query-relevant excerpt when a long
   // memory has to be shortened for the response.
   queryTokens?: string[];
+  /** Non-saturated query evidence plus numeric identifiers; current intent without time bounds. */
+  currentQueryTokens?: string[];
   compoundStale?: CompoundStaleSignal;
+  graphContribution: RecallGraphContribution;
   /** Present only when `asOf` was set (spec 14 5.7/5.9). */
   asOf?: { at: number; notRecordedBefore: number | null };
   /** Standing instructions that fired, capped at STANDING_MAX_FIRES, present only when non-empty (spec 15 2.8/2.9). */
@@ -140,6 +159,10 @@ export interface RecallDiagnostics {
   eligibleRelatedIds?: string[];
   selectedRelatedIds?: string[];
   finalIds?: string[];
+  collapsedDirectRolloverIds?: string[];
+  collapsedGraphRolloverIds?: string[];
+  promotedDirectRolloverIds?: string[];
+  lineageFallbackUsed?: boolean;
   rejections?: { id: string; reason: string }[];
   operations?: RecallOperationDiagnostics;
   /** Observation anomalies, e.g. a first() statement that returned more than one row. Absent when there are none. */
@@ -232,6 +255,8 @@ export interface RecallInternalOptions {
 }
 
 export interface KeywordRow {
+  /** タグ検索が取得した派生索引状態。通常のkeyword検索では未取得。 */
+  vector_ids?: string;
   id: string;
   /** The note's text. Absent on rows the keyword arm reads: it returns `hits` instead and never the text (see keyword-rows.ts). */
   content?: string;

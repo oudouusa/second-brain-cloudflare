@@ -14,7 +14,7 @@ async function makeEnv() {
   resetDatabaseInit();
   await initializeDatabase(env);
   const roots = await ensureTenantBootstrap(env);
-  return { env, roots };
+  return { env: d1.admitEnv(env), roots };
 }
 
 async function activeAdminIds(env: Env): Promise<string[]> {
@@ -192,11 +192,11 @@ describe("team member administration", () => {
     const { member, token } = await createMember(env, { name: "Ada" });
     await setMemberSuspended(env, "someone-else", member.userId, true);
     const { resolveIdentity } = await import("../../src/lib/identity");
-    const request = new Request("https://x/", { headers: { Authorization: `Bearer ${token}` } });
-    expect(await resolveIdentity(request, env)).toBeNull();
+    const request = () => new Request("https://x/", { headers: { Authorization: `Bearer ${token}` } });
+    expect(await resolveIdentity(request(), env)).toBeNull();
     // Unsuspend restores access.
     await setMemberSuspended(env, "someone-else", member.userId, false);
-    expect(await resolveIdentity(request, env)).not.toBeNull();
+    expect(await resolveIdentity(request(), env)).not.toBeNull();
   });
 
   it("surfaces unknown members as 404-class errors", async () => {

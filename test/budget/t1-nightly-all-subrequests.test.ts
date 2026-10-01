@@ -31,7 +31,7 @@ describe.runIf(HAS_PENDING)("the whole nightly invocation, every binding counted
     const d1Sql: string[] = [];
     // One vector per input text, as Workers AI returns for a batch (embedMany checks the count).
     const ai = { run: async (model: string, input: any) => {
-      if (model.startsWith("@cf/baai/bge")) {
+      if (model === "@cf/google/embeddinggemma-300m") {
         const texts = Array.isArray(input?.text) ? input.text : [input?.text];
         return { data: texts.map(() => Array.from({ length: 384 }, (_, i) => (i % 7) / 10)) };
       }

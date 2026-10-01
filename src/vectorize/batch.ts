@@ -1,5 +1,6 @@
 import type { Env } from "../env";
 import { VECTORIZE_DELETE_MAX_IDS_PER_CALL, VECTORIZE_GET_BY_IDS_BATCH, VECTORIZE_UPSERT_BATCH } from "../constants";
+import { D1BudgetExceededError, reserveD1Sql } from "../runtime/d1-budget";
 
 /** Vector ids an entry claims as its own: what its row lists, an upload it made, or ids derived for it. */
 export interface OwnedVectors { entryId: string; vectorIds: readonly string[] }
@@ -40,16 +41,43 @@ export async function deleteEntryVectors(
   const leftoverIds = new Set(allIds.slice(cap));
 
   const doomed: string[] = [];
+  const ownersById = new Map<string, string>();
   for (let i = 0; i < ids.length; i += VECTORIZE_GET_BY_IDS_BATCH) {
     const found = await env.VECTORIZE.getByIds(ids.slice(i, i + VECTORIZE_GET_BY_IDS_BATCH));
     for (const v of found) {
       const parentId = (v.metadata as { parentId?: unknown } | undefined)?.parentId;
       const owners = claimants.get(v.id);
       if (!owners) continue;
-      if (typeof parentId === "string" ? owners.has(parentId) : owners.has(v.id)) doomed.push(v.id);
+      if (typeof parentId === "string" ? owners.has(parentId) : owners.has(v.id)) {
+        doomed.push(v.id);
+        ownersById.set(v.id, typeof parentId === "string" ? parentId : v.id);
+      }
     }
   }
-  for (let i = 0; i < doomed.length; i += VECTORIZE_UPSERT_BATCH) await env.VECTORIZE.deleteByIds(doomed.slice(i, i + VECTORIZE_UPSERT_BATCH));
+  const { recordVectorCleanup, markVectorCleanupReady, settleVectorCleanupOp,
+    recordVectorCleanupBatch, submitVectorCleanupBatch } = await import("./cleanup");
+  if (owned.length > 1 && doomed.length) {
+    const work = reserveD1Sql(env, 5);
+    if (!work) throw new D1BudgetExceededError();
+    try {
+      const live = await work.env.DB.prepare(
+        // scope-exempt: 認可済み削除対象のIDだけを再読し、現行の索引参照を保護する。本文は読まない。
+        // validity: any: 期限切れの行も索引を参照しうるため、削除から保護する。
+        `SELECT id, vector_ids FROM entries WHERE id IN (SELECT value FROM json_each(?))`,
+      ).bind(JSON.stringify(owned.map(o => o.entryId))).all<{ id: string; vector_ids: string }>();
+      const referenced = new Set((live.results ?? []).flatMap(r => JSON.parse(r.vector_ids || "[]") as string[]));
+      const claims = [...new Set(owned.map(o => o.entryId))].map(entryId => ({ entryId,
+        vectorIds: doomed.filter(id => ownersById.get(id) === entryId && !referenced.has(id)) }));
+      const operations = await recordVectorCleanupBatch(work.env, claims);
+      await submitVectorCleanupBatch(work.env, operations);
+    } finally { work.release(); }
+  } else for (const o of owned) {
+    const ids = doomed.filter(id => o.vectorIds.includes(id));
+    if (!ids.length) continue;
+    const op = await recordVectorCleanup(env, o.entryId, ids);
+    await markVectorCleanupReady(env, op);
+    await settleVectorCleanupOp(env, op, o.entryId, ids);
+  }
 
   if (!leftoverIds.size) return { done: true, remaining: [] };
   const remaining: OwnedVectors[] = owned
@@ -96,4 +124,8 @@ export async function drainPendingVectorDeletes(env: Env, maxIds: number = VECTO
   } catch (e) {
     console.error("Draining queued vector deletes failed (non-fatal):", e);
   }
+}
+
+export async function deleteVectorIds(env: Env, ids: readonly string[]): Promise<void> {
+  for (let i = 0; i < ids.length; i += VECTORIZE_UPSERT_BATCH) await env.VECTORIZE.deleteByIds(ids.slice(i, i + VECTORIZE_UPSERT_BATCH) as string[]);
 }

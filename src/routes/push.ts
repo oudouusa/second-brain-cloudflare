@@ -116,9 +116,12 @@ export async function handlePushRoutes(
     if (auth instanceof Response) return auth;
 
     const workspaces = [...new Set(readableWorkspaces(auth))];
-    // One external-fetch budget for the whole request, not one per workspace.
     const budget = newPushBudget();
-    const perWorkspace = await Promise.all(workspaces.map(w => pushDueItems(env, w, undefined, budget)));
+    const perWorkspace = [];
+    for (const workspace of workspaces.slice(0, 4)) {
+      perWorkspace.push(await pushDueItems(env, workspace, undefined, budget));
+      if (!budget.fetchesLeft) break;
+    }
     const sent = perWorkspace.reduce((n, r) => n + r.sent, 0);
     const candidates = perWorkspace.reduce((n, r) => n + r.candidates, 0);
     const subscriptions = perWorkspace.reduce((n, r) => n + r.subscriptions, 0);
@@ -145,7 +148,11 @@ export async function handlePushRoutes(
 
     const workspaces = [...new Set(readableWorkspaces(auth))];
     const budget = newPushBudget();
-    const perWorkspace = await Promise.all(workspaces.map(w => sendTestNotification(env, w, budget)));
+    const perWorkspace = [];
+    for (const workspace of workspaces.slice(0, 4)) {
+      perWorkspace.push(await sendTestNotification(env, workspace, budget));
+      if (!budget.fetchesLeft) break;
+    }
     const sent = perWorkspace.reduce((n, r) => n + r.sent, 0);
     const subscriptions = perWorkspace.reduce((n, r) => n + r.subscriptions, 0);
     const results = perWorkspace.flatMap(r => r.results).slice(0, MAX_REPORTED_PUSH_RUN_RESULTS);

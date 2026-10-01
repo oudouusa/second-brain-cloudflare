@@ -120,17 +120,17 @@ describe("a hop lands only on a node the caller may read", () => {
     expect(out.map(n => n.id)).toEqual([]);
   });
 
-  it("GET /connections?id=a-seed as Alice returns nothing", async () => {
-    const body = await jsonOf(await call("GET", "/connections?id=a-seed", alice.token));
-    expect(body).toEqual({ ok: true, id: "a-seed", connections: [] });
+  it("POST /connections as Alice returns nothing", async () => {
+    const body = await jsonOf(await call("POST", "/connections", alice.token, { id: "a-seed" }));
+    expect(body).toEqual({ ok: true, id: "a-seed", connections: [], next_cursor: null });
   });
 
-  it("a 2-hop GET /graph?seed=a-seed reaches neither Bob's row nor what lies beyond it", async () => {
+  it("a 2-hop POST /graph reaches neither Bob's row nor what lies beyond it", async () => {
     // co-far is a company memory Alice may read — that is the point. Before the
     // fix she received it here, and the only route to it was through b-mid, which
     // she may not read. Which nodes a walk reaches is itself information: it says
     // Bob's private memory connects these two.
-    const view = await jsonOf(await call("GET", "/graph?seed=a-seed", alice.token));
+    const view = await jsonOf(await call("POST", "/graph", alice.token, { seed: "a-seed" }));
     expect(view.ok).toBe(true);
     expect(view.nodes.map((n: any) => n.id)).toEqual(["a-seed"]);
     expect(view.edges).toEqual([]);
@@ -140,7 +140,7 @@ describe("a hop lands only on a node the caller may read", () => {
     // The mirror case, so the fix is proven to be a scope check and not a blanket
     // "drop hop 2". Bob reads b-mid and co-far, and the a-seed edge is company-
     // stamped, so his walk from b-mid is unaffected.
-    const view = await jsonOf(await call("GET", "/graph?seed=b-mid", bob.token));
+    const view = await jsonOf(await call("POST", "/graph", bob.token, { seed: "b-mid" }));
     expect(view.nodes.map((n: any) => n.id).sort()).toEqual(["b-mid", "co-far"]);
   });
 });

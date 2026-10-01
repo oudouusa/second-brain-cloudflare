@@ -33,12 +33,13 @@ describe("nightly vectorize-pending pass", () => {
 
     await nightly();
     const first = await Promise.all(Array.from({ length: n }, (_, i) => indexed(`d${i}`)));
-    expect(first.filter(Boolean)).toHaveLength(VECTORIZE_PENDING_NIGHTLY_ROWS);
-    expect(first.slice(0, VECTORIZE_PENDING_NIGHTLY_ROWS).every(Boolean)).toBe(true); // oldest first
+    expect(first.filter(Boolean)).toHaveLength(1);
+    expect(first.slice(0, 1).every(Boolean)).toBe(true); // oldest first
     expect(await indexed("fresh")).toBe(false);
     expect(await indexed("dep")).toBe(false);
 
-    await nightly();
+    // forkの夜間は1件ずつ。毎回進捗し、有限回で全て索引化する。
+    for (let pass = 1; pass < n; pass++) await nightly();
     const second = await Promise.all(Array.from({ length: n }, (_, i) => indexed(`d${i}`)));
     expect(second.every(Boolean)).toBe(true);
   }, 30000);

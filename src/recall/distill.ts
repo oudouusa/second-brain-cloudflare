@@ -1,3 +1,4 @@
+import { CONTENT_LIKE_ESCAPE, contentLikePattern } from "../text/like";
 import type { Env } from "../env";
 import { DEFAULTS, type Config } from "../config";
 import {
@@ -8,10 +9,15 @@ import {
   MAX_QUERY_TERMS,
   QUERY_SATURATION_FRACTION,
 } from "../constants";
+import {
+  likeContainsPattern,
+  QUERY_LIKE_ESCAPE,
+  tokenizeQueryDetailed,
+  withoutContainedCjkBigrams,
+  type LexicalToken,
+} from "../text/lexical-query";
 import type { Identity } from "../lib/identity";
 import { scopeWhereForRead, type ScopeClause } from "../lib/scope";
-import { tokenizeQuery } from "../text/tokenize";
-import { CONTENT_LIKE_ESCAPE, contentLikePattern } from "../text/like";
 import { extractHashtags } from "../text/hashtags";
 import { isTopicTag } from "../compression/eligibility";
 import { getTagVocabulary } from "../tags/vocabulary";
@@ -23,16 +29,24 @@ import { FTS_LIVENESS_SQL, ftsCountSafeToken, ftsEligibleToken, ftsMatchQuery, f
  * caller; pass it wherever there is one, or an aged-out vocabulary is rebuilt on the
  * request's own critical path instead of behind it.
  */
-export async function inferQueryTags(query: string, env: Env, ctx?: ExecutionContext, identity?: Identity): Promise<string[]> {
+export async function inferQueryTags(query: string, env: Env, ctx?: ExecutionContext, identity?: Identity, only?: "personal" | "company", teamId?: string): Promise<string[]> {
   const { hashtags } = extractHashtags(query);
   if (hashtags.length) return hashtags;
 
   // Cached (#288): this used to be a full table scan expanded per tag per row, on
   // every recall, and it was 82% of a recall's read cost.
   //
-  // System tags describe processing state, not the entry's subject. Keep only
-  // topic tags for the ranking boost.
-  const knownTags = (await getTagVocabulary(env, ctx, identity)).filter(isTopicTag);
+  // System tags are dropped rather than matched against. They say what the system
+  // did to an entry, not what it is about, and the only thing a query tag does is
+  // boost entries whose subject overlaps the question. Two of them — `auto-pattern`
+  // and `status:deprecated` — name entries that recall's hydration filter removes
+  // outright, so a boost they win is spent on rows that are then discarded. They are
+  // also applied in bulk (the staleness pass alone writes `volatility:` and
+  // `stale:as-of` across up to 25 entries a night), which makes them the highest-
+  // count tags in a mature brain and exactly the ones that would crowd real topics
+  // out of the 50 the LLM below is shown. The same predicate #278 used to keep them
+  // out of digest candidates, so the two agree by construction.
+  const knownTags = (await getTagVocabulary(env, ctx, identity, only, teamId)).filter(isTopicTag);
 
   const lowerQuery = query.toLowerCase();
   const keywordMatches = knownTags.filter(t =>
@@ -54,8 +68,9 @@ export interface DistilledQuery {
   query: string;
   df: Map<string, number> | null;
   total: number | null;
-  /** How df/total were obtained: the FTS index, the LIKE full scan, that scan capped as the FTS counts would be (a common-word query), or skipped (single term). */
-  distillSource: "fts" | "like" | "scan" | "shortcut";
+  /** Present for runtime-produced queries; optional keeps fixture callers thin. */
+  terms?: LexicalToken[];
+  distillSource?: "fts" | "like" | "scan" | "shortcut";
 }
 
 export interface TimeBounds {
@@ -414,6 +429,50 @@ async function distillViaFts(
   return { df, total, scanned };
 }
 
+function rebuildFromCounts(
+  uniq: LexicalToken[], terms: LexicalToken[], content: string[],
+  df: Map<string, number>, total: number, source: "fts" | "like" | "scan",
+  estimated: ReadonlySet<string> = new Set(),
+): DistilledQuery {
+  // A token absent from the corpus cannot retrieve a row. CJK fallback
+  // bigrams can cross a grammatical boundary (for example "じロ") and df=0
+  // previously made those impossible terms look maximally discriminative,
+  // consuming all three rare-term slots ahead of observed subject words.
+  let candidates = uniq.map(term => term.value).filter(t => {
+    const frequency = df.get(t) ?? 0;
+    return frequency > 0 && frequency / total <= QUERY_SATURATION_FRACTION;
+  });
+  if (!candidates.length) {
+    const observed = uniq.map(term => term.value).filter(t => (df.get(t) ?? 0) > 0);
+    candidates = observed.length ? observed : uniq.map(term => term.value);
+  }
+  // 観測済みの単語と、その部分一致用bigramで複数の枠を使わない。
+  // 単語が候補に残らなければbigramを維持し、従来の部分一致を救済する。
+  const candidateSet = new Set(candidates);
+  candidates = withoutContainedCjkBigrams(uniq.filter(term => candidateSet.has(term.value)))
+    .map(term => term.value);
+  const ranked = [...candidates].sort((a, b) => Number(estimated.has(a)) - Number(estimated.has(b)) || (df.get(a) ?? 0) - (df.get(b) ?? 0));
+  // 既存の3枠のうち最大1枠を、観測済みで非頻出の構造付き識別子に割り当てる。
+  // 単なる略語は対象外。質問の語尾や動詞でissue番号・path等を落とさない。
+  // 通常候補へのfallback時も、未観測・頻出の識別子は優先しない。
+  const anchor = ranked.find(value => uniq.some(term =>
+    term.value === value && term.kind === "protected" && /[\d@#./:_-]/u.test(value)
+    && (df.get(value) ?? 0) > 0 && df.get(value)! / total <= QUERY_SATURATION_FRACTION
+  ));
+  const keep = new Set(
+    (anchor ? [anchor, ...ranked.filter(value => value !== anchor)] : ranked).slice(0, MAX_QUERY_TERMS)
+  );
+  const rebuiltTerms = terms.filter(term => keep.has(term.value));
+  const rebuilt = rebuiltTerms.map(term => term.value);
+  return {
+    query: rebuilt.length ? rebuilt.join(" ") : content.join(" "),
+    df,
+    total,
+    terms: rebuilt.length ? rebuiltTerms : terms,
+    distillSource: source,
+  };
+}
+
 export async function distillToRareTerms(
   query: string,
   env: Env,
@@ -423,107 +482,102 @@ export async function distillToRareTerms(
   only?: "personal" | "company",
   teamId?: string,
 ): Promise<DistilledQuery> {
-  const words = query.split(/\s+/).filter(Boolean);
-  // One vocabulary for the whole pipeline (#326): the terms counted here are the
-  // ones the keyword arm binds, so corpus IDF covers everything fusion asks
-  // about — search.ts requires all-or-nothing coverage.
-  const tokensOf = new Map<string, string[]>();
-  // A word is judged with the whole query: a scaffolding word ("wants") is a term only when nothing else in the query is.
-  const queryTokens = new Set(tokenizeQuery(query));
-  for (const w of words) if (!tokensOf.has(w)) tokensOf.set(w, tokenizeQuery(w).filter(t => queryTokens.has(t)));
-  const content = words.filter(w => tokensOf.get(w)!.length > 0);
-  const uniq = [...new Set(content.flatMap(w => tokensOf.get(w)!))].slice(0, KEYWORD_MAX_TOKENS);
-  // keywordSearch's budget check needs df for every retrieval token, and
-  // retrieval appends deterministicVariants — plural/stemmed forms this scan
-  // would otherwise never count ("widgets gadgets" would route to FTS on a
-  // corpus the singular routes to LIKE). They join a separate list for the df
-  // statement only: `uniq` stays exactly as it is, so keep/rebuilt still rank
-  // original content terms alone. Originals win the KEYWORD_MAX_TOKENS cap
-  // and variants only fill the slots they leave; a variant left without a df
-  // entry (cap bound) keeps the router's FTS default.
-  const evidence = tokenizeQuery(query).slice(0, KEYWORD_MAX_TOKENS);
-  const dfTerms = [...new Set([...uniq, ...deterministicVariants(query, evidence)])].slice(0, KEYWORD_MAX_TOKENS);
-  // Nothing to rank with at most one distinct term. A single whitespace word can
-  // carry several terms once it is CJK; that case goes on to the scan.
-  if (content.length <= 1 && uniq.length <= 1) {
-    return { query: content.length ? content.join(" ") : query, df: null, total: null, distillSource: "shortcut" };
+  const terms = tokenizeQueryDetailed(query);
+  const content = terms.map(term => term.value);
+  if (content.length === 0) {
+    return { query: content.length ? content.join(" ") : query, df: null, total: null, terms, distillSource: "shortcut" };
   }
 
-  // One bound parameter and one SUM column per term, so this scan is bounded by
-  // the same ceiling as the keyword clause it feeds. Sharing the constant is
-  // what makes that true rather than coincidental: the widest set ranked here
-  // is the widest set search.ts can carry, in either direction.
-  // The DF denominator is the caller's readable corpus, not the deployment's:
-  // another workspace's rows must not be able to saturate a term out of (or
-  // inflate a term's rarity within) this caller's query.
   const scope = identity ? scopeWhereForRead(identity, { layer: only, teamId }) : null;
+  let where = "";
+  const timeBindings: number[] = [];
+  if (bounds.after !== undefined) {
+    where += " created_at >= ?";
+    timeBindings.push(bounds.after);
+  }
+  if (bounds.before !== undefined) {
+    where += `${where ? " AND" : ""} created_at < ?`;
+    timeBindings.push(bounds.before);
+  }
+  if (scope) {
+    where += `${where ? " AND" : ""} ${scope.clause}`;
+  }
 
-  // T-0059: prefer the FTS index over the full LIKE scan when it is live and
-  // every term can be counted through it with no risk of a different answer
-  // than LIKE would give (ftsCountSafeToken — LIKE folds ASCII case only,
-  // trigram folds Unicode case). T-0074: a term too short for the index is not
-  // a disqualifier when other terms can be counted; the scan it would force
-  // reads the whole partition, so its df is sampled from the newest rows instead
-  // (shortTermSampleStmt).
-  // Any other disqualifier, or a thrown error, falls through to the existing
-  // LIKE statement below, unchanged.
-  const shortTerms = dfTerms.filter(ftsShortToken);
-  const countTerms = dfTerms.filter(t => !ftsShortToken(t));
-  if (countTerms.length && countTerms.every(t => ftsEligibleToken(t) && ftsCountSafeToken(t)) && await ftsReady(env)) {
+  // Every term gets its normalized primary probe first. Compatibility probes
+  // are added only from the remaining D1 variable budget, so a user with many
+  // readable team workspaces cannot turn the optional NFKC rescue into a 100-
+  // parameter failure.
+  const probeBudget = Math.max(
+    0,
+    D1_MAX_BOUND_PARAMS - timeBindings.length - (scope?.bindings.length ?? 0),
+  );
+  const uniq = terms.slice(0, Math.min(KEYWORD_MAX_TOKENS, probeBudget));
+  if (!uniq.length) return { query: content.join(" "), df: null, total: null, terms, distillSource: "shortcut" };
+  // Retrieval appends deterministic variants after the original terms. Count
+  // them as well so the match budget sees the same query as the keyword arm.
+  const seen = new Set(uniq.map(term => term.value));
+  const variants = deterministicVariants(query, content).filter(value => {
+    if (seen.has(value)) return false;
+    seen.add(value);
+    return true;
+  }).slice(0, Math.max(0, Math.min(KEYWORD_MAX_TOKENS, probeBudget) - uniq.length))
+    .map(value => ({ value, kind: "word" as const, probes: [value] }));
+  const countTerms: LexicalToken[] = [...uniq, ...variants];
+  const probesByTerm = new Map(countTerms.map(term => [term.value, [term.probes[0]]]));
+  let remainingProbeBudget = probeBudget - countTerms.length;
+  for (const term of countTerms) {
+    for (const probe of term.probes.slice(1)) {
+      if (remainingProbeBudget <= 0) break;
+      probesByTerm.get(term.value)!.push(probe);
+      remainingProbeBudget--;
+    }
+  }
+
+  // Compatibility surfaces and CJK bigrams require the existing LIKE probe
+  // semantics. Every other token can use upstream's exact FTS count path.
+  const dfTerms = countTerms.map(term => term.value);
+  if (countTerms.every(term => term.kind !== "cjk-bigram" && term.probes.length === 1
+    && (ftsEligibleToken(term.value) || ftsShortToken(term.value)) && ftsCountSafeToken(term.value)) && await ftsReady(env)) {
     try {
-      const viaFts = await distillViaFts(countTerms, shortTerms, env, bounds, scope);
-      // Every original term saturated and at least one count hit its LIMIT
-      // cap: the capped counts can no longer order the terms against each
-      // other, so the FTS ranking could differ from LIKE's. Discard them and
-      // count exactly through the LIKE fallback — the byte-identical
-      // statement below.
-      const counted = uniq.filter(t => !ftsShortToken(t));
+      const viaFts = await distillViaFts(dfTerms.filter(t => !ftsShortToken(t)), dfTerms.filter(ftsShortToken), env, bounds, scope);
       const unrankable = !!viaFts
-        && counted.every(t => (viaFts.df.get(t) ?? 0) / viaFts.total > QUERY_SATURATION_FRACTION)
-        && counted.some(t => (viaFts.df.get(t) ?? 0) === saturationCap(viaFts.total));
+        && uniq.every(term => (viaFts.df.get(term.value) ?? 0) / viaFts.total > QUERY_SATURATION_FRACTION)
+        && uniq.some(term => (viaFts.df.get(term.value) ?? 0) === saturationCap(viaFts.total));
       if (viaFts && !unrankable) {
         const { df, total } = viaFts;
-        return { query: rankAndRebuild(uniq, content, tokensOf, df, total, new Set(shortTerms)), df, total, distillSource: viaFts.scanned ? "scan" : "fts" };
+        return rebuildFromCounts(uniq, terms, content, df, total, viaFts.scanned ? "scan" : "fts", new Set(dfTerms.filter(ftsShortToken)));
       }
       // The pass already holds what the LIKE fallback below would count (the same terms, scope and rows).
       if (viaFts?.scanned) {
         const { df, total } = viaFts.scanned;
         if (!total) return { query: content.join(" "), df: null, total: null, distillSource: "like" };
-        return { query: rankAndRebuild(uniq, content, tokensOf, df, total), df, total, distillSource: "like" };
+        return rebuildFromCounts(uniq, terms, content, df, total, "like");
       }
-    } catch (e) {
-      console.error("FTS distillation count failed (degrading to LIKE):", e);
+    } catch (error) {
+      console.error("FTS distillation count failed (degrading to LIKE):", error);
     }
   }
 
   try {
-    // LIKE folds ASCII case only while the trigram index folds all of Unicode, so on this path a df can
-    // undercount rows that differ only by non-ASCII case. An undercount could make planFtsMatch treat the OR
-    // tier as holding every match (and leave out its AND tier) when it would truncate, but only for a query
-    // whose matches differ from the counted ones by non-ASCII case in hundreds of rows.
-    const sums = dfTerms.map((_, i) => `SUM(CASE WHEN content LIKE ? ${CONTENT_LIKE_ESCAPE} THEN 1 ELSE 0 END) AS d${i}`).join(", ");
-    let where = "";
-    const timeBindings: number[] = [];
-    if (bounds.after !== undefined) {
-      where += " created_at >= ?";
-      timeBindings.push(bounds.after);
-    }
-    if (bounds.before !== undefined) {
-      where += `${where ? " AND" : ""} created_at < ?`;
-      timeBindings.push(bounds.before);
-    }
-    if (scope) {
-      where += `${where ? " AND" : ""} ${scope.clause}`;
-    }
+    const conditions = countTerms.map(term => probesByTerm.get(term.value)!
+      .map(() => `content LIKE ? ${QUERY_LIKE_ESCAPE}`)
+      .join(" OR "));
+    const sums = conditions.map((condition, i) =>
+      `SUM(CASE WHEN ${condition.includes(" OR ") ? `(${condition})` : condition} THEN 1 ELSE 0 END) AS d${i}`
+    ).join(", ");
     // scope-checked: the caller's clause IS applied when an identity is present — it is appended into `where` above; the lexer cannot see into a JS-assembled fragment
     const row = await env.DB.prepare(`SELECT COUNT(*) AS total, ${sums} FROM entries${where ? ` WHERE${where}` : ""}`)
-      .bind(...dfTerms.map(contentLikePattern), ...timeBindings, ...(scope?.bindings ?? [])).first() as Record<string, number> | null;
-    if (!row || !row.total) return { query: content.join(" "), df: null, total: null, distillSource: "like" };
+      .bind(
+        ...countTerms.flatMap(term => probesByTerm.get(term.value)!.map(likeContainsPattern)),
+        ...timeBindings,
+        ...(scope?.bindings ?? []),
+      ).first() as Record<string, number> | null;
+    if (!row || !row.total) return { query: content.join(" "), df: null, total: null, terms, distillSource: "like" };
     const total = row.total;
-    const df = new Map(dfTerms.map((t, i) => [t, (row[`d${i}`] as number) ?? 0]));
-    return { query: rankAndRebuild(uniq, content, tokensOf, df, total), df, total, distillSource: "like" };
+    const df = new Map(countTerms.map((term, i) => [term.value, (row[`d${i}`] as number) ?? 0]));
+    return rebuildFromCounts(uniq, terms, content, df, total, "like");
   } catch {
-    return { query: content.join(" "), df: null, total: null, distillSource: "like" };
+    return { query: content.join(" "), df: null, total: null, terms, distillSource: "like" };
   }
 }
 

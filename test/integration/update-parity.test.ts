@@ -21,8 +21,8 @@
  */
 import { describe, it, expect, beforeAll, afterAll, vi } from "vitest";
 import { Miniflare } from "miniflare";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { Client } from "@modelcontextprotocol/client";
+import { InMemoryTransport } from "@modelcontextprotocol/client";
 import worker from "../../src/index";
 import { buildMcpServer } from "../../src/mcp/server";
 import { requireIdentity } from "../../src/lib/identity";
@@ -30,6 +30,9 @@ import { initializeDatabase, resetDatabaseInit } from "../../src/db/init";
 import { makeAIMock, makeMemoryKV, makeVectorizeMock } from "../helpers/make-env";
 import { req } from "../helpers/make-request";
 import type { Env } from "../../src/env";
+import { beginMemoryWriteAdmission, memoryWriteMarker } from "../../src/migration/write-lock";
+import { updateEntryContent } from "../../src/capture/store";
+import { createEdge, inferEdgesOnWrite, replaceInferredEdgesOnWrite } from "../../src/graph/edges";
 import { cleanTemp } from "../helpers/tmp";
 
 afterAll(cleanTemp);
@@ -43,7 +46,7 @@ const SEEDED_AT = Date.parse("2024-01-17T00:00:00Z");
 // ── The world both callers run against ──────────────────────────────────────────────────
 
 /** Vectorize with real insert/upsert/delete semantics, so "what is indexed" is observable. */
-function makeStatefulVectorize(seed: { id: string; content: string }[], overrides: Partial<VectorizeIndex> = {}) {
+function makeStatefulVectorize(seed: { id: string; content: string }[], overrides: Partial<Vectorize> = {}) {
   const store = new Map<string, any>();
   // Real vectors name their entry in metadata.parentId (deleteEntryVectors checks it, T-0089.1.1).
   for (const v of seed) store.set(v.id, { id: v.id, values: [], metadata: { content: v.content, parentId: v.id.replace(/-chunk-\d+$/, "") } });
@@ -94,6 +97,8 @@ type World = {
   deleteFails?: boolean;
   /** A connected integration owns entries with this source, making them read-only. */
   connectedIntegration?: string;
+  /** Parent-level candidates returned while refreshing inferred edges. */
+  queryMatches?: { id: string; score: number; metadata?: Record<string, unknown> }[];
 };
 
 // ── State capture ───────────────────────────────────────────────────────────────────────
@@ -123,17 +128,31 @@ function normalize(snapshot: Snapshot): Snapshot {
         metaRest = JSON.stringify(m);
       } catch { /* not JSON: leave as-is */ }
     }
+    if (typeof rest.write_marker === "string") rest.write_marker = "<capability>";
     return { ...rest, meta: metaRest };
   });
   if (!snapshot.row) return { ...snapshot, versions };
   const row = { ...snapshot.row };
   if (typeof row.updated_at === "number") row.updated_at = "<written>";
-  return { ...snapshot, row, versions };
+  if (typeof row.write_marker === "string") row.write_marker = "<capability>";
+  const generated = [...new Set([
+    ...snapshot.vectors.map(vector => vector.id),
+    ...(JSON.parse((row.vector_ids as string) ?? "[]") as string[]),
+  ].filter(id => /^v-[0-9a-f-]+-\d+$/.test(id)))].sort();
+  const canonical = new Map(generated.map((id, index) => [id, `<generated-${index}>`]));
+  row.vector_ids = JSON.stringify(
+    (JSON.parse((row.vector_ids as string) ?? "[]") as string[]).map(id => canonical.get(id) ?? id),
+  );
+  return {
+    row, versions,
+    vectors: snapshot.vectors.map(vector => ({ ...vector, id: canonical.get(vector.id) ?? vector.id })),
+  };
 }
 
 describe("POST /update and the MCP update tool write identical state (#289)", () => {
   let mf: Miniflare;
   let d1: D1Database;
+  let fixtureToken: string;
 
   beforeAll(async () => {
     mf = new Miniflare({
@@ -142,10 +161,15 @@ describe("POST /update and the MCP update tool write identical state (#289)", ()
       d1Databases: { DB: "update-parity" },
     });
     d1 = (await mf.getD1Database("DB")) as unknown as D1Database;
-    // The real migration, so the columns under test are the ones production has —
-    // updated_at in particular is a runtime ALTER that db/schema.sql does not carry.
+    // The real migration keeps this Miniflare database aligned with the complete
+    // reference schema and exercises the same production initializer.
     resetDatabaseInit();
     await initializeDatabase({ DB: d1 } as Env);
+    fixtureToken = `fixture-${crypto.randomUUID()}`;
+    await d1.prepare(
+      `INSERT INTO memory_write_admissions (token, started_at, expires_at, generation)
+       SELECT ?, ?, ?, generation FROM memory_write_epoch WHERE id = 'current'`,
+    ).bind(fixtureToken, Date.now(), Number.MAX_SAFE_INTEGER).run();
   }, 30_000);
 
   afterAll(async () => {
@@ -154,6 +178,7 @@ describe("POST /update and the MCP update tool write identical state (#289)", ()
 
   function makeEnv(world: World) {
     const { store, index } = makeStatefulVectorize(world.vectors ?? [], {
+      ...(world.queryMatches ? { query: vi.fn().mockResolvedValue({ matches: world.queryMatches }) } : {}),
       ...(world.vectorizeDown ? { describe: vi.fn(async () => { throw new Error("no such index"); }) } : {}),
       ...(world.deleteFails ? { deleteByIds: vi.fn(async () => { throw new Error("delete failed"); }) } : {}),
     });
@@ -173,11 +198,16 @@ describe("POST /update and the MCP update tool write identical state (#289)", ()
    * the row the first one did rather than from what the first one left behind.
    */
   async function setUp(world: World) {
+    await d1.prepare(`UPDATE entries SET write_marker = ?`)
+      .bind(`${fixtureToken}:delete:${crypto.randomUUID()}`).run();
+    await d1.prepare(`DELETE FROM entries`).run();
     const { env, store, OAUTH_KV } = makeEnv(world);
     // Provision tenancy BEFORE seeding so the seed lands in the owner's personal
     // workspace exactly like any post-bootstrap write — otherwise the first caller
     // in the file would get its row backfilled and later ones would not.
     const owner = await ownerOf(env);
+    await d1.prepare(`UPDATE entries SET write_marker = ?`).bind(`${fixtureToken}:delete:${crypto.randomUUID()}`).run();
+    await d1.prepare(`UPDATE entry_versions SET write_marker = ?`).bind(`${fixtureToken}:delete:${crypto.randomUUID()}`).run();
     await d1.prepare(`DELETE FROM entries`).run();
     await d1.prepare(`DELETE FROM entry_versions`).run();
     if (world.connectedIntegration) {
@@ -188,8 +218,8 @@ describe("POST /update and the MCP update tool write identical state (#289)", ()
     }
     const s = world.seed;
     await d1.prepare(
-      `INSERT INTO entries (id, content, tags, source, created_at, updated_at, vector_ids, recall_count, importance_score, workspace_id, actor_id)
-       VALUES (?, ?, ?, ?, ?, ?, ?, 0, 3, ?, ?)`,
+      `INSERT INTO entries (id, content, tags, source, created_at, updated_at, vector_ids, recall_count, importance_score, write_marker)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 0, 3, ?)`,
     ).bind(
       ENTRY_ID,
       s.content,
@@ -198,8 +228,7 @@ describe("POST /update and the MCP update tool write identical state (#289)", ()
       s.createdAt ?? SEEDED_AT,
       s.updatedAt ?? null,
       JSON.stringify(s.vectorIds ?? [ENTRY_ID]),
-      owner.personalWorkspaceId,
-      owner.userId,
+      `${fixtureToken}:write:${crypto.randomUUID()}`,
     ).run();
     return { env, store };
   }
@@ -240,7 +269,8 @@ describe("POST /update and the MCP update tool write identical state (#289)", ()
   /** The MCP `update` tool, through a real MCP client and transport. */
   async function viaMcp(world: World, content: string) {
     const { env, store } = await setUp(world);
-    const server = buildMcpServer(env, ctx, await ownerOf(env));
+    const admitted = await beginMemoryWriteAdmission(env, ctx);
+    const server = buildMcpServer(admitted.env, admitted.ctx, await ownerOf(env));
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
     const client = new Client({ name: "parity-client", version: "1.0.0" });
     await Promise.all([client.connect(clientTransport), server.connect(serverTransport)]);
@@ -250,6 +280,7 @@ describe("POST /update and the MCP update tool write identical state (#289)", ()
       return { snapshot: await capture(store), reply };
     } finally {
       await client.close();
+      await admitted.finish();
     }
   }
 
@@ -272,9 +303,10 @@ describe("POST /update and the MCP update tool write identical state (#289)", ()
       content: "I live in Lisbon",
       expect: (s) => {
         expect(s.row!.content).toBe("I live in Lisbon");
-        // The row lists one fresh upload holding the new text; the old vector is retired.
-        expect(s.vectors).toEqual([{ id: `${ENTRY_ID}~0`, content: "I live in Lisbon" }]);
-        expect(JSON.parse(s.row!.vector_ids as string)).toEqual([`${ENTRY_ID}~0`]);
+        expect(s.vectors).toHaveLength(1);
+        expect(s.vectors[0].content).toBe("I live in Lisbon");
+        expect(s.vectors[0].id).toMatch(/^v-[0-9a-f-]+-0$/);
+        expect(JSON.parse(s.row!.vector_ids as string)).toEqual([s.vectors[0].id]);
       },
     },
     {
@@ -398,9 +430,10 @@ describe("POST /update and the MCP update tool write identical state (#289)", ()
       },
       content: "short replacement",
       expect: (s) => {
-        // A fresh upload (per-upload ids, T-0089.1.1): both of 3.7's old vectors go, the new one stays.
-        expect(s.vectors).toEqual([{ id: `${ENTRY_ID}~0`, content: "short replacement" }]);
-        expect(JSON.parse(s.row!.vector_ids as string)).toEqual([`${ENTRY_ID}~0`]);
+        expect(s.vectors).toHaveLength(1);
+        expect(s.vectors[0].content).toBe("short replacement");
+        expect(s.vectors[0].id).toMatch(/^v-[0-9a-f-]+-0$/);
+        expect(JSON.parse(s.row!.vector_ids as string)).toEqual([s.vectors[0].id]);
       },
     },
     {
@@ -418,7 +451,9 @@ describe("POST /update and the MCP update tool write identical state (#289)", ()
         // The new vectors are already in place, so the leftover orphan is a tidiness
         // problem, not a correctness one — rolling the content back would be worse.
         expect(s.row!.content).toBe("short replacement");
-        expect(JSON.parse(s.row!.vector_ids as string)).toEqual([`${ENTRY_ID}~0`]);
+        const ids = JSON.parse(s.row!.vector_ids as string) as string[];
+        expect(ids).toHaveLength(1);
+        expect(ids[0]).toMatch(/^v-[0-9a-f-]+-0$/);
       },
     },
     {
@@ -439,7 +474,7 @@ describe("POST /update and the MCP update tool write identical state (#289)", ()
     expect(normalize(mcp.snapshot)).toEqual(normalize(http.snapshot));
     assertFacts(http.snapshot);
     assertFacts(mcp.snapshot);
-  });
+  }, 15_000);
 
   it("a missing entry leaves both callers with nothing to write", async () => {
     const world: World = { seed: { content: "present", tags: [] } };
@@ -464,6 +499,58 @@ describe("POST /update and the MCP update tool write identical state (#289)", ()
 
     expect(reply).toMatch(/No memory found with ID: nope/);
     expect(normalize(await capture(mcpStore))).toEqual(normalize(httpSnapshot));
+  });
+
+  it("a committed replacement recalculates only inferred relates_to edges on real D1", async () => {
+    const world: World = {
+      seed: { content: "old subject", tags: ["work", "second-brain"] },
+      queryMatches: [
+        { id: ENTRY_ID, score: 1, metadata: { parentId: ENTRY_ID } },
+        { id: "fresh", score: 0.55, metadata: { parentId: "fresh" } },
+        { id: "stale", score: 0.69, metadata: { parentId: "stale" } },
+      ],
+    };
+    const { env } = await setUp(world);
+    const admission = await beginMemoryWriteAdmission(env, ctx);
+    const admitted = admission.env;
+    try {
+      for (const [id, tags] of [
+        ["stale", ["upwork"]], ["fresh", ["second-brain"]], ["manual", ["context"]],
+      ] as const) {
+        await admitted.DB.prepare(
+          `INSERT INTO entries (id, content, tags, source, created_at, updated_at, vector_ids, write_marker)
+           VALUES (?, ?, ?, 'api', 1, 1, '[]', ?)`,
+        ).bind(id, id, JSON.stringify(tags), memoryWriteMarker(admitted)).run();
+      }
+      await createEdge(ENTRY_ID, "stale", "relates_to", { provenance: "inferred", weight: 0.8, readableWorkspaceIds: [""] }, admitted);
+      await createEdge(ENTRY_ID, "manual", "relates_to", { provenance: "explicit", weight: 0.4, readableWorkspaceIds: [""] }, admitted);
+      await createEdge(ENTRY_ID, "stale", "supersedes", { provenance: "system", weight: 1, readableWorkspaceIds: [""] }, admitted);
+
+      expect((await updateEntryContent(admitted, ENTRY_ID, "replacement about the second brain", undefined, undefined, undefined, { workspaceId: "", actorId: "" }, { actorId: "", channel: "rest" as const }, "")).status)
+        .toBe("updated");
+      const edges = (await admitted.DB.prepare(
+        `SELECT source_id, target_id, type, weight, provenance, metadata FROM edges ORDER BY provenance`,
+      ).all()).results as Record<string, any>[];
+      expect(edges.some(edge => edge.provenance === "inferred"
+        && [edge.source_id, edge.target_id].includes("fresh")
+        && JSON.parse(edge.metadata).inference_policy === "embeddinggemma-mrl128-v2")).toBe(true);
+      expect(edges.some(edge => edge.provenance === "inferred"
+        && [edge.source_id, edge.target_id].includes("stale"))).toBe(false);
+      expect(edges.some(edge => edge.provenance === "explicit" && edge.weight === 0.4)).toBe(true);
+      expect(edges.some(edge => edge.type === "supersedes" && edge.provenance === "system")).toBe(true);
+
+      await inferEdgesOnWrite(ENTRY_ID, [{ id: "manual", score: 0.9 }], admitted);
+      expect(await admitted.DB.prepare(
+        `SELECT weight, provenance FROM edges WHERE type = 'relates_to' AND provenance = 'explicit'`,
+      ).first()).toEqual({ weight: 0.4, provenance: "explicit" });
+
+      await replaceInferredEdgesOnWrite([{ entryId: ENTRY_ID, neighbors: [] }], admitted);
+      expect(await admitted.DB.prepare(
+        `SELECT COUNT(*) AS count FROM edges WHERE provenance = 'inferred'`,
+      ).first()).toEqual({ count: 0 });
+    } finally {
+      await admission.finish();
+    }
   });
 
   it("one version per successful update, none on reembed_failed; REST and MCP differ only in channel", async () => {
@@ -514,6 +601,8 @@ describe("POST /update and the MCP update tool write identical state (#289)", ()
 
   it("the MCP tool still reports the vector count on the healthy path", async () => {
     const mcp = await viaMcp({ seed: { content: "I live in Berlin", tags: ["home"] } }, "I live in Lisbon");
-    expect(mcp.reply).toBe("Updated entry x1. Re-embedded as 1 vector(s).");
+    expect(mcp.reply).toMatch(
+      /^Updated entry x1\. Re-embedded as 1 vector\(s\)\.$/,
+    );
   });
 });

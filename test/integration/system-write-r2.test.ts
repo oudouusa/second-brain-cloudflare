@@ -4,6 +4,7 @@ import { runWeeklyInsights } from "../../src/insight/weekly";
 import { resetDatabaseInit, initializeDatabase } from "../../src/db/init";
 import { makeTestEnv, makeMemoryKV, makeVectorizeMock } from "../helpers/make-env";
 import { makeSqliteD1, type SqliteD1 } from "../helpers/sqlite-d1";
+import { pricingInsight, PRICING_INSIGHTS } from "../helpers/insight-fixture";
 import type { Env } from "../../src/env";
 
 const DAY = 86400000;
@@ -21,9 +22,9 @@ function makeAI(decision: () => string) {
   return {
     run: vi.fn().mockImplementation(async (model: string, opts: any) => {
       // R20's batchEmbeds sends every chunk in one call: answer with one vector per requested text.
-      if (model.startsWith("@cf/baai/bge")) {
+      if (model === "@cf/google/embeddinggemma-300m") {
         const texts = Array.isArray(opts?.text) ? opts.text : [opts?.text];
-        return { data: texts.map(() => new Array(384).fill(0.1)) };
+        return { data: texts.map(() => new Array(768).fill(0.1)) };
       }
       const prompt = String(opts?.messages?.[0]?.content ?? "");
       if (prompt.includes("Choose exactly one action") || prompt.includes("checking if a new memory contradicts")) return sse(decision());
@@ -44,12 +45,12 @@ describe("ADV systemWrite", () => {
     vi.spyOn(Date, "now").mockImplementation(() => now);
     resetDatabaseInit();
     sqlite = makeSqliteD1();
-    env = makeTestEnv(undefined, {
+    env = sqlite.admitEnv(makeTestEnv(undefined, {
       DB: sqlite.db as any, AI: makeAI(() => decision()), OAUTH_KV: makeMemoryKV(),
       VECTORIZE: makeVectorizeMock({ query: vi.fn().mockImplementation(async () => ({ matches: target ? [{ id: target, score, metadata: { parentId: target } }] : [] })) }),
-    }) as Env;
+    })) as Env;
     await initializeDatabase(env);
-    for (let i = 0; i < 12; i++) sqlite.seed({ id: `w-${i}`, content: `Memory about work number ${i}`, createdAt: now - 200 * DAY + i, tags: ["work"] });
+    for (let i = 0; i < 12; i++) sqlite.seed({ id: `w-${i}`, content: `Memory about work number ${i}`, createdAt: now - 200 * DAY + i, tags: ["rocket-project"] });
   });
   afterEach(() => { sqlite.close(); vi.restoreAllMocks(); });
 
@@ -66,7 +67,7 @@ describe("ADV systemWrite", () => {
     const base = ai.run.getMockImplementation();
     ai.run.mockImplementation(async (model: string, opts: any) => {
       const prompt = String(opts?.messages?.[0]?.content ?? "");
-      if (prompt.includes("Memory A:")) return sse('{"insight": true, "shape": "contradiction", "text": "You priced this tier at nine dollars flat, then moved it entirely to usage-based billing."}');
+      if (prompt.includes("Memory A:")) return sse(pricingInsight(PRICING_INSIGHTS["0"]));
       return base(model, opts);
     });
   }
@@ -75,7 +76,7 @@ describe("ADV systemWrite", () => {
     sqlite.seed({ id: "ins", content: "You priced work at nine dollars then moved to usage billing.\n\n[Insight: contradiction — drawn from 2 memories]", createdAt: now - 3 * DAY, tags: ["auto-insight"], source: "system" });
     target = "ins"; score = 0.9;
     decision = () => JSON.stringify({ action: "replace", target_id: "ins" });
-    await compressTag("work", env, ctx);
+    await compressTag("rocket-project", env, ctx);
     const rows = sqlite.rows();
     // The digest lands as its own row and the sources roll up onto THAT, not onto the recall-hidden insight.
     const digest = rows.find(x => String(x.tags).includes('"synthesized"'))!;
@@ -87,7 +88,7 @@ describe("ADV systemWrite", () => {
   });
 
   it("F2: an insight cannot merge into a digest either", async () => {
-    sqlite.seed({ id: "dig", content: "[Synthesized from 12 entries tagged \"work\"]\n\nA digest", createdAt: now - 3 * DAY, tags: ["synthesized", "work"], source: "system" });
+    sqlite.seed({ id: "dig", content: "[Synthesized from 12 entries tagged \"rocket-project\"]\n\nA digest", createdAt: now - 3 * DAY, tags: ["synthesized", "rocket-project"], source: "system" });
     seedPair();
     target = "dig"; score = 0.9;
     decision = () => JSON.stringify({ action: "merge", target_id: "dig", merged_content: "digest plus model guess" });
@@ -126,7 +127,7 @@ describe("ADV systemWrite", () => {
   });
 
   it("N: a user edit landing between the merge's read and its UPDATE survives; the system text lands as its own row", async () => {
-    sqlite.seed({ id: "old-digest", content: "Older digest", createdAt: now - 3 * DAY, tags: ["synthesized", "work"], source: "system" });
+    sqlite.seed({ id: "old-digest", content: "Older digest", createdAt: now - 3 * DAY, tags: ["synthesized", "rocket-project"], source: "system" });
     target = "old-digest"; score = 0.9;
     decision = () => JSON.stringify({ action: "merge", target_id: "old-digest", merged_content: "combined digest text" });
     const upserts: { id: string; metadata: any }[] = [];
@@ -138,13 +139,13 @@ describe("ADV systemWrite", () => {
     const realPrepare = db.prepare.bind(db);
     let raced = false;
     db.prepare = (sql: string) => {
-      if (!raced && sql.startsWith("UPDATE entries AS e SET content = ")) {
+      if (!raced && sql.startsWith("UPDATE entries AS e SET write_marker = ") && sql.includes(", content = ")) {
         raced = true;
-        sqlite.db.prepare(`UPDATE entries SET content = 'MY EDIT', tags = '["synthesized","work","user-edited"]' WHERE id = 'old-digest'`).run();
+        sqlite.db.prepare(`UPDATE entries SET content = 'MY EDIT', tags = '["synthesized","rocket-project","user-edited"]' WHERE id = 'old-digest'`).run();
       }
       return realPrepare(sql);
     };
-    await compressTag("work", env, ctx);
+    await compressTag("rocket-project", env, ctx);
     expect(raced).toBe(true);
     const rows = sqlite.rows();
     const mine = rows.find(x => x.id === "old-digest")!;
@@ -170,24 +171,31 @@ describe("ADV systemWrite", () => {
     vz.getByIds = async (ids: string[]) => ids.filter(i => store.has(i)).map(i => ({ id: i, values: [], metadata: store.get(i) }));
     return store;
   }
-  function raceOnMergeUpdate(action: () => void) {
-    const db = env.DB as any; const real = db.prepare.bind(db); let raced = false;
+  function raceOnMergeUpdate(action: () => void | Promise<void>) {
+    const db = env.DB as any;
+    const prepare = db.prepare.bind(db), batch = db.batch.bind(db);
+    let ready = false, raced = false;
     db.prepare = (sql: string) => {
-      if (!raced && sql.startsWith("UPDATE entries AS e SET content = ")) { raced = true; action(); }
-      return real(sql);
+      if (!raced && sql.startsWith("UPDATE entries AS e SET write_marker = ") && sql.includes(", content = ")) ready = true;
+      return prepare(sql);
     };
+    db.batch = async (statements: unknown[]) => {
+      if (ready && !raced) { raced = true; await action(); }
+      return batch(statements);
+    };
+    return () => raced;
   }
-  const LONG = "combined digest text ".repeat(200); // multi-chunk merge
+  const LONG = "combined digest text ".repeat(10); // forkの400文字以内のmerge契約
 
   it("P2: lost merge + restore embed failure leaves the user row indexed by the system text", async () => {
-    sqlite.seed({ id: "d", content: "Older digest", createdAt: now - 3 * DAY, tags: ["synthesized", "work"], source: "system", vectorIds: ["d"] });
+    sqlite.seed({ id: "d", content: "Older digest", createdAt: now - 3 * DAY, tags: ["synthesized", "rocket-project"], source: "system", vectorIds: ["d"] });
     const store = statefulVectors(); store.set("d", { content: "Older digest", parentId: "d" });
     target = "d"; score = 0.9;
     decision = () => JSON.stringify({ action: "merge", target_id: "d", merged_content: LONG });
     const ai = env.AI as any; const base = ai.run.getMockImplementation(); let failEmbeds = false;
-    ai.run.mockImplementation(async (m: string, o: any) => { if (failEmbeds && m.startsWith("@cf/baai/bge")) throw new Error("embed 503"); return base(m, o); });
-    raceOnMergeUpdate(() => { sqlite.db.prepare(`UPDATE entries SET content = 'MY EDIT', tags = '["synthesized","work","user-edited"]' WHERE id = 'd'`).run(); failEmbeds = true; });
-    await compressTag("work", env, ctx);
+    ai.run.mockImplementation(async (m: string, o: any) => { if (failEmbeds && m === "@cf/google/embeddinggemma-300m") throw new Error("embed 503"); return base(m, o); });
+    raceOnMergeUpdate(() => { sqlite.db.prepare(`UPDATE entries SET content = 'MY EDIT', tags = '["synthesized","rocket-project","user-edited"]' WHERE id = 'd'`).run(); failEmbeds = true; });
+    await compressTag("rocket-project", env, ctx);
     // No vector of the lost merge's system text survives under the user's row.
     expect([...store.values()].filter(m => m.parentId === "d").every(m => !String(m.content).includes("combined digest"))).toBe(true);
     // Round 6: the lost merge only deleted its own upload, so the row still lists (and has) its own vector.
@@ -196,37 +204,38 @@ describe("ADV systemWrite", () => {
   });
 
   it("P3: row forgotten during the merge re-embed leaves the merge's vectors orphaned", async () => {
-    sqlite.seed({ id: "d", content: "Older digest", createdAt: now - 3 * DAY, tags: ["synthesized", "work"], source: "system", vectorIds: ["d"] });
+    sqlite.seed({ id: "d", content: "Older digest", createdAt: now - 3 * DAY, tags: ["synthesized", "rocket-project"], source: "system", vectorIds: ["d"] });
     const store = statefulVectors(); store.set("d", { content: "Older digest", parentId: "d" });
     target = "d"; score = 0.9;
     decision = () => JSON.stringify({ action: "merge", target_id: "d", merged_content: LONG });
-    raceOnMergeUpdate(() => { sqlite.db.prepare(`DELETE FROM entries WHERE id = 'd'`).run(); store.delete("d"); });
-    await compressTag("work", env, ctx);
+    const raced = raceOnMergeUpdate(() => { return sqlite.deleteFixtureRows(`DELETE FROM entries WHERE id = 'd'`).then(() => { store.delete("d"); }); });
+    await compressTag("rocket-project", env, ctx);
+    expect(raced()).toBe(true);
     expect([...store.entries()].filter(([, m]) => m.parentId === "d").map(([k]) => k)).toEqual([]); // gets d-chunk-0..2
   });
 
   it("I: a legacy row (empty actor, ordinary source) a user tagged synthesized is not a system row", async () => {
-    sqlite.seed({ id: "legacy", content: "My own note that I tagged synthesized", createdAt: now - 3 * DAY, tags: ["synthesized", "work"], source: "api" });
+    sqlite.seed({ id: "legacy", content: "My own note that I tagged synthesized", createdAt: now - 3 * DAY, tags: ["synthesized", "rocket-project"], source: "api" });
     target = "legacy"; score = 0.9;
     decision = () => JSON.stringify({ action: "merge", target_id: "legacy", merged_content: "combined digest text" });
-    await compressTag("work", env, ctx);
+    await compressTag("rocket-project", env, ctx);
     expect(String(sqlite.rows().find(x => x.id === "legacy")!.content)).toBe("My own note that I tagged synthesized");
   });
 
   it("J: appending to a digest also marks it user-edited, so the next digest leaves it alone", async () => {
     const { appendToEntry } = await import("../../src/capture/store");
-    sqlite.seed({ id: "old-digest", content: "Older digest", createdAt: now - 3 * DAY, tags: ["synthesized", "work"], source: "system" });
-    await appendToEntry(env, "old-digest", "Older digest", "my addendum", ["synthesized", "work"], "system", undefined, undefined, { workspaceId: "", actorId: "u1" }, { actorId: "u1", channel: "rest" }, undefined, "");
+    sqlite.seed({ id: "old-digest", content: "Older digest", createdAt: now - 3 * DAY, tags: ["synthesized", "rocket-project"], source: "system" });
+    await appendToEntry(env, "old-digest", "Older digest", "my addendum", ["synthesized", "rocket-project"], "system", undefined, undefined, { workspaceId: "", actorId: "u1" }, { actorId: "u1", channel: "rest" }, undefined, "");
     expect(JSON.parse(String(sqlite.rows().find(x => x.id === "old-digest")!.tags))).toContain("user-edited");
     target = "old-digest"; score = 0.9;
     decision = () => JSON.stringify({ action: "merge", target_id: "old-digest", merged_content: "combined digest text" });
-    await compressTag("work", env, ctx);
+    await compressTag("rocket-project", env, ctx);
     expect(String(sqlite.rows().find(x => x.id === "old-digest")!.content)).toContain("my addendum");
   });
 
   it("K: a user capture that merges into a digest marks it user-edited", async () => {
     const { captureEntry } = await import("../../src/capture/entry");
-    sqlite.seed({ id: "old-digest", content: "Older digest", createdAt: now - 3 * DAY, tags: ["synthesized", "work"], source: "system" });
+    sqlite.seed({ id: "old-digest", content: "Older digest", createdAt: now - 3 * DAY, tags: ["synthesized", "rocket-project"], source: "system" });
     target = "old-digest"; score = 0.9;
     decision = () => JSON.stringify({ action: "merge", target_id: "old-digest", merged_content: "digest with my fact" });
     const r = await captureEntry("my fact", [], "api", env, ctx, undefined, { workspaceId: "", actorId: "u1" });
@@ -243,11 +252,11 @@ describe("ADV systemWrite", () => {
 
   it("G: an owner-edited digest is no longer a system row, so the next digest leaves the edit alone", async () => {
     const { updateEntryContent } = await import("../../src/capture/store");
-    sqlite.seed({ id: "old-digest", content: "Older digest", createdAt: now - 3 * DAY, tags: ["synthesized", "work"], source: "system" });
+    sqlite.seed({ id: "old-digest", content: "Older digest", createdAt: now - 3 * DAY, tags: ["synthesized", "rocket-project"], source: "system" });
     await updateEntryContent(env, "old-digest", "MY OWN CORRECTION: the launch is in March, not May", undefined, undefined, undefined, { workspaceId: "", actorId: "owner" }, { actorId: "owner", channel: "rest" }, "");
     target = "old-digest"; score = 0.9;
     decision = () => JSON.stringify({ action: "merge", target_id: "old-digest", merged_content: "combined digest text" });
-    await compressTag("work", env, ctx);
+    await compressTag("rocket-project", env, ctx);
     expect(String(sqlite.rows().find(x => x.id === "old-digest")!.content)).toContain("MY OWN CORRECTION"); // the digest text does not replace it
   });
 });

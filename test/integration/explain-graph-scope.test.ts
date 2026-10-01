@@ -6,6 +6,7 @@
  * (why.graph.from, MCP "linked from", REST related_to).
  */
 import { it, expect, vi } from 'vitest';
+import { embeddingMetadata } from '../../src/embedding/profile';
 import worker from '../../src/index';
 import { makeExplainFixture, NOW } from '../helpers/explain-fixture';
 import { createMember } from '../../src/lib/team-admin';
@@ -17,7 +18,7 @@ import { renderRecallText } from '../../src/recall/render';
 
 const ctx = { waitUntil: (_: Promise<unknown>) => {} } as ExecutionContext;
 const TEAM_B = 'ws-adv-team-b';
-const vec = (id: string, score: number) => ({ id, score, metadata: { parentId: id, created_at: NOW - 86_400_000, tags: [] } });
+const vec = (id: string, score: number) => ({ id, score, metadata: { ...embeddingMetadata(), parentId: id, created_at: NOW - 86_400_000, tags: [] } });
 
 type Mode = 'personal' | 'company' | 'team' | 'graph' | 'graphForeign' | 'keyword';
 async function run(mode: Mode, foreign: boolean) {
@@ -51,7 +52,7 @@ async function run(mode: Mode, foreign: boolean) {
       const result = await recallEntries({query:'atlas ledger',topK:5,hops:1,synthesize:false,explain:true},f.env,ctx,undefined,{identity,workspaceFilter:'personal',variant:{arms:'dense-only'}});
       return {status:200,rows:result.matches.map(r=>({id:r.id,why:r.why,hop:r.hop})),mcpText:renderRecallText(result.matches,''),offText:renderRecallText(result.matches.map(r=>({...r,why:undefined})),''),sawFiltered,sawRetry};
     }
-    const response = await worker.fetch(new Request(`http://localhost/recall?query=atlas%20ledger&topK=5&explain=1&${qs}`, { headers: { Authorization: `Bearer ${bob.token}` } }), f.env, ctx);
+    const response = await worker.fetch(new Request("http://localhost/recall", { method: "POST", body: JSON.stringify({ query: "atlas ledger", topK: 5, explain: true, ...Object.fromEntries(new URLSearchParams(qs)) }), headers: { "Content-Type": "application/json", Authorization: `Bearer ${bob.token}` } }), f.env, ctx);
     const body = await response.json() as any;
     return {status: response.status, rows: body.results?.map((r: any) => ({id:r.id, why:r.why, hop:r.hop})), sawFiltered, sawRetry};
   } finally { f.close(); }

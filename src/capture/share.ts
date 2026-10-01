@@ -2,6 +2,7 @@ import type { Env } from "../env";
 import type { Identity } from "../lib/identity";
 import { isCompanyWorkspace, scopeWhere, scopeWrite } from "../lib/scope";
 import { VECTORIZE_GET_BY_IDS_BATCH } from "../constants";
+import { memoryWriteMarker } from "../migration/write-lock";
 import type { ChangeContext } from "../lib/audit";
 import { changesOf } from "../memory/versions";
 import { resolveConfig } from "../config";
@@ -79,12 +80,12 @@ export async function moveEntry(
          FROM entries e WHERE e.id = ? AND e.workspace_id = ?`
     ).bind(crypto.randomUUID(), change.actorId, event, targetWorkspaceId, change.channel, Date.now(), id, row.workspace_id),
     // versioning: exempt: a move changes location, not content, tags or when_*
-    env.DB.prepare(`UPDATE entries SET workspace_id = ? WHERE id = ? AND workspace_id = ?`)
-      .bind(targetWorkspaceId, id, row.workspace_id),
+    env.DB.prepare(`UPDATE entries SET workspace_id = ?, write_marker = ? WHERE id = ? AND workspace_id = ?`)
+      .bind(targetWorkspaceId, memoryWriteMarker(env), id, row.workspace_id),
     // Edges carry denormalized workspace metadata and must move with the entry, and only that
     // entry's own edges as of this same read — pinned the same way as the row itself.
-    env.DB.prepare(`UPDATE edges SET workspace_id = ? WHERE (source_id = ? OR target_id = ?) AND workspace_id = ?`)
-      .bind(targetWorkspaceId, id, id, row.workspace_id),
+    env.DB.prepare(`UPDATE edges SET workspace_id = ?, write_marker = ? WHERE (source_id = ? OR target_id = ?) AND workspace_id = ?`)
+      .bind(targetWorkspaceId, memoryWriteMarker(env), id, id, row.workspace_id),
   ]);
 
   if (changesOf(results[1]) === 0) {

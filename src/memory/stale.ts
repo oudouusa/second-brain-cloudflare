@@ -1,5 +1,6 @@
 import { withoutVolatility } from "./volatility";
-import { currentValidityAt, SQL_NOW_MS } from "./validity";
+import { currentValidityAt } from "./validity";
+import { SQL_NOW_MS } from "../constants";
 import { RETRACTED_SOURCE_TAG } from "../tags/system";
 
 export const STALE_AS_OF = "stale:as-of";

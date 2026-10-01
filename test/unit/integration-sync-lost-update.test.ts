@@ -14,12 +14,13 @@ const imapHooks = vi.hoisted(() => ({
   onSearch: async (): Promise<void> => {},
   fail: false,
 }));
-vi.mock("../../src/integrations/imap", () => ({
+vi.mock("../../src/integrations/imap", async (importOriginal) => ({
+  ...await importOriginal<typeof import("../../src/integrations/imap")>(),
   ImapClient: {
     connect: async () => ({
       login: async () => {},
-      selectInbox: async () => ({ exists: 1 }),
-      uidSearchSince: async () => {
+      selectInbox: async () => ({ exists: 1, uidNext: 8, uidValidity: 1 }),
+      uidSearchRangeSince: async () => {
         await imapHooks.onSearch();
         if (imapHooks.fail) throw new Error("imap search exploded");
         return [7];

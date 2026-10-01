@@ -8,17 +8,24 @@
  * — new qualifying messages are captured once (deduped by Message-ID) and kept.
  */
 import PostalMime from "postal-mime";
-import { ImapClient } from "./imap";
+import {
+  ImapClient,
+  ImapLiteralTooLargeError,
+  MAX_IMAP_BODY_BYTES,
+  MAX_IMAP_SEARCH_UID_SPAN,
+} from "./imap";
 import type { IntegrationEnv, IntegrationProvider, IntegrationRecord, MirrorStore, SyncOutcome } from "./framework";
 import { loadIntegration, updateIntegration } from "./framework";
 
 const DAY_MS = 86_400_000;
-export const FIRST_SYNC_LOOKBACK_MS = 7 * DAY_MS;  // how far back the very first sync reaches
+export const FIRST_SYNC_LOOKBACK_MS = 7 * DAY_MS;  // first sync: up to 7 days within the newest bounded UID span
 const OVERLAP_MS = 2 * DAY_MS;                      // re-scan window each sync (dedup covers repeats)
-export const EMAIL_FETCH_BATCH = 5;                // full-body fetches per sync call; caller loops on `remaining`
+export const EMAIL_FETCH_BATCH = 1;                // one fenced mirror write per Free-plan invocation
+export const EMAIL_HEADER_PAGE_SIZE = 1;           // an oversized header can be skipped without stranding later UIDs
+const INITIAL_UID_LOOKBACK_SPAN = 2048;             // first sync: newest bounded UID window within seven days
 const MAX_EMAIL_CHARS = 4000;
 const MAX_INGESTED_IDS = 500;                       // bound the dedupe set kept in the record
-const MAX_EMAIL_BYTES = 1_000_000;                  // skip messages larger than this (big attachments) to avoid timeouts/OOM
+export const MAX_EMAIL_BYTES = MAX_IMAP_BODY_BYTES; // checked at header, literal and received-byte boundaries
 
 const HEADER_FIELDS = [
   "MESSAGE-ID", "FROM", "SUBJECT", "DATE",
@@ -118,8 +125,12 @@ export function looksBulk(headers: Record<string, string>): boolean {
 // sender, and not already ingested. Oldest-first so partial batches converge.
 export function computeEmailPlan(headers: EmailHeaderInfo[], ingestedIds: Set<string>): EmailHeaderInfo[] {
   return headers
-    .filter((h) => !h.bulk && !isNoiseSender(h.from) && (!h.messageId || !ingestedIds.has(h.messageId)))
+    .filter((h) => !h.bulk && !isNoiseSender(h.from) && !ingestedIds.has(emailIdentity(h)))
     .sort((a, b) => a.uid - b.uid);
+}
+
+function emailIdentity(header: Pick<EmailHeaderInfo, "messageId" | "uid">): string {
+  return header.messageId || `uid:${header.uid}`;
 }
 
 // ─── Body extraction + cleaning ─────────────────────────────────────────────
@@ -220,12 +231,17 @@ export async function validateEmailToken(token: string, host: string): Promise<s
   }
 }
 
-function getConfig(record: IntegrationRecord): { checkpoint?: number; ingestedIds?: string[] } {
+function getConfig(record: IntegrationRecord): {
+  checkpoint?: number;
+  ingestedIds?: string[];
+  scanAfterUid?: number;
+  uidValidity?: number;
+} {
   const c = record.config as any;
   return c && typeof c === "object" ? c : {};
 }
 
-async function runEmailSync(env: IntegrationEnv, store: MirrorStore, svc: EmailService): Promise<SyncOutcome> {
+export async function runEmailSync(env: IntegrationEnv, store: MirrorStore, svc: EmailService): Promise<SyncOutcome> {
   const record = await loadIntegration(env, svc.id);
   if (!record) return { ok: false, error: `${svc.name} is not connected` };
 
@@ -251,10 +267,59 @@ async function runEmailSync(env: IntegrationEnv, store: MirrorStore, svc: EmailS
   try {
     client = await ImapClient.connect(svc.host);
     await client.login(creds.email, creds.appPassword);
-    await client.selectInbox();
+    const mailbox = await client.selectInbox();
+    if (mailbox.uidValidity !== undefined && cfg.uidValidity !== mailbox.uidValidity) {
+      // UIDs are scoped to UIDVALIDITY. A mailbox rebuild may reuse low UIDs;
+      // retaining the old cursor would silently skip new messages.
+      cfg.scanAfterUid = undefined;
+      cfg.uidValidity = mailbox.uidValidity;
+      for (const identity of ingestedIds) {
+        if (identity.startsWith("uid:")) ingestedIds.delete(identity);
+      }
+    }
 
-    const uids = await client.uidSearchSince(searchSince);
-    const headerMsgs = await client.uidFetchHeaders(uids, HEADER_FIELDS);
+    if (mailbox.uidNext === undefined) throw new Error("IMAP server did not provide UIDNEXT");
+    const mailboxMaxUid = mailbox.uidNext - 1;
+    const initialFloor = Math.max(1, mailboxMaxUid - INITIAL_UID_LOOKBACK_SPAN + 1);
+    const firstUid = (cfg.scanAfterUid ?? (initialFloor - 1)) + 1;
+    const lastUid = Math.min(firstUid + MAX_IMAP_SEARCH_UID_SPAN - 1, mailboxMaxUid);
+    const uids = firstUid <= lastUid
+      ? await client.uidSearchRangeSince(searchSince, firstUid, lastUid)
+      : [];
+    const pageUids = uids.slice(0, EMAIL_HEADER_PAGE_SIZE);
+    let headerMsgs;
+    try {
+      headerMsgs = await client.uidFetchHeaders(pageUids, HEADER_FIELDS);
+    } catch (error) {
+      if (!(error instanceof ImapLiteralTooLargeError) || pageUids.length !== 1) throw error;
+      // The connection was closed before allocating the declared literal. With
+      // one UID per header page we can durably skip exactly that message and
+      // continue from the following UID on the next invocation.
+      cfg.scanAfterUid = pageUids[0];
+      ingestedIds.add(`uid:${pageUids[0]}`);
+      cfg.ingestedIds = [...ingestedIds].slice(-MAX_INGESTED_IDS);
+      (record.config as any) = cfg;
+      record.status = "connected";
+      record.lastSyncedAt = now;
+      record.lastSyncError = null;
+      record.updatedAt = now;
+      await updateIntegration(env, svc.id, (r) => {
+        r.config = { ...r.config, scanAfterUid: cfg.scanAfterUid, uidValidity: cfg.uidValidity, ingestedIds: cfg.ingestedIds };
+        r.status = record.status;
+        r.lastSyncedAt = record.lastSyncedAt;
+        r.lastSyncError = record.lastSyncError;
+        r.updatedAt = record.updatedAt;
+      });
+      return {
+        ok: true,
+        created: 0,
+        updated: 0,
+        deleted: 0,
+        failed: 0,
+        remaining: pageUids[0] < mailboxMaxUid ? 1 : 0,
+        total: 1,
+      };
+    }
     const headers: EmailHeaderInfo[] = headerMsgs.map((m) => ({
       uid: m.uid,
       size: m.size,
@@ -268,44 +333,63 @@ async function runEmailSync(env: IntegrationEnv, store: MirrorStore, svc: EmailS
     const plan = computeEmailPlan(headers, ingestedIds);
     const batch = plan.slice(0, EMAIL_FETCH_BATCH);
 
-    let created = 0, failed = 0;
+    let created = 0, failed = 0, processed = 0;
     for (const h of batch) {
       try {
-        if (h.size && h.size > MAX_EMAIL_BYTES) {
+        const identity = emailIdentity(h);
+        if (h.size !== undefined && h.size > MAX_EMAIL_BYTES) {
           // Skip large messages (usually big attachments): fetching them risks
           // timeouts/OOM. Mark seen so they don't linger in the candidate set.
-          if (h.messageId) ingestedIds.add(h.messageId);
+          ingestedIds.add(identity);
+          processed++;
           continue;
         }
         const raw = await client.uidFetchBody(h.uid);
         if (!raw) { failed++; continue; }
+        // Defense in depth for a missing/incorrect RFC822.SIZE and custom IMAP
+        // implementations. Never hand an oversized payload to PostalMime.
+        if (raw.byteLength > MAX_EMAIL_BYTES) {
+          ingestedIds.add(identity);
+          processed++;
+          continue;
+        }
         const parsed = await extractEmail(raw);
         const body = cleanEmailBody(parsed.text);
         const content = buildEmailContent(parsed.subject || h.subject, parsed.from || h.from, parsed.date || h.date, body);
         await store.createEntry(content, ["email", svc.id], svc.id);
         created++;
-        if (h.messageId) ingestedIds.add(h.messageId);
+        processed++;
+        ingestedIds.add(identity);
       } catch (e) {
+        if (e instanceof ImapLiteralTooLargeError) {
+          ingestedIds.add(emailIdentity(h));
+          processed++;
+          continue;
+        }
         console.error(`Email ingest failed for uid ${h.uid} (non-fatal):`, e);
         failed++;
       }
     }
 
-    const remaining = plan.length - batch.length;
-    // Only advance the checkpoint once the whole candidate set is drained, so a
-    // partial batch re-searches the same window next run. Keep a 2-day overlap
-    // so nothing slips through day-boundary/timing gaps — dedupe absorbs repeats.
-    const checkpoint = remaining === 0 ? now - OVERLAP_MS : undefined;
-    const nextIngestedIds = [...ingestedIds].slice(-MAX_INGESTED_IDS);
-
-    // checkpoint and ingestedIds are the only config keys email owns (getConfig
-    // reads nothing else). Applied to a freshly read record so a layer change
-    // landing during the IMAP round trips isn't written back over (#348).
+    const remainingCandidates = plan.length - processed;
+    const pageDrained = remainingCandidates === 0;
+    const lastPageUid = pageUids.at(-1);
+    if (pageDrained) cfg.scanAfterUid = lastPageUid ?? lastUid;
+    const hasUnscannedUids = (cfg.scanAfterUid ?? 0) < mailboxMaxUid;
+    const remaining = remainingCandidates + (hasUnscannedUids ? 1 : 0);
+    // Advance the date checkpoint only after every UID returned for this scan is
+    // classified. Keep the UID cursor across overlap scans; newly delivered mail
+    // always receives a higher UID, including mail with an older Date header.
+    if (remaining === 0) cfg.checkpoint = now - OVERLAP_MS;
+    cfg.ingestedIds = [...ingestedIds].slice(-MAX_INGESTED_IDS);
+    // 同期カーソルだけを最新レコードへ反映し、保存先設定を巻き戻さない。
     await updateIntegration(env, svc.id, (r) => {
       r.config = {
         ...r.config,
-        ingestedIds: nextIngestedIds,
-        ...(checkpoint !== undefined ? { checkpoint } : {}),
+        ingestedIds: cfg.ingestedIds,
+        checkpoint: cfg.checkpoint,
+        scanAfterUid: cfg.scanAfterUid,
+        uidValidity: cfg.uidValidity,
       };
       r.status = "connected";
       r.lastSyncedAt = now;

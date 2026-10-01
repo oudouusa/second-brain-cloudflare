@@ -33,7 +33,7 @@ describe("vector ids", () => {
 
   it("two writers embedding the same content upload disjoint ids; the one whose read went stale loses and deletes only its own", async () => {
     t = await makeTrashEnv();
-    t.seed("e", { content: "same text" });
+    t.seed("e", { content: "same text", created_at: 1 });
     const ctx = { workspaceId: t.roots.ownerPersonalWorkspaceId, actorId: t.roots.ownerUserId };
     const deleted: string[] = [];
     const del = t.env.VECTORIZE.deleteByIds.bind(t.env.VECTORIZE);
@@ -67,7 +67,7 @@ describe("vector ids", () => {
     await runNightlyVectorizePending(t.env, DEFAULTS);
     expect(await listed("d")).toEqual(winner);
     for (const v of winner) expect(present.has(v), v).toBe(true);
-    expect([...present].filter((v) => parentIdOfVectorId(v) === "d")).toEqual(winner); // the loser left nothing behind
+    expect([...present]).toEqual(winner); // the loser left nothing behind
   });
 });
 
@@ -84,7 +84,7 @@ describe("structural", () => {
       if (f.file === "memory/trash.ts") continue; // deterministicVectorIds: reads 3.7 ids for Delete forever, never uploads
       expect(f.src, f.file).not.toMatch(/-chunk-\$\{|-update-\$\{/);
     }
-    expect(all.find((f) => f.file === "capture/store.ts")!.src).toMatch(/import \{ newVectorIds as mintVectorIds \} from "\.\.\/vectorize\/ids"/);
+    expect(all.find((f) => f.file === "capture/store.ts")!.src).toContain("crypto.randomUUID()");
   });
 
   it("every UPDATE that replaces vector_ids also compare-and-sets the vector_ids it read (the row decides which upload won)", () => {

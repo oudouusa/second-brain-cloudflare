@@ -70,8 +70,8 @@ describe("member removal keeps history consistent", () => {
     const total = MEMBER_HISTORY_CHUNK * MEMBER_HISTORY_MAX_CHUNKS + 500;
     await t.sqlite.db.exec(`
       WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ${total})
-      INSERT INTO entry_versions (entry_id, workspace_id, seq, content, prior_length, tags, actor_id, channel, reason, created_at)
-      SELECT 'big', '${P}', i, 'v', NULL, '[]', '', 'rest', 'update', i FROM n`);
+      INSERT INTO entry_versions (entry_id, workspace_id, seq, content, prior_length, tags, actor_id, channel, reason, created_at, write_marker)
+      SELECT 'big', '${P}', i, 'v', NULL, '[]', '', 'rest', 'update', i, '${t.sqlite.fixtureMarker()}' FROM n`);
 
     const first = await remove(m.userId);
     expect(first.status).toBe(202);
@@ -104,8 +104,8 @@ describe("member removal keeps history consistent", () => {
     t.seed("big", { workspace_id: P, actor_id: m.userId });
     await t.sqlite.db.exec(`
       WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 3500)
-      INSERT INTO entry_versions (entry_id, workspace_id, seq, content, prior_length, tags, actor_id, channel, reason, created_at)
-      SELECT 'big', '${P}', i, 'v', NULL, '[]', '', 'rest', 'update', i FROM n`);
+      INSERT INTO entry_versions (entry_id, workspace_id, seq, content, prior_length, tags, actor_id, channel, reason, created_at, write_marker)
+      SELECT 'big', '${P}', i, 'v', NULL, '[]', '', 'rest', 'update', i, '${t.sqlite.fixtureMarker()}' FROM n`);
     t.sqlite.issued.length = 0;
     await remove(m.userId);
     expect(t.sqlite.issued.filter((s) => /SELECT DISTINCT entry_id FROM entry_versions/.test(s))).toHaveLength(1);
@@ -118,8 +118,8 @@ describe("member removal keeps history consistent", () => {
     await seedVersionsFor(t, [], 0);
     await t.sqlite.db.exec(`
       WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 10500)
-      INSERT INTO entry_versions (entry_id, workspace_id, seq, content, prior_length, tags, actor_id, channel, reason, created_at)
-      SELECT 'big', '${P}', i, 'v', NULL, '[]', '', 'rest', 'update', i FROM n`);
+      INSERT INTO entry_versions (entry_id, workspace_id, seq, content, prior_length, tags, actor_id, channel, reason, created_at, write_marker)
+      SELECT 'big', '${P}', i, 'v', NULL, '[]', '', 'rest', 'update', i, '${t.sqlite.fixtureMarker()}' FROM n`);
     expect((await remove(m.userId)).status).toBe(202);
 
     const night = await runNightlyCleanup(t.env);
@@ -141,8 +141,8 @@ describe("member removal keeps history consistent", () => {
     await seedVersionsFor(t, [], 0);
     await t.sqlite.db.exec(`
       WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 10500)
-      INSERT INTO entry_versions (entry_id, workspace_id, seq, content, prior_length, tags, actor_id, channel, reason, created_at)
-      SELECT 'big', '${P}', i, 'v', NULL, '[]', '', 'rest', 'update', i FROM n`);
+      INSERT INTO entry_versions (entry_id, workspace_id, seq, content, prior_length, tags, actor_id, channel, reason, created_at, write_marker)
+      SELECT 'big', '${P}', i, 'v', NULL, '[]', '', 'rest', 'update', i, '${t.sqlite.fixtureMarker()}' FROM n`);
     expect((await remove(m.userId)).status).toBe(202);
 
     // The nightly run finishes the D1 side (done:true) and its own vector delete is capped.
@@ -165,8 +165,8 @@ describe("member removal keeps history consistent", () => {
       t.seed(id, { workspace_id: m.personalWorkspaceId, actor_id: m.userId });
       await t.sqlite.db.exec(`
         WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 12000)
-        INSERT INTO entry_versions (entry_id, workspace_id, seq, content, prior_length, tags, actor_id, channel, reason, created_at)
-        SELECT '${id}', '${m.personalWorkspaceId}', i, 'v', NULL, '[]', '', 'rest', 'update', i FROM n`);
+        INSERT INTO entry_versions (entry_id, workspace_id, seq, content, prior_length, tags, actor_id, channel, reason, created_at, write_marker)
+        SELECT '${id}', '${m.personalWorkspaceId}', i, 'v', NULL, '[]', '', 'rest', 'update', i, '${t.sqlite.fixtureMarker()}' FROM n`);
     }
     // Claim both removals (each answers 202 and leaves history behind).
     expect((await remove(m1.userId)).status).toBe(202);
@@ -180,8 +180,8 @@ describe("member removal keeps history consistent", () => {
     expect(night.removalResumed).toBe(true);
     expect(before - after).toBe(2000);
     expect(night.rowsWritten).toBeLessThanOrEqual(NIGHTLY_CLEANUP_ROWS);
-    // Pinned: purge read 1, probe 1, id reads 2, chunks 3 (1,000 + 1,000 + the empty one), vector read 1,
-    // counts 1, final batch 1, member_removed audit 1. A full 10-chunk night is 18.
-    expect(executions).toBe(11);
+    // forkではbatch内各statementも数える。履歴3chunkのmarker UPDATEとDELETE、
+    // 最終batchのentry/trash/edge markerを含め24文。書込予算は上の実消去数でも検査する。
+    expect(executions).toBe(24);
   });
 });

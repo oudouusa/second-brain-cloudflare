@@ -23,6 +23,7 @@ import { runWeeklyInsights } from "../../src/insight/weekly";
 import { resetDatabaseInit, initializeDatabase } from "../../src/db/init";
 import { makeTestEnv, makeMemoryKV, makeVectorizeMock } from "../helpers/make-env";
 import { makeSqliteD1, type SqliteD1 } from "../helpers/sqlite-d1";
+import { pricingInsight, PRICING_INSIGHTS } from "../helpers/insight-fixture";
 import type { Env } from "../../src/env";
 
 const DAY = 86400000;
@@ -39,10 +40,10 @@ function makeAI() {
   });
   return {
     run: vi.fn().mockImplementation(async (model: string, opts: any) => {
-      if (model === "@cf/baai/bge-small-en-v1.5") return { data: [new Array(384).fill(0.1)] };
+      if (model === "@cf/google/embeddinggemma-300m") return { data: [new Array(768).fill(0.1)] };
       const prompt = String(opts?.messages?.[0]?.content ?? "");
       if (prompt.includes("Memory A:")) {
-        return sse('{"insight": true, "shape": "contradiction", "text": "You priced this tier at nine dollars flat, then moved it entirely to usage-based billing."}');
+        return sse(pricingInsight(PRICING_INSIGHTS["0"]));
       }
       return opts?.stream ? sse("A digest of the work memories.") : { response: "3" };
     }),
@@ -58,9 +59,9 @@ describe("system jobs declare themselves to captureEntry", () => {
     vi.spyOn(Date, "now").mockReturnValue(NOW);
     resetDatabaseInit();
     sqlite = makeSqliteD1();
-    env = makeTestEnv(undefined, {
+    env = sqlite.admitEnv(makeTestEnv(undefined, {
       DB: sqlite.db as any, AI: makeAI(), OAUTH_KV: makeMemoryKV(), VECTORIZE: makeVectorizeMock(),
-    }) as Env;
+    })) as Env;
     await initializeDatabase(env);
   });
 
@@ -68,9 +69,9 @@ describe("system jobs declare themselves to captureEntry", () => {
 
   it("the digest passes systemWrite with a system:digest channel", async () => {
     for (let i = 0; i < 12; i++) {
-      sqlite.seed({ id: `w-${i}`, content: `Memory about work number ${i}`, createdAt: NOW - 200 * DAY + i, tags: ["work"] });
+      sqlite.seed({ id: `w-${i}`, content: `Memory about work number ${i}`, createdAt: NOW - 200 * DAY + i, tags: ["rocket-project"] });
     }
-    await compressTag("work", env, ctx);
+    await compressTag("rocket-project", env, ctx);
     expect(seen).toHaveLength(1);
     expect(seen[0].source).toBe("system");
     expect(seen[0].opts).toEqual({ systemWrite: "digest", channel: "system:digest" });

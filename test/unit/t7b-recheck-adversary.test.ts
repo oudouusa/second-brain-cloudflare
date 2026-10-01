@@ -71,8 +71,9 @@ describe("Track 7 lane B budget adversary", () => {
     const env = makeTestEnv(dbOf(sq) as any, { OAUTH_KV: makeMemoryKV() });
     const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(null, { status: 201 }));
 
-    await pushDueItemsAllWorkspaces(env, cfg);
-    await pushDueItemsAllWorkspaces(env, cfg);
+    // forkは1回4workspace。11回で41workspaceを一巡し、重複送信もしない。
+    for (let i = 0; i < Math.ceil(41 / 4); i++) await pushDueItemsAllWorkspaces(env, cfg);
+    expect(fetchSpy).toHaveBeenCalledTimes(82);
 
     expect(fetchSpy.mock.calls.map(([url]) => url)).toContain("https://push.example/ws-40-sub-0");
   });

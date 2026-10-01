@@ -1,13 +1,34 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { runInsightAccrual, ACCRUAL_CURSOR_KEY, isEligiblePair } from "../../src/insight/candidates";
+import { runInsightAccrual as runInsightAccrualImpl, ACCRUAL_CURSOR_KEY, isEligiblePair } from "../../src/insight/candidates";
 import { scoreCandidate, type ScorableEntry } from "../../src/insight/score";
 import { makeTestEnv, makeVectorizeMock, makeMemoryKV } from "../helpers/make-env";
 import { makeSqliteD1, type SqliteD1 } from "../helpers/sqlite-d1";
 import type { Env } from "../../src/env";
+import { readDerivedStateGeneration } from "../../src/migration/write-lock";
+import { beginMemoryWriteAdmission } from "../../src/migration/write-lock";
 
 const DAY = 86400000;
 const NOW = 400 * DAY;
 const ctx = { waitUntil: () => {} } as unknown as ExecutionContext;
+
+async function runInsightAccrual(env: Env, executionCtx: ExecutionContext) {
+  const pending: Promise<unknown>[] = [];
+  const localCtx = Object.create(executionCtx) as ExecutionContext;
+  localCtx.waitUntil = promise => { pending.push(Promise.resolve(promise)); };
+  const admitted = await beginMemoryWriteAdmission(env, localCtx);
+  // These tests intentionally freeze Date.now() to 1971-era domain timestamps. SQLite's
+  // trigger clock remains real wall time, so make the test capability non-expiring.
+  await admitted.env.DB.prepare(
+    `UPDATE memory_write_admissions SET expires_at = ? WHERE token = ?`,
+  ).bind(Number.MAX_SAFE_INTEGER, admitted.env.WRITE_ADMISSION_TOKEN).run();
+  try {
+    const result = await runInsightAccrualImpl(admitted.env, admitted.ctx);
+    await Promise.allSettled(pending);
+    return result;
+  } finally {
+    await admitted.finish();
+  }
+}
 
 const SEED_TEXT = "A long enough decision about the pricing model to clear the eligibility floor, in full.";
 const OLD_TEXT = "An earlier position on how the pricing model should work, written at real length.";
@@ -56,7 +77,7 @@ function makeEnv(sqlite: SqliteD1, matches: any[], kv = makeMemoryKV()): Env {
     // only ever coincidentally matched single-seed tests; any scenario with
     // more than one seed needs each seed's own head vector to resolve.
     getByIds: vi.fn().mockImplementation(async (ids: string[]) =>
-      ids.map(id => ({ id, values: new Array(384).fill(0.1) }))),
+      ids.map(id => ({ id, values: new Array(128).fill(0.1) }))),
     query: vi.fn().mockResolvedValue({ matches }),
   });
   return makeTestEnv(undefined, { DB: sqlite.db as any, VECTORIZE: vectorize, OAUTH_KV: kv });
@@ -69,13 +90,22 @@ async function candidateCount(sqlite: SqliteD1): Promise<number> {
   return row.n;
 }
 
+async function putCurrentCursor(
+  sqlite: SqliteD1,
+  kv: KVNamespace,
+  cursor: { createdAt: number; id: string },
+): Promise<void> {
+  const generation = await readDerivedStateGeneration({ DB: sqlite.db } as unknown as Env);
+  await kv.put(ACCRUAL_CURSOR_KEY, JSON.stringify({ ...cursor, generation }));
+}
+
 describe("runInsightAccrual()", () => {
   let sqlite: SqliteD1;
 
   beforeEach(() => {
     vi.spyOn(Date, "now").mockReturnValue(NOW);
     sqlite = makeSqliteD1();
-    sqlite.db.prepare(`ALTER TABLE entries ADD COLUMN valid_until INTEGER`).run();
+    expect(sqlite.columns()).toContain("valid_until");
     sqlite.seed({
       id: "seed-1", content: SEED_TEXT, createdAt: NOW,
       tags: ["pricing"], source: "claude-desktop",
@@ -89,6 +119,41 @@ describe("runInsightAccrual()", () => {
     seedNeighbour(sqlite);
     await runInsightAccrual(makeEnv(sqlite, [match()]), ctx);
     expect(await candidateCount(sqlite)).toBe(1);
+  });
+
+  it("packs the real 15-by-10 maximum into 13 INSERT statements below 50 D1 queries", async () => {
+    const kv = makeMemoryKV();
+    await putCurrentCursor(sqlite, kv, { createdAt: NOW - 2 * DAY, id: "" });
+    for (let i = 0; i < 14; i++) {
+      sqlite.seed({
+        id: `seed-max-${String(i).padStart(2, "0")}`,
+        content: `${SEED_TEXT} Seed ${i}.`,
+        createdAt: NOW,
+        tags: ["pricing"],
+        source: "claude-desktop",
+        vectorIds: [`vec-seed-max-${i}`],
+      });
+    }
+    for (let i = 0; i < 10; i++) {
+      seedNeighbour(sqlite, {
+        id: `old-max-${i}`,
+        content: `${OLD_TEXT} Neighbour ${i}.`,
+        createdAt: NOW - 90 * DAY,
+      });
+    }
+    const matches = Array.from({ length: 10 }, (_, i) => match({
+      id: `vec-old-max-${i}`,
+      score: 0.9,
+      metadata: { parentId: `old-max-${i}` },
+    }));
+    const before = sqlite.issued.length;
+
+    await runInsightAccrual(makeEnv(sqlite, matches, kv), ctx);
+
+    const issued = sqlite.issued.slice(before);
+    expect(await candidateCount(sqlite)).toBe(150);
+    expect(issued.filter(sql => sql.includes("INSERT INTO insight_candidates"))).toHaveLength(13);
+    expect(issued.length).toBeLessThan(50);
   });
 
   it("normalises the pair so ids are stored in a stable order", async () => {
@@ -167,7 +232,7 @@ describe("runInsightAccrual()", () => {
     seedNeighbour(sqlite);
     await runInsightAccrual(makeEnv(sqlite, [match()], kv), ctx);
     const cursor = JSON.parse((await kv.get(ACCRUAL_CURSOR_KEY))!) as { createdAt: number; id: string };
-    expect(cursor).toEqual({ createdAt: NOW, id: "seed-1" });
+    expect(cursor).toMatchObject({ createdAt: NOW, id: "seed-1", generation: expect.any(String) });
   });
 
   it("leaves the cursor untouched when Vectorize is unavailable", async () => {
@@ -202,7 +267,7 @@ describe("runInsightAccrual()", () => {
     const kv = makeMemoryKV();
     // Push the cursor past the default seed-1 so this run's window contains
     // only the row below.
-    await kv.put(ACCRUAL_CURSOR_KEY, JSON.stringify({ createdAt: NOW, id: "seed-1" }));
+    await putCurrentCursor(sqlite, kv, { createdAt: NOW, id: "seed-1" });
     sqlite.seed({
       id: "too-short", content: "short.", createdAt: NOW + DAY,
       tags: ["pricing"], source: "claude-desktop", vectorIds: ["vec-too-short"], importanceScore: 0,
@@ -214,7 +279,7 @@ describe("runInsightAccrual()", () => {
     // floor) — not skipped. Holding the cursor here would re-read it, and
     // only it, forever.
     const cursor = JSON.parse((await kv.get(ACCRUAL_CURSOR_KEY))!) as { createdAt: number; id: string };
-    expect(cursor).toEqual({ createdAt: NOW + DAY, id: "too-short" });
+    expect(cursor).toMatchObject({ createdAt: NOW + DAY, id: "too-short", generation: expect.any(String) });
   });
 
   it("keeps a same-timestamp tie from being lost across the batch boundary", async () => {
@@ -247,7 +312,7 @@ describe("runInsightAccrual()", () => {
       tags: ["pricing"], source: "claude-desktop", vectorIds: ["vec-seed-2"], importanceScore: 0,
     });
     // Sitting exactly on seed-1's own position.
-    await kv.put(ACCRUAL_CURSOR_KEY, JSON.stringify({ createdAt: NOW, id: "seed-1" }));
+    await putCurrentCursor(sqlite, kv, { createdAt: NOW, id: "seed-1" });
 
     const env = makeEnv(sqlite, [], kv);
     await runInsightAccrual(env, ctx);
@@ -259,10 +324,30 @@ describe("runInsightAccrual()", () => {
     expect(cursorAfter.id).toBe("seed-2");
   });
 
+  it("ignores an eventually-consistent cursor from an older D1 generation", async () => {
+    const kv = makeMemoryKV();
+    const oldGeneration = await readDerivedStateGeneration({ DB: sqlite.db } as unknown as Env);
+    await kv.put(ACCRUAL_CURSOR_KEY, JSON.stringify({
+      createdAt: NOW,
+      id: "seed-1",
+      generation: oldGeneration,
+    }));
+    const newGeneration = "generation-after-restore";
+    await sqlite.db.prepare(
+      `UPDATE embedding_migration_generation SET generation = ? WHERE id = 'embedding-v1'`,
+    ).bind(newGeneration).run();
+
+    const summary = await runInsightAccrual(makeEnv(sqlite, [], kv), ctx);
+
+    expect(summary.seedsExamined).toBe(1);
+    const cursorAfter = JSON.parse((await kv.get(ACCRUAL_CURSOR_KEY))!);
+    expect(cursorAfter).toMatchObject({ createdAt: NOW, id: "seed-1", generation: newGeneration });
+  });
+
   it("writes the cursor as the newest examined seed's own timestamp, not the wall clock", async () => {
     sqlite.close();
     sqlite = makeSqliteD1();
-    sqlite.db.prepare(`ALTER TABLE entries ADD COLUMN valid_until INTEGER`).run();
+    expect(sqlite.columns()).toContain("valid_until");
     const earlier = NOW - 2 * DAY;
     const later = NOW - DAY;
     sqlite.seed({
@@ -289,7 +374,7 @@ describe("runInsightAccrual()", () => {
     // throwing or resolving to nothing — the caller (POST /insights/accrue)
     // always gets a shape it can report, even on a broken run.
     await expect(
-      runInsightAccrual(makeTestEnv(undefined, { DB: broken, OAUTH_KV: makeMemoryKV() }), ctx),
+      runInsightAccrualImpl(makeTestEnv(undefined, { DB: broken, OAUTH_KV: makeMemoryKV() }), ctx),
     ).resolves.toEqual({ seedsExamined: 0 });
   });
 
@@ -394,8 +479,8 @@ describe("runInsightAccrual()", () => {
        VALUES ('edge-explicit', 'explicit-a', 'explicit-b', 'supersedes', 1.0, 'explicit', '{}', ?, ?)`,
     ).bind(NOW, NOW).run();
 
-    // One shared live source, 12 distinct deprecated targets, 12 system
-    // edges — more than the LIMIT 10 the query applies. All 12 edges are
+    // One shared live source, 11 distinct deprecated targets, 11 system
+    // edges — more than the LIMIT 10 the query applies. All 11 edges are
     // newer than the explicit edge above, so an unfiltered top-10-by-recency
     // window is filled entirely by these before the explicit edge is ever
     // reached. (The source is shared, not distinct per edge, purely to keep
@@ -406,7 +491,7 @@ describe("runInsightAccrual()", () => {
       id: "sys-src", createdAt: NOW - 60 * DAY, tags: ["pricing"],
       content: "A perfectly ordinary system-edge source entry, long enough to clear the content floor easily.",
     });
-    for (let i = 0; i < 12; i++) {
+    for (let i = 0; i < 11; i++) {
       const tgt = `sys-tgt-${i}`;
       sqlite.seed({
         id: tgt, createdAt: NOW - 150 * DAY, tags: ["pricing", "status:deprecated"],
@@ -452,7 +537,7 @@ describe("runInsightAccrual()", () => {
       // subset, on that path too.
       sqlite.close();
       sqlite = makeSqliteD1();
-      sqlite.db.prepare(`ALTER TABLE entries ADD COLUMN valid_until INTEGER`).run();
+      expect(sqlite.columns()).toContain("valid_until");
       sqlite.seed({
         id: "too-short", content: "short.", createdAt: NOW,
         tags: ["pricing"], source: "claude-desktop", vectorIds: ["vec-too-short"], importanceScore: 0,
@@ -464,7 +549,7 @@ describe("runInsightAccrual()", () => {
     it("is zero when the window itself is empty", async () => {
       sqlite.close();
       sqlite = makeSqliteD1();
-      sqlite.db.prepare(`ALTER TABLE entries ADD COLUMN valid_until INTEGER`).run();
+      expect(sqlite.columns()).toContain("valid_until");
       const summary = await runInsightAccrual(makeEnv(sqlite, []), ctx);
       expect(summary).toEqual({ seedsExamined: 0 });
     });

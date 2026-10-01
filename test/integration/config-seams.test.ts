@@ -10,7 +10,8 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { DEFAULTS } from "../../src/config";
 import { allowanceFor } from "../../src/recall/snippet";
 import { compressionEligibilitySql } from "../../src/compression/eligibility";
-import { embed } from "../../src/lib/ai";
+import { embedDocument } from "../../src/lib/ai";
+import { EMBEDDING_PROFILE, embeddingMetadata } from "../../src/embedding/profile";
 import { expandGraph } from "../../src/graph/traverse";
 import { checkDuplicateAndContradiction } from "../../src/capture/duplicate";
 import { makeTestEnv, makeTestDb, makeVectorizeMock } from "../helpers/make-env";
@@ -61,22 +62,26 @@ describe("seam: compression eligibility (eligibility.ts)", () => {
 });
 
 describe("seam: embedding model (ai.ts)", () => {
-  it("embeds with the configured model", async () => {
-    const run = vi.fn().mockResolvedValue({ data: [[0.1, 0.2]] });
+  it("embeds with the fixed profile model and document prompt", async () => {
+    const run = vi.fn().mockResolvedValue({ data: [new Array(768).fill(0.1)] });
     const env = makeTestEnv(undefined, { AI: { run } as never });
 
-    await embed("hello", env, { ...DEFAULTS, EMBEDDING_MODEL: "@cf/some/other-model" });
+    await embedDocument("hello", env);
 
-    expect(run.mock.calls[0][0]).toBe("@cf/some/other-model");
+    expect(run.mock.calls[0]).toEqual([
+      EMBEDDING_PROFILE.model,
+      { text: ["title: none | text: hello"] },
+    ]);
   });
 
-  it("falls back to the shipped model when no config is passed", async () => {
-    const run = vi.fn().mockResolvedValue({ data: [[0.1]] });
+  it("rejects a model override that does not match the fixed profile", async () => {
+    const run = vi.fn();
     const env = makeTestEnv(undefined, { AI: { run } as never });
 
-    await embed("hello", env);
+    await expect(embedDocument("hello", env, { ...DEFAULTS, EMBEDDING_MODEL: "@cf/some/other-model" }))
+      .rejects.toThrow(/unsupported embedding model/);
 
-    expect(run.mock.calls[0][0]).toBe(DEFAULTS.EMBEDDING_MODEL);
+    expect(run).not.toHaveBeenCalled();
   });
 });
 
@@ -127,10 +132,10 @@ describe("seam: graph expansion (traverse.ts)", () => {
 describe("seam: duplicate detection (duplicate.ts)", () => {
   function envWithTopScore(score: number) {
     return makeTestEnv(makeTestDb(), {
-      AI: { run: vi.fn().mockResolvedValue({ data: [[0.1]] }) } as never,
+      AI: { run: vi.fn().mockResolvedValue({ data: [new Array(768).fill(0.1)] }) } as never,
       VECTORIZE: makeVectorizeMock({
         query: vi.fn().mockResolvedValue({
-          matches: [{ id: "dup", score, metadata: { parentId: "dup" } }],
+          matches: [{ id: "dup", score, metadata: { parentId: "dup", ...embeddingMetadata() } }],
         }),
       }),
     });

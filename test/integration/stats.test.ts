@@ -116,6 +116,28 @@ describe("GET /stats — vectorization fields", () => {
     expect(data.vectorize_grace_ms).toBe(300000);
   });
 
+  it("reports queued append passages separately from full-entry indexing", async () => {
+    db.entries.push({
+      id: "append-pending",
+      content: "content plus durable append",
+      tags: "[]",
+      source: "api",
+      created_at: Date.now(),
+      vector_ids: '["existing-vector"]',
+      pending_append_passages: JSON.stringify([
+        { id: "passage", content: "durable append", createdAt: Date.now() },
+      ]),
+      recall_count: 0,
+      importance_score: 0,
+    });
+
+    const res = await worker.fetch(req("GET", "/stats"), env, ctx);
+    const data = await res.json() as any;
+
+    expect(data.unvectorized).toBe(0);
+    expect(data.pending_append_passages).toBe(1);
+  });
+
   it("uses VECTORIZE_GRACE_MS env var when set", async () => {
     env = makeTestEnv(db, { VECTORIZE_GRACE_MS: "60000" });
     // entry that is 90 seconds old — past the 60s grace but within default 300s
@@ -171,25 +193,40 @@ describe("GET /stats — digest candidates", () => {
     return { id, content: `c ${id}`, tags: JSON.stringify([tag]), source: "api", created_at: Date.now(), vector_ids: "[]", recall_count: 0, importance_score: 0, contradiction_wins: 0 };
   }
 
+  it("汎用分類タグを要約候補から外し、通常のタグ表示と元記憶は維持する", async () => {
+    for (let i = 0; i < 12; i++) db.entries.push({
+      ...compressible(`e-${i}`, "project-atlas"),
+      tags: JSON.stringify(["project-atlas", "work", "task", "idea", "context", "personal", "codex-response"]),
+    });
+    const before = structuredClone(db.entries);
+    const res = await worker.fetch(req("GET", "/stats"), env, ctx);
+    const data = await res.json() as { top_tags: string[]; digest_candidates: { tag: string; count: number }[] };
+    expect(data.top_tags).toContain("work");
+    expect(data.top_tags).toContain("project-atlas");
+    expect(data.digest_candidates).toEqual([{ tag: "project-atlas", count: 12 }]);
+    expect(db.entries.map(e => ({ content: e.content, tags: e.tags })))
+      .toEqual(before.map(e => ({ content: e.content, tags: e.tags })));
+  });
+
   it("reports a tag with >10 eligible entries as a digest candidate", async () => {
-    for (let i = 0; i < 11; i++) db.entries.push(compressible(`e-${i}`, "work"));
+    for (let i = 0; i < 11; i++) db.entries.push(compressible(`e-${i}`, "project-atlas"));
     const res = await worker.fetch(req("GET", "/stats"), env, ctx);
     const data = await res.json() as any;
-    expect(data.digest_candidates.some((c: any) => c.tag === "work" && c.count === 11)).toBe(true);
+    expect(data.digest_candidates.some((c: any) => c.tag === "project-atlas" && c.count === 11)).toBe(true);
   });
 
   it("does not report a tag whose entries are all recall-protected", async () => {
-    for (let i = 0; i < 11; i++) db.entries.push({ ...compressible(`e-${i}`, "work"), recall_count: 5 });
+    for (let i = 0; i < 11; i++) db.entries.push({ ...compressible(`e-${i}`, "project-atlas"), recall_count: 5 });
     const res = await worker.fetch(req("GET", "/stats"), env, ctx);
     const data = await res.json() as any;
-    expect(data.digest_candidates.some((c: any) => c.tag === "work")).toBe(false);
+    expect(data.digest_candidates.some((c: any) => c.tag === "project-atlas")).toBe(false);
   });
 
   it("does not report a tag whose entries are all contradiction survivors", async () => {
-    for (let i = 0; i < 11; i++) db.entries.push({ ...compressible(`e-${i}`, "work"), contradiction_wins: 1 });
+    for (let i = 0; i < 11; i++) db.entries.push({ ...compressible(`e-${i}`, "project-atlas"), contradiction_wins: 1 });
     const res = await worker.fetch(req("GET", "/stats"), env, ctx);
     const data = await res.json() as any;
-    expect(data.digest_candidates.some((c: any) => c.tag === "work")).toBe(false);
+    expect(data.digest_candidates.some((c: any) => c.tag === "project-atlas")).toBe(false);
   });
 
   // /stats reports what the nightly run would compress, so it has to apply the same rule.
@@ -197,20 +234,20 @@ describe("GET /stats — digest candidates", () => {
   // high counts and would otherwise sit at the top of a list of "digest candidates" that
   // can never produce a digest.
   //
-  // Scope: this runs against the D1 mock, whose digest-candidate branch calls isTopicTag(),
+  // Scope: this runs against the D1 mock, whose digest-candidate branch calls isCompressionTag(),
   // so it covers the predicate rather than the SQL /stats actually issues. The query itself
   // is covered by test/integration/digest-candidates.test.ts against real SQLite.
   it("excludes reserved namespaced tags (kind:* / status:* / volatility:* / stale:as-of) from digest candidates", async () => {
     for (let i = 0; i < 12; i++) {
       db.entries.push({
-        ...compressible(`e-${i}`, "work"),
-        tags: JSON.stringify(["work", "kind:semantic", "status:canonical", "volatility:state", "stale:as-of"]),
+        ...compressible(`e-${i}`, "project-atlas"),
+        tags: JSON.stringify(["project-atlas", "kind:semantic", "status:canonical", "volatility:state", "stale:as-of"]),
       });
     }
     const res = await worker.fetch(req("GET", "/stats"), env, ctx);
     const data = await res.json() as any;
     const tags = data.digest_candidates.map((c: any) => c.tag);
-    expect(tags).toContain("work");                  // topical tag still a candidate
+    expect(tags).toContain("project-atlas");                  // topical tag still a candidate
     expect(tags).not.toContain("kind:semantic");     // namespaced excluded
     expect(tags).not.toContain("status:canonical");  // namespaced excluded
     expect(tags).not.toContain("volatility:state");  // written by the staleness pass

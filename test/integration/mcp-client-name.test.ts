@@ -7,8 +7,8 @@
  * test/unit/client-label.test.ts).
  */
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { Client } from "@modelcontextprotocol/client";
+import { InMemoryTransport } from "@modelcontextprotocol/client";
 import worker from "../../src/index";
 import { buildMcpServer } from "../../src/mcp/server";
 import type { McpClientProps } from "../../src/mcp/client-label";
@@ -67,9 +67,10 @@ beforeEach(async () => {
   resetDatabaseInit();
   pending = [];
   sqlite = makeSqliteD1();
-  env = makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV() });
+  env = sqlite.admitEnv(makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV() }));
   await initializeDatabase(env);
   await ensureTenantBootstrap(env);
+  env = sqlite.admitEnv(env);
   identity = (await resolveIdentityFromToken("test-token", env))!;
 });
 afterEach(async () => { await Promise.all(pending); sqlite?.close(); });

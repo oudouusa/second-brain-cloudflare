@@ -1,3 +1,4 @@
+import { assertMemoryWritesAllowed, memoryWriteMarker } from "../migration/write-lock";
 import type { Env } from "../env";
 import type { Config } from "../config";
 import { CHUNK_MAX_CHARS, CHUNK_OVERLAP_CHARS, MIRRORED_SOURCES } from "../constants";
@@ -37,7 +38,7 @@ export interface PendingRow {
  * row's content or workspace changed during the embed: the upload is settled and the row stays pending. */
 export async function indexPendingRow(env: Env, row: PendingRow, cfg: Readonly<Config>): Promise<boolean> {
   const stored = await storeEntry(env, row.id, row.content, JSON.parse(row.tags), row.source, row.created_at, cfg,
-    { workspaceId: row.workspace_id, actorId: row.actor_id }, { expectedVectorIds: "[]" });
+    { workspaceId: row.workspace_id, actorId: row.actor_id }, { expectedVectorIds: "[]", expectedTagsJson: row.tags, expectedSource: row.source, expectedCreatedAt: row.created_at, existingContent: true });
   return stored.committed !== false;
 }
 
@@ -81,6 +82,7 @@ async function readFailures(env: Env): Promise<FailureCounts> {
  */
 export async function runNightlyVectorizePending(
   env: Env, cfg: Readonly<Config> | (() => Promise<Readonly<Config>>),
+  opts: { maxRows?: number } = {},
 ): Promise<{ processed: number; failed: number }> {
   // One statement, always one row: how many deferred rows are over the cap, and the queue (rows within
   // it, demoted rows last) as a JSON array, re-sorted below so order never rests on aggregate order.
@@ -93,7 +95,7 @@ export async function runNightlyVectorizePending(
                  FROM (SELECT id, length(content) AS len, source, created_at, (id IN (SELECT value FROM json_each(?))) AS demoted
                          FROM entries WHERE ${PENDING_WHERE} AND length(CAST(content AS BLOB)) <= ?
                         ORDER BY demoted ASC, created_at ASC, id LIMIT ?) q) AS queue`,
-    ).bind(cutoff, VECTORIZE_PENDING_NIGHTLY_MAX_BYTES, JSON.stringify(demoted), cutoff, VECTORIZE_PENDING_NIGHTLY_MAX_BYTES, VECTORIZE_PENDING_NIGHTLY_ROWS)
+    ).bind(cutoff, VECTORIZE_PENDING_NIGHTLY_MAX_BYTES, JSON.stringify(demoted), cutoff, VECTORIZE_PENDING_NIGHTLY_MAX_BYTES, Math.max(1, Math.min(VECTORIZE_PENDING_NIGHTLY_ROWS, opts.maxRows ?? VECTORIZE_PENDING_NIGHTLY_ROWS)))
       .first<{ oversize: number; queue: string | null }>();
     type Queued = { id: string; len: number; source: string; created_at: number; demoted: number };
     let results: Queued[] = [];
@@ -145,38 +147,14 @@ export async function runNightlyVectorizePending(
   };
 
   let failed = 0;
-  const upserted: { row: PendingRow; vectorIds: string[] }[] = [];
+  let processed = 0;
   for (const row of rows) {
     try {
-      const stored = await upsertEntryVectors(env, row.id, row.content, JSON.parse(row.tags), row.source, row.created_at, config,
-        { workspaceId: row.workspace_id, actorId: row.actor_id }, { batchEmbeds: true });
-      upserted.push({ row, vectorIds: stored.vectorIds });
+      if (await indexPendingRow(env, row, config)) { processed++; indexedIds.push(row.id); }
     } catch (e) {
       console.error("Nightly re-embed failed for entry", row.id, e);
       failedIds.push(row.id);
       failed++;
-    }
-  }
-  if (!upserted.length) return finish(0, failed);
-  // CAS on the content AND the workspace the vectors were stamped for (round 5), and on the row still
-  // being pending (round 6): whoever committed first won, and a loser discards only its own upload.
-  // Codex review, T-0102 D4: also gated on INDEXABLE_SQL, checked at commit time -- the same
-  // concurrent hold/deprecate-during-embed race store.ts's storeEntry closes, here for the
-  // nightly backfill's own vector_ids write.
-  const written = await env.DB.batch(upserted.map(({ row, vectorIds }) => env.DB.prepare(
-    // versioning: exempt: vector bookkeeping
-    `UPDATE entries SET vector_ids = ? WHERE id = ? AND content = ? AND workspace_id = ? AND vector_ids = '[]' AND ${INDEXABLE_SQL}`,
-  ).bind(JSON.stringify(vectorIds), row.id, row.content, row.workspace_id)));
-  let processed = 0;
-  for (let i = 0; i < upserted.length; i++) {
-    if (changedRows(written[i]) > 0) { processed++; indexedIds.push(upserted[i].row.id); continue; }
-    // Lost the CAS (content edited, row shared or moved, or another writer committed first): this
-    // upload's ids are its own, so delete them; a still-pending row retries next night.
-    const { row, vectorIds } = upserted[i];
-    try {
-      await discardUpload(env, row.id, vectorIds);
-    } catch (e) {
-      console.error("Nightly re-embed settle failed for entry", row.id, e);
     }
   }
   return finish(processed, failed);

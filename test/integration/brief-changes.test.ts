@@ -26,7 +26,7 @@ describe("getChanges() (S1)", () => {
 
   beforeEach(() => {
     sqlite = makeSqliteD1();
-    env = { DB: sqlite.db as unknown as Env["DB"] } as Env;
+    env = sqlite.admitEnv({ DB: sqlite.db as unknown as Env["DB"] } as Env);
     now = Date.UTC(2026, 8, 27, 12, 0, 0);
     vi.spyOn(Date, "now").mockReturnValue(now);
   });
@@ -300,9 +300,9 @@ describe("getChanges() (S1)", () => {
     // alongside the main read, batched together -- two prepared statements, one D1 call, the same
     // way this codebase counts every other batched write (sqlite.issued collapses a whole
     // .batch() to one "BATCH" entry; a raw vi.spyOn(prepare) count would see two and mislead).
-    sqlite.issued.length = 0;
+    sqlite.executions.length = 0;
     await getChanges(env, identityOf("u1", "ws-p"));
-    expect(sqlite.issued).toEqual(["BATCH"]);
+    expect(sqlite.executions).toEqual(["BATCH"]);
   });
 
   it("hides a reused id's earlier life: only events after the latest purge/tier-3-delete show, by insertion order, not created_at (round 3 re-review MAJOR)", async () => {
@@ -572,7 +572,7 @@ describe("a teammate's burst cannot crowd out this reader's own changes or a hel
 
   beforeEach(() => {
     sqlite = makeSqliteD1();
-    env = { DB: sqlite.db as unknown as Env["DB"] } as Env;
+    env = sqlite.admitEnv({ DB: sqlite.db as unknown as Env["DB"] } as Env);
     now = Date.UTC(2026, 8, 27, 12, 0, 0);
     vi.spyOn(Date, "now").mockReturnValue(now);
   });
@@ -598,10 +598,10 @@ describe("a teammate's burst cannot crowd out this reader's own changes or a hel
   async function seedBurst() {
     for (let start = 0; start < 1500; start += 500) {
       await sqlite.db.prepare(
-        `INSERT INTO entries (id, content, tags, source, created_at, vector_ids, workspace_id, actor_id)
+        `INSERT INTO entries (id, content, tags, source, created_at, vector_ids, workspace_id, actor_id, write_marker)
          WITH RECURSIVE c(x) AS (SELECT ? UNION ALL SELECT x + 1 FROM c WHERE x < ?)
-         SELECT 'noise-e'||x, 'noise memory '||x, '["work"]', 'api', ? - 40 * 3600000 - x, '["v"]', 'ws-p', 'u2' FROM c`,
-      ).bind(start + 1, Math.min(start + 500, 1500), now).run();
+         SELECT 'noise-e'||x, 'noise memory '||x, '["work"]', 'api', ? - 40 * 3600000 - x, '["v"]', 'ws-p', 'u2', ? FROM c`,
+      ).bind(start + 1, Math.min(start + 500, 1500), now, sqlite.fixtureMarker()).run();
       await sqlite.db.prepare(
         `INSERT INTO entry_events (id, entry_id, actor_id, event, payload, created_at)
          WITH RECURSIVE c(x) AS (SELECT ? UNION ALL SELECT x + 1 FROM c WHERE x < ?)

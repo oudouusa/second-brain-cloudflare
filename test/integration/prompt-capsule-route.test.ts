@@ -1,3 +1,4 @@
+import { embeddingMetadata } from "../../src/embedding/profile";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Env } from "../../src/env";
 import { resetDatabaseInit, initializeDatabase } from "../../src/db/init";
@@ -6,8 +7,8 @@ import { createMember } from "../../src/lib/team-admin";
 import { createProject } from "../../src/projects/registry";
 import { defaultHandler } from "../../src/routes";
 import { buildMcpServer } from "../../src/mcp/server";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { Client } from "@modelcontextprotocol/client";
+import { InMemoryTransport } from "@modelcontextprotocol/client";
 import { makeMemoryKV, makeTestEnv } from "../helpers/make-env";
 import { req } from "../helpers/make-request";
 import { makeSqliteD1, type SqliteD1 } from "../helpers/sqlite-d1";
@@ -31,11 +32,11 @@ describe("prompt capsule routes", () => {
   beforeEach(async () => {
     resetDatabaseInit();
     sqlite = makeSqliteD1();
-    env = makeTestEnv(undefined, {
+    env = sqlite.admitEnv(makeTestEnv(undefined, {
       DB: sqlite.db as unknown as D1Database,
       OAUTH_KV: makeMemoryKV(),
       AUTH_TOKEN: "test-token",
-    });
+    }));
     const resolved = await resolveIdentityFromToken("test-token", env);
     if (!resolved) throw new Error("owner identity was not bootstrapped");
     identity = resolved;
@@ -378,7 +379,7 @@ describe("prompt capsule routes", () => {
 
   // The registry is not consulted: capsule ids predate projects and callers invent them.
   it("still serves a project capsule whose id is not in the projects registry, over REST and MCP", async () => {
-    await createProject(sqlite.db as unknown as D1Database, identity.personalWorkspaceId, { id: "website", name: "Website" });
+    await createProject(sqlite.db as unknown as D1Database, identity.personalWorkspaceId, { id: "website", name: "Website" }, sqlite.admitEnv(env));
     await seed("invented-state", "Caller-invented project state", [
       "capsule:project:caller-invented", "capsule-slot:current-state", "status:canonical",
     ]);
@@ -596,7 +597,7 @@ describe("prompt capsule routes", () => {
 
   /** How many times the capsule candidate scan has hit D1 so far. */
   function executedSql(): string[] {
-    return [...sqlite.issued, ...sqlite.batches.flat()];
+    return sqlite.issued;
   }
 
   function capsuleQueries(): number {
@@ -1130,7 +1131,7 @@ describe("prompt capsule routes", () => {
   ): Ai {
     return {
       run: vi.fn().mockImplementation(async (model: string, opts: { messages?: { content: string }[] }) => {
-        if (model.startsWith("@cf/baai/bge")) return { data: [new Array(384).fill(0.1)] };
+        if (model === "@cf/google/embeddinggemma-300m") return { data: [new Array(768).fill(0.1)] };
         const prompt = (opts?.messages ?? []).map(m => m.content).join("\n");
         const response = prompt.includes("Choose exactly one action")
           ? mergeResponse
@@ -1148,7 +1149,7 @@ describe("prompt capsule routes", () => {
 
   function nearMatch(id: string): void {
     (env.VECTORIZE.query as unknown as { mockResolvedValue: (v: unknown) => void })
-      .mockResolvedValue({ matches: [{ id, score: 0.88, metadata: { parentId: id } }] });
+      .mockResolvedValue({ matches: [{ id, score: 0.88, metadata: { ...embeddingMetadata(), parentId: id } }] });
   }
 
   it("stores a near-duplicate capsule entry for another slot as its own row and serves both slots", async () => {
@@ -1222,7 +1223,7 @@ describe("prompt capsule routes", () => {
   });
   it("重複blockedでもCapsule定義を保存し、通常メモリの重複拒否は維持する", async () => {
     await seed("existing", "A stable preference.", ["work"]);
-    vi.mocked(env.VECTORIZE.query).mockResolvedValue({ matches: [{ id: "existing", score: 0.999, metadata: { parentId: "existing" } }] } as never);
+    vi.mocked(env.VECTORIZE.query).mockResolvedValue({ matches: [{ id: "existing", score: 0.999, metadata: { ...embeddingMetadata(), parentId: "existing" } }] } as never);
     const ordinary = await defaultHandler.fetch(req("POST", "/capture", { body: { content: "A stable preference." } }), env, ctx);
     expect(await ordinary.json()).toMatchObject({ ok: false, duplicate: true, matchId: "existing" });
     const capture = capturingCtx();

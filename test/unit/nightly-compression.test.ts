@@ -28,7 +28,7 @@ function makeSseStream(response: string) {
 function makeDigestAI() {
   return {
     run: vi.fn().mockImplementation(async (model: string, opts: any) => {
-      if (model === "@cf/baai/bge-small-en-v1.5") return { data: [new Array(384).fill(0.1)] };
+      if (model === "@cf/google/embeddinggemma-300m") return { data: [new Array(768).fill(0.1)] };
       if (opts?.stream) return makeSseStream("A digest of the tagged memories.");
       return { response: "3" };
     }),

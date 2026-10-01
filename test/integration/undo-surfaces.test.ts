@@ -4,8 +4,8 @@
  * status/body (REST) or sentence (MCP) the spec's table gives, plus the parity and audit rules.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { Client } from "@modelcontextprotocol/client";
+import { InMemoryTransport } from "@modelcontextprotocol/client";
 import { makeSqliteD1, type SqliteD1 } from "../helpers/sqlite-d1";
 import { makeAIMock, makeMemoryKV, makeTestEnv, makeVectorizeMock } from "../helpers/make-env";
 import { initializeDatabase, resetDatabaseInit } from "../../src/db/init";
@@ -29,8 +29,9 @@ let owner: Identity;
 beforeEach(async () => {
   resetDatabaseInit();
   sqlite = makeSqliteD1();
-  env = makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV(), VECTORIZE: makeVectorizeMock(), AI: makeAIMock() });
+  env = sqlite.admitEnv(makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV(), VECTORIZE: makeVectorizeMock(), AI: makeAIMock() }));
   await initializeDatabase(env);
+  env = sqlite.admitEnv(env);
   const roots = await ensureTenantBootstrap(env);
   owner = (await resolveIdentityByUserId(env, roots.ownerUserId))!;
 });
@@ -129,7 +130,7 @@ describe("POST /undo maps every revertEntry result to its status and body", () =
     seed("h1", { content: "personal v1", workspaceId: owner.personalWorkspaceId });
     await updateEntryContent(env, "h1", "personal v2", DEFAULTS, undefined, undefined, { workspaceId: owner.personalWorkspaceId, actorId: owner.userId }, { actorId: owner.userId, channel: "rest" }, owner.personalWorkspaceId);
     const preShareSeq = (await versions("h1"))[0].seq;
-    sqlite.db.prepare(`UPDATE entries SET workspace_id = ? WHERE id = 'h1'`).bind(roots.companyWorkspaceId).run();
+    sqlite.db.prepare(`UPDATE entries SET write_marker = '${sqlite.fixtureMarker()}', workspace_id = ? WHERE id = 'h1'`).bind(roots.companyWorkspaceId).run();
     await updateEntryContent(env, "h1", "company v3", DEFAULTS, undefined, undefined, { workspaceId: roots.companyWorkspaceId, actorId: owner.userId }, { actorId: owner.userId, channel: "rest" }, roots.companyWorkspaceId);
     const res = await restUndo("h1", preShareSeq, bobToken);
     expect(res.status).toBe(404);
@@ -246,7 +247,7 @@ describe("REST and MCP undo leave identical rows and versions except channel", (
     // two sequential real calls a moment apart) and each request's own random nonce (meta) — and
     // channel, which is the one thing REST and MCP are allowed, and expected, to differ on.
     const strip = (v: any) => {
-      const { id, entry_id, created_at, valid_from, channel, meta, ...rest } = v;
+      const { id, entry_id, created_at, valid_from, channel, meta, write_marker, ...rest } = v;
       // event_id (round 3 re-review MAJOR) is minted fresh per call, same reasoning as nonce.
       const { nonce, event_id, ...metaRest } = meta ? JSON.parse(meta) : {};
       return { ...rest, meta: metaRest };
@@ -348,8 +349,8 @@ describe("reply text for a merge/redo, plus the redo hint on every reverted resu
 describe("pruned vs unreadable: only the entry's own author is told a version was pruned", () => {
   const seed21 = (id: string, workspaceId: string) => sqlite.db.exec(`
     WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 21)
-    INSERT INTO entry_versions (entry_id, workspace_id, seq, content, prior_length, tags, state, actor_id, channel, reason, meta, valid_from, created_at)
-    SELECT '${id}', '${workspaceId}', i, 'v' || i, NULL, '[]', '{}', '${owner.userId}', 'rest', 'update', '{}', i * 100, i * 100 FROM n`);
+    INSERT INTO entry_versions (entry_id, workspace_id, seq, content, prior_length, tags, state, actor_id, channel, reason, meta, valid_from, created_at, write_marker)
+    SELECT '${id}', '${workspaceId}', i, 'v' || i, NULL, '[]', '{}', '${owner.userId}', 'rest', 'update', '{}', i * 100, i * 100, '${sqlite.fixtureMarker()}' FROM n`);
 
   it("the author asking for a version older than VERSION_KEEP is offered the oldest one still kept", async () => {
     seed("pruned-a", { content: "v22" });
@@ -380,7 +381,7 @@ describe("not_found tells a caller who could read a row why it is gone, and only
   it("too large for the trash (tier 3), with the date, for whoever forgot it", async () => {
     seed("gone-tier3");
     await goneEvent("gone-tier3", owner.userId, "deleted", { trash: false, reason: "too_large_for_trash", channel: "rest" }, 1_700_000_000_000);
-    sqlite.db.prepare(`DELETE FROM entries WHERE id = 'gone-tier3'`).run();
+    sqlite.deleteFixtureRows(`DELETE FROM entries WHERE id = 'gone-tier3'`);
     const res = await restUndo("gone-tier3");
     expect(res.status).toBe(404);
     const body = await res.json() as any;
@@ -391,7 +392,7 @@ describe("not_found tells a caller who could read a row why it is gone, and only
   it("deleted forever, with the date, for whoever deleted it", async () => {
     seed("gone-forever");
     await goneEvent("gone-forever", owner.userId, "purged", { reason: "permanent", channel: "rest", from: "live" }, 1_700_000_000_000);
-    sqlite.db.prepare(`DELETE FROM entries WHERE id = 'gone-forever'`).run();
+    sqlite.deleteFixtureRows(`DELETE FROM entries WHERE id = 'gone-forever'`);
     const res = await restUndo("gone-forever");
     expect(res.status).toBe(404);
     const body = await res.json() as any;
@@ -403,7 +404,7 @@ describe("not_found tells a caller who could read a row why it is gone, and only
     seed("gone-purged");
     await goneEvent("gone-purged", owner.userId, "deleted", { trash: true, reason: "forget", channel: "rest" }, 1_699_000_000_000);
     await goneEvent("gone-purged", "", "purged", { channel: "system:purge", reason: "forget", deleted_at: 1_699_000_000_000 }, 1_700_000_000_000);
-    sqlite.db.prepare(`DELETE FROM entries WHERE id = 'gone-purged'`).run();
+    sqlite.deleteFixtureRows(`DELETE FROM entries WHERE id = 'gone-purged'`);
     const res = await restUndo("gone-purged");
     expect(res.status).toBe(404);
     const body = await res.json() as any;
@@ -415,7 +416,7 @@ describe("not_found tells a caller who could read a row why it is gone, and only
     const { token: bobToken } = await createMember(env, { name: "Bob" });
     seed("gone-stranger");
     await goneEvent("gone-stranger", owner.userId, "purged", { reason: "permanent", channel: "rest", from: "live" }, 1_700_000_000_000);
-    sqlite.db.prepare(`DELETE FROM entries WHERE id = 'gone-stranger'`).run();
+    sqlite.deleteFixtureRows(`DELETE FROM entries WHERE id = 'gone-stranger'`);
     const res = await restUndo("gone-stranger", undefined, bobToken);
     expect(res.status).toBe(404);
     const body = await res.json() as any;
@@ -426,7 +427,7 @@ describe("not_found tells a caller who could read a row why it is gone, and only
   it("MCP gives the same cause in its sentence", async () => {
     seed("gone-mcp");
     await goneEvent("gone-mcp", owner.userId, "purged", { reason: "permanent", channel: "rest", from: "live" }, 1_700_000_000_000);
-    sqlite.db.prepare(`DELETE FROM entries WHERE id = 'gone-mcp'`).run();
+    sqlite.deleteFixtureRows(`DELETE FROM entries WHERE id = 'gone-mcp'`);
     expect(await mcpUndo(owner, "gone-mcp")).toBe(`Entry gone-mcp was deleted forever on ${new Date(1_700_000_000_000).toDateString()}.`);
   });
 });

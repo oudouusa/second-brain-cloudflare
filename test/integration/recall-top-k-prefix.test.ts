@@ -5,7 +5,7 @@
  */
 import { describe, expect, it, vi } from "vitest";
 import { recallEntries } from "../../src/recall/search";
-import { RECALL_DEEP_POOL_SIZE, RECALL_MAX_TOP_K, RECALL_POOL_SIZE } from "../../src/constants";
+import { VECTORIZE_WIDEN_MAX_CANDIDATES, RECALL_MAX_TOP_K, RECALL_POOL_SIZE } from "../../src/constants";
 import { makeTestEnv, makeVectorizeMock } from "../helpers/make-env";
 import { D1Mock } from "../helpers/d1-mock";
 import { mulberry32 } from "../eval/stats";
@@ -30,7 +30,7 @@ function setup(parents: number) {
   const env = makeTestEnv(db, { VECTORIZE: makeVectorizeMock({ query: query as never }) });
   // No keyword rows: the dense arm alone decides, so the candidate count is the parent count.
   const prepare = db.prepare.bind(db);
-  (db as any).prepare = (sql: string) => sql.includes("WHERE content LIKE") && sql.includes("ORDER BY created_at DESC LIMIT")
+  (db as any).prepare = (sql: string) => sql.includes("content LIKE") && sql.includes("ORDER BY") && (sql.includes("SELECT id, content") || sql.startsWith("WITH s AS MATERIALIZED"))
     ? { bind: () => ({ all: async () => ({ results: [] }) }) }
     : prepare(sql);
   const recall = async (topK: number, hops = 0) => (await recallEntries({ query: "topic note", topK, hops, synthesize: false }, env, ctx)).matches.map(m => m.id);
@@ -42,21 +42,21 @@ describe("recall topK never reorders the head (T-0081)", () => {
     for (const hops of [0, 1]) {
       const { recall } = setup(30);
       const full = await recall(RECALL_MAX_TOP_K, hops);
-      expect(full).toHaveLength(RECALL_MAX_TOP_K);
+      expect(full).toHaveLength(VECTORIZE_WIDEN_MAX_CANDIDATES / 2);
       for (let k = 1; k < RECALL_MAX_TOP_K; k++) expect(await recall(k, hops), `topK ${k}, hops ${hops}`).toEqual(full.slice(0, k));
     }
   });
 
   it("draws from a deeper dense list only when the diversified one is shorter than topK, and only appends", async () => {
-    // 15 chunks fill the pool but are 8 memories; 30 chunks are 15.
+    // 15 chunkで8記憶、forkの追加取得上限20 chunkで10記憶。
     const { recall, query } = setup(25);
     const head = await recall(5);
     expect(query.mock.calls.map(c => (c[1] as { topK: number }).topK)).toEqual([RECALL_POOL_SIZE]);
     query.mockClear();
     const deep = await recall(12);
-    expect(query.mock.calls.map(c => (c[1] as { topK: number }).topK)).toEqual([RECALL_POOL_SIZE, RECALL_DEEP_POOL_SIZE]);
-    expect(deep).toHaveLength(12);
-    expect(new Set(deep).size).toBe(12);
+    expect(query.mock.calls.map(c => (c[1] as { topK: number }).topK)).toEqual([RECALL_POOL_SIZE, VECTORIZE_WIDEN_MAX_CANDIDATES]);
+    expect(deep).toHaveLength(VECTORIZE_WIDEN_MAX_CANDIDATES / 2);
+    expect(new Set(deep).size).toBe(VECTORIZE_WIDEN_MAX_CANDIDATES / 2);
     expect(deep.slice(0, 5)).toEqual(head);
   });
 

@@ -25,7 +25,7 @@ let companyWs = "";
 beforeEach(async () => {
   resetDatabaseInit();
   sqlite = makeSqliteD1();
-  env = makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV() });
+  env = sqlite.admitEnv(makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV() }));
   await initializeDatabase(env);
   const roots = await ensureTenantBootstrap(env);
   companyWs = roots.companyWorkspaceId;
@@ -179,7 +179,7 @@ describe("readEntryVersion", () => {
   it("a trashed row is not_visible, not a distinguishable state", async () => {
     await seedRow("e5", "v0");
     await edit("e5", "v1", { now: 1000 });
-    await sqlite.db.prepare(`DELETE FROM entries WHERE id = 'e5'`).run();
+    await sqlite.deleteFixtureRows(`DELETE FROM entries WHERE id = 'e5'`);
     const config = await resolveConfig(env);
     const result = await readEntryVersion(env, owner, "e5", 1, config);
     expect(result.ok).toBe(false);

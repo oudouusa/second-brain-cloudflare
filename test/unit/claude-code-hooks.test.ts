@@ -98,13 +98,15 @@ describe("session-start.buildRecallPlan / buildRecallUrl", () => {
     expect(plan).toHaveLength(2);
     expect(plan[0]).toMatchObject({ project: "brain-app", workspace: "personal" });
     expect(plan[1].project).toBeUndefined();
-    const url = new URL(start.buildRecallUrl("https://w.example", plan[0]));
+    const url = new URL(start.buildRecallUrl("https://w.example"));
     expect(url.pathname).toBe("/recall");
-    expect(url.searchParams.get("query")).toContain("brain-app");   // the parameter GET /recall reads
-    expect(url.searchParams.get("q")).toBeNull();                    // the one that caused #327
-    expect(url.searchParams.get("project")).toBe("brain-app");
-    expect(url.searchParams.get("workspace")).toBe("personal");
-    expect(url.searchParams.get("full")).toBeNull();
+    expect(url.search).toBe("");
+    const body = JSON.parse(start.buildRecallBody(plan[0]));
+    expect(body.query).toContain("brain-app");
+    expect(body.q).toBeUndefined();
+    expect(body.project).toBe("brain-app");
+    expect(body.workspace).toBe("personal");
+    expect(body.full).toBeUndefined();
   });
   it("uses a recent-window generic query when there is no project", () => {
     const plan = start.buildRecallPlan(null, "personal", 1_000_000_000_000);

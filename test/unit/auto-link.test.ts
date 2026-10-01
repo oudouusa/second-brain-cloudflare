@@ -2,6 +2,8 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { captureEntry } from "../../src/capture/entry";
 import { makeTestDb, makeTestEnv, makeVectorizeMock } from "../helpers/make-env";
 import type { Env } from "../../src/env";
+import { makeSqliteD1 } from "../helpers/sqlite-d1";
+import { initializeDatabase, resetDatabaseInit } from "../../src/db/init";
 import { D1Mock } from "../helpers/d1-mock";
 
 // Collects waitUntil promises so we can await the fire-and-forget auto-link.
@@ -17,7 +19,7 @@ function makeCtx() {
 function makeAI(verdict: string) {
   return {
     run: vi.fn().mockImplementation(async (model: string) => {
-      if (model === "@cf/baai/bge-small-en-v1.5") return { data: [new Array(384).fill(0.1)] };
+      if (model === "@cf/google/embeddinggemma-300m") return { data: [new Array(768).fill(0.1)] };
       return new ReadableStream({
         start(c) {
           c.enqueue(new TextEncoder().encode(`data: {"response":${JSON.stringify(verdict)}}\n\n`));
@@ -47,7 +49,7 @@ describe("auto-link on write (issue #16)", () => {
   it("links a newly-stored entry to a similar existing one (relates_to, inferred)", async () => {
     seedExisting(db);
     const env = makeTestEnv(db, {
-      VECTORIZE: makeVectorizeMock({ query: vi.fn().mockResolvedValue({ matches: [match("existing", 0.8)] }) }),
+      VECTORIZE: makeVectorizeMock({ query: vi.fn().mockResolvedValue({ matches: [match("existing", 0.7)] }) }),
       AI: makeAI('{"contradicts": false}'),
     });
     const { ctx, drain } = makeCtx();
@@ -68,7 +70,7 @@ describe("auto-link on write (issue #16)", () => {
   it("does NOT link when the capture is blocked as a duplicate", async () => {
     seedExisting(db);
     const env = makeTestEnv(db, {
-      VECTORIZE: makeVectorizeMock({ query: vi.fn().mockResolvedValue({ matches: [match("existing", 0.97)] }) }),
+      VECTORIZE: makeVectorizeMock({ query: vi.fn().mockResolvedValue({ matches: [match("existing", 0.99)] }) }),
       AI: makeAI('{"contradicts": false}'),
     });
     const { ctx, drain } = makeCtx();
@@ -80,19 +82,28 @@ describe("auto-link on write (issue #16)", () => {
     expect(db.edges).toHaveLength(0);
   });
 
-  it("does NOT link when the capture is merged/replaced into an existing entry", async () => {
-    seedExisting(db);
-    const env = makeTestEnv(db, {
+  it("置換の旧内容をentry_versionsに保存し、重複した関連edgeを追加しない", async () => {
+    const sqlite = makeSqliteD1();
+    const env = sqlite.admitEnv(makeTestEnv(undefined, {
+      DB: sqlite.db as unknown as Env["DB"],
       VECTORIZE: makeVectorizeMock({ query: vi.fn().mockResolvedValue({ matches: [match("existing", 0.9)] }) }),
       AI: makeAI('{"action":"replace","target_id":"existing"}'),
-    });
+    }));
+    resetDatabaseInit();
+    await initializeDatabase(env);
+    sqlite.seed({ id: "existing", content: "Existing memory", createdAt: 1 });
     const { ctx, drain } = makeCtx();
 
     const result = await captureEntry("Updated version", [], "api", env, ctx);
     await drain();
 
     expect(result.status).toBe("replaced");
-    expect(db.edges).toHaveLength(0);
+    const versions = (await env.DB.prepare("SELECT entry_id, content, reason FROM entry_versions").all()).results;
+    expect(versions).toHaveLength(1);
+    expect(versions[0]).toMatchObject({ entry_id: "existing", content: "Existing memory", reason: "replace" });
+    expect((await env.DB.prepare("SELECT * FROM edges").all()).results).toHaveLength(0);
+    sqlite.close();
+
   });
 
   it("does NOT link a contradiction-protected draft (the new entry lost to a canonical)", async () => {

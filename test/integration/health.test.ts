@@ -3,6 +3,9 @@ import worker from "../../src/index"; import { SB_VERSION } from "../../src/env"
 import { makeTestEnv, makeTestDb, makeVectorizeMock, makeMemoryKV } from "../helpers/make-env";
 import { req } from "../helpers/make-request";
 import { D1Mock } from "../helpers/d1-mock";
+import { makeSqliteD1 } from "../helpers/sqlite-d1";
+import { resetDatabaseInit } from "../../src/db/init";
+import { setDbReady } from "../../src/runtime/state";
 import { VERSIONS_SINCE_KV_KEY } from "../../src/constants";
 
 const ctx = { waitUntil: (_: Promise<any>) => {} } as any;
@@ -26,7 +29,8 @@ describe("GET /health", () => {
     const data = await res.json() as any;
     expect(data.ok).toBe(true);
     expect(data.vectorize.ok).toBe(true);
-    expect(data.vectorize.indexName).toBe("second-brain-vectors");
+    expect(data.vectorize.indexName).toBe("second-brain-cf-eg128-v1");
+    expect(data.ai).toEqual({ ok: null, status: "no_recent_quota_error" });
   });
 
   it("echoes the Worker version (used by the desktop app's update check)", async () => {
@@ -49,6 +53,26 @@ describe("GET /health", () => {
     expect(data.ok).toBe(false);
     expect(data.vectorize.ok).toBe(false);
     expect(data.vectorize.error).toContain("index not found");
+  });
+
+  it("does not report deployment readiness until a completely empty D1 is initialized", async () => {
+    const sqlite = makeSqliteD1({ schema: false });
+    resetDatabaseInit();
+    setDbReady(false);
+    try {
+      const env = makeTestEnv(undefined, { DB: sqlite.db as unknown as D1Database });
+      const res = await worker.fetch(req("GET", "/health"), env, ctx);
+      expect(res.status).toBe(200);
+      const row = await sqlite.db.prepare(
+        `SELECT COUNT(*) AS count FROM entries`,
+      ).first() as { count: number };
+      expect(row.count).toBe(0);
+      expect(sqlite.columns()).toContain("migration_lease_owner");
+    } finally {
+      sqlite.close();
+      resetDatabaseInit();
+      setDbReady(false);
+    }
   });
 
   it("includes history_since when the marker exists and omits it otherwise", async () => {

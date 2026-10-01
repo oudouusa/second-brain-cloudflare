@@ -1,21 +1,25 @@
+// 新規導入用の共通設定。実際の資産IDと所有者設定はGit対象外のwrangler.personal.jsoncへ保存する。
 {
 	"$schema": "node_modules/wrangler/config-schema.json",
-	"name": "second-brain",
+	"name": "second-brain-cf",
 	"main": "src/index.ts",
 	"compatibility_date": "2026-06-17",
 	"compatibility_flags": [
-		"nodejs_compat"
+		"nodejs_compat",
+		"global_fetch_strictly_public"
 	],
+	"workers_dev": true,
+	"preview_urls": false,
 	"d1_databases": [
 		{
 			"binding": "DB",
-			"database_name": "second-brain-db"
+			"database_name": "second-brain-cf-db"
 		}
 	],
 	"vectorize": [
 		{
 			"binding": "VECTORIZE",
-			"index_name": "second-brain-vectors"
+			"index_name": "second-brain-cf-eg128-v1"
 		}
 	],
 	"ai": {
@@ -26,50 +30,66 @@
 			"binding": "OAUTH_KV"
 		}
 	],
+	"durable_objects": {
+		"bindings": [
+			{
+				"name": "MCP_EXECUTOR",
+				"class_name": "McpExecutor"
+			}
+		]
+	},
+	"migrations": [
+		{
+			"tag": "v1-mcp-executor",
+			"new_sqlite_classes": [
+				"McpExecutor"
+			]
+		}
+	],
+	"r2_buckets": [
+		{
+			"binding": "ARCHIVE",
+			"bucket_name": "second-brain-cf-archive"
+		}
+	],
 	"vars": {
-		"VECTORIZE_GRACE_MS": "300000"
+		"VECTORIZE_GRACE_MS": "300000",
+		"CHATGPT_MODEL": "gpt-5.6-luna",
+		"CHATGPT_OPERATIONS": "",
+		"CHATGPT_OWNER_WORKSPACE_ID": ""
 	},
 	"secrets": {
-		"required": ["AUTH_TOKEN"]
+		"required": [
+			"AUTH_TOKEN",
+			"ACCESS_TEAM_DOMAIN",
+			"ACCESS_AUD",
+			"DASHBOARD_ACCESS_AUD",
+			"ACCESS_ALLOWED_EMAIL"
+		]
 	},
 	"assets": {
-		"directory": "./public"
+		"directory": "./public",
+		"binding": "ASSETS",
+		"run_worker_first": [
+			"/",
+			"/dashboard",
+			"/dashboard/*"
+		]
 	},
-	// Two schedules, because they are two budgets. A Worker invocation gets 50 D1
-	// queries and 10 ms of CPU on the free plan, and the nightly maintenance pass
-	// already spends 30 of those queries — leaving too little for a mirror sync to
-	// do useful work without pushing the whole invocation over (#290). Splitting
-	// them gives the integration sync its own allowance. scheduled() in
-	// src/index.ts routes on the cron string; INTEGRATION_SYNC_CRON in
-	// src/integrations/mirror.ts must match the second entry exactly, and
-	// test/unit/cron-triggers.test.ts fails if it drifts.
+	"observability": {
+		"enabled": true,
+		"logs": {
+			"enabled": true,
+			"head_sampling_rate": 1,
+			"invocation_logs": false
+		}
+	},
 	"triggers": {
 		"crons": [
-			// Nightly maintenance: compression, graph pass, staleness pass.
 			"0 1 * * *",
-			// Integrations. Hourly, because one provider syncs per run (see
-			// runScheduledIntegrationSync) — a nightly rotation would leave a user
-			// with several connections waiting days between syncs. Offset to :30 so
-			// it never fires in the same minute as the nightly job.
 			"30 * * * *",
-			// Insight candidate accrual. Its own schedule because it is its own
-			// budget: maintenance already spends ~30 of an invocation's 50 D1
-			// subrequests and this needs ~34. INSIGHT_ACCRUAL_CRON in
-			// src/insight/schedule.ts must match exactly.
 			"45 1 * * *",
-			// Weekly insight reasoning. INSIGHT_WEEKLY_CRON must match exactly.
-			// Day-of-week is "SUN", not "0": Cloudflare's trigger API rejects the
-			// numeric form (code 10100: invalid cron string: 15 2 * * 0), confirmed
-			// empirically. Do not "tidy" this back to 0.
 			"15 2 * * SUN",
-			// Weekly TEAM insight reasoning, thirty minutes after the personal one.
-			// INSIGHT_TEAM_WEEKLY_CRON must match exactly. Its own trigger because it
-			// cannot share an invocation: the weekly pass measures 38 of an
-			// invocation's 50 subrequests at a full candidate slate, so two passes in
-			// one invocation is 76 and the second dies half-written. Off by default
-			// (config TEAM_INSIGHTS) — an opted-out brain spends one KV read here and
-			// stops. THIS IS THE FIFTH AND LAST TRIGGER THE FREE PLAN ALLOWS: a sixth
-			// schedule has to displace one of these, not be appended.
 			"45 2 * * SUN"
 		]
 	}

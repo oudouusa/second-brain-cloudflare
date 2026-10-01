@@ -15,8 +15,8 @@ import { resetDatabaseInit, initializeDatabase } from "../../src/db/init";
 import { makeSqliteD1, type SqliteD1 } from "../helpers/sqlite-d1";
 import { makeTestEnv, makeMemoryKV, makeVectorizeMock } from "../helpers/make-env";
 import { req } from "../helpers/make-request";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { Client } from "@modelcontextprotocol/client";
+import { InMemoryTransport } from "@modelcontextprotocol/client";
 import { CJK_RECALL_FIXTURE, CJK_RECALL_EXTRA } from "../fixtures/cjk-recall";
 import type { RecallDiagnostics } from "../../src/recall/types";
 import type { Env } from "../../src/env";
@@ -69,8 +69,9 @@ describe("CJK and compatibility-form recall (#326)", () => {
     const ids = res.matches.map(m => m.id);
     expect(ids).toContain("fw-ascii");
     expect(ids).toContain("fw-wide");
-    // Canonical token first, typed surface as the probe.
-    expect(res.queryTokens).toEqual(["terraform", "Ｔｅｒｒａｆｏｒｍ"]);
+    // Scoring exposes only the canonical term; the raw surface remains an
+    // internal D1 probe and both storage forms were retrieved above.
+    expect(res.queryTokens).toEqual(["terraform"]);
   });
 
   it("a half-width query reaches half-width content through its probe", async () => {
@@ -78,8 +79,8 @@ describe("CJK and compatibility-form recall (#326)", () => {
     expect(res.matches[0]?.id).toBe("mx-12");
   });
 
-  it("retrieves the exact CJK memory through GET /recall (criterion 2, REST)", async () => {
-    const res = await worker.fetch(req("GET", `/recall?query=${encodeURIComponent("認証方式を変更した理由")}`), env, ctx);
+  it("retrieves the exact CJK memory through POST /recall (criterion 2, REST)", async () => {
+    const res = await worker.fetch(req("POST", "/recall", { body: { query: "認証方式を変更した理由" } }), env, ctx);
     expect(res.status).toBe(200);
     const data = await res.json() as { results: { id: string; content: string }[] };
     expect(data.results[0]?.id).toBe("jp-01");

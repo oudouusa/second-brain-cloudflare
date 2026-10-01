@@ -29,6 +29,10 @@ export const ENTRY_ROW_COLUMNS: readonly EntryColumn[] = [
   { name: "when_label", notNull: false },
   { name: "valid_from", notNull: false },
   { name: "valid_until", notNull: false },
+  { name: "memory_tier", notNull: false, default: "'warm'" },
+  { name: "pinned", notNull: false, default: "0" },
+  { name: "last_recalled_at", notNull: false },
+  { name: "pending_append_passages", notNull: true, default: "'[]'" },
 ];
 
 /** `json_object(...)` over the columns of the entries row aliased `alias`. */

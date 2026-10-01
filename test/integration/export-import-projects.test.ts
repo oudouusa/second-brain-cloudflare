@@ -39,14 +39,28 @@ const call = (brain: Brain, method: string, path: string, token: string, body?: 
   }), brain.env, ctx);
 const jsonOf = async (res: Response) => res.json() as Promise<any>;
 
+async function importAll(brain: Brain, token: string, payload: any) {
+  const total: any = { imported: 0, skipped: 0, failed: 0, projects_imported: 0, projects_skipped: 0, projects_failed: 0 };
+  let cursor = { next_offset: 0, next_edge_offset: 0, next_project_offset: 0 };
+  for (let i = 0; i < 100; i++) {
+    const res = await call(brain, "POST", `/import?offset=${cursor.next_offset}&edge_offset=${cursor.next_edge_offset}&project_offset=${cursor.next_project_offset}`, token, payload);
+    expect(res.status).toBe(200);
+    const page = await jsonOf(res);
+    for (const k of Object.keys(total)) total[k] += page[k];
+    cursor = page;
+    if (!page.remaining_entries && !page.remaining_edges && !page.remaining_projects) return new Response(JSON.stringify({ ...page, ...total }));
+  }
+  throw new Error("復元カーソルが完了しない");
+}
+
 let source: Brain;
 let target: Brain;
 
 beforeEach(async () => {
   source = await makeBrain();
-  await createProject(source.env.DB, source.aliceWs, { id: "site", name: "Site relaunch", description: "The marketing site", aliases: ["hosting", "web"] });
-  await createProject(source.env.DB, source.aliceWs, { id: "old-app", name: "Old app" });
-  await updateProject(source.env.DB, source.aliceWs, "old-app", { status: "archived" });
+  await createProject(source.env.DB, source.aliceWs, { id: "site", name: "Site relaunch", description: "The marketing site", aliases: ["hosting", "web"] }, source.sqlite.admitEnv(source.env));
+  await createProject(source.env.DB, source.aliceWs, { id: "old-app", name: "Old app" }, source.sqlite.admitEnv(source.env));
+  await updateProject(source.env.DB, source.aliceWs, "old-app", { status: "archived" }, source.sqlite.admitEnv(source.env));
   source.sqlite.db
     .prepare(`INSERT INTO entries (id, content, tags, source, created_at, updated_at, vector_ids, workspace_id, actor_id) VALUES ('e1', 'a note', '["project:site"]', 'api', 1000, 1000, '[]', ?, '')`)
     .bind(source.aliceWs)
@@ -72,12 +86,12 @@ describe("GET /export", () => {
     expect(byId.site).toMatchObject({ name: "Site relaunch", description: "The marketing site", aliases: ["hosting", "web"], status: "active" });
     expect(byId["old-app"].status).toBe("archived");
     expect(typeof byId.site.created_at).toBe("number");
-    expect(byId.site).not.toHaveProperty("workspace_id");
+    expect(byId.site.workspace_id).toBe(source.aliceWs);
   });
 
   it("exports only the projects the caller can read", async () => {
-    await createProject(source.env.DB, source.companyWs, { id: "shared", name: "Shared" });
-    await createProject(source.env.DB, source.bobWs, { id: "bobs", name: "Bob's own" });
+    await createProject(source.env.DB, source.companyWs, { id: "shared", name: "Shared" }, source.sqlite.admitEnv(source.env));
+    await createProject(source.env.DB, source.bobWs, { id: "bobs", name: "Bob's own" }, source.sqlite.admitEnv(source.env));
 
     const alice = (await jsonOf(await call(source, "GET", "/export", ALICE))).projects.map((p: any) => p.id).sort();
     const bob = (await jsonOf(await call(source, "GET", "/export", source.bobToken))).projects.map((p: any) => p.id).sort();
@@ -87,11 +101,40 @@ describe("GET /export", () => {
   });
 });
 
+describe("Projectsの分割exportと完全exportの上限", () => {
+  it("3つのcursorで最後のProjectsまで重複なく読み出す", async () => {
+    let cursor = { next_offset: 0, next_edge_offset: 0, next_project_offset: 0 };
+    const projects: any[] = [];
+    let complete = false;
+    for (let i = 0; i < 4 && !complete; i++) {
+      const res = await call(source, "GET", `/export?limit=1&offset=${cursor.next_offset}&edge_offset=${cursor.next_edge_offset}&project_offset=${cursor.next_project_offset}`, ALICE);
+      expect(res.status).toBe(200);
+      const page = await jsonOf(res);
+      expect(page.entries.length + page.edges.length + page.projects.length).toBeLessThanOrEqual(1);
+      projects.push(...page.projects);
+      cursor = page.pagination;
+      complete = page.pagination.complete;
+    }
+    expect(complete).toBe(true);
+    expect(projects.map(p => p.id).sort()).toEqual(["old-app", "site"]);
+    const cursorOnly = await jsonOf(await call(source, "GET", "/export?project_offset=1", ALICE));
+    expect(cursorOnly.pagination.next_project_offset).toBe(1);
+  });
+
+  it("Projects設定のbyte数も完全exportの上限へ含める", async () => {
+    for (let i = 0; i < 90; i++) await createProject(source.env.DB, source.aliceWs,
+      { id: `large-${i}`, name: "大きい設定", description: "あ".repeat(1000) }, source.sqlite.admitEnv(source.env));
+    expect((await call(source, "GET", "/export", ALICE)).status).toBe(413);
+    const paged = await call(source, "GET", "/export?paged=1&limit=1", ALICE);
+    expect(paged.status).toBe(200);
+  });
+});
+
 describe("round trip through POST /import", () => {
   it("restores name, description, aliases, archived status and created_at into a fresh brain", async () => {
     const exported = await jsonOf(await call(source, "GET", "/export", ALICE));
 
-    const res = await call(target, "POST", "/import", ALICE, exported);
+    const res = await importAll(target, ALICE, exported);
     const summary = await jsonOf(res);
 
     expect(res.status).toBe(200);
@@ -107,7 +150,7 @@ describe("round trip through POST /import", () => {
   it("lands in the importer's own workspace, like entries", async () => {
     const exported = await jsonOf(await call(source, "GET", "/export", ALICE));
 
-    await call(target, "POST", "/import", target.bobToken, exported);
+    await importAll(target, target.bobToken, exported);
 
     const rows = (await target.sqlite.db.prepare(`SELECT id, workspace_id FROM projects ORDER BY id`).all()).results as { id: string; workspace_id: string }[];
     expect(rows).toEqual([{ id: "old-app", workspace_id: target.bobWs }, { id: "site", workspace_id: target.bobWs }]);
@@ -115,10 +158,10 @@ describe("round trip through POST /import", () => {
 
   it("is idempotent and keeps an existing project rather than overwriting it", async () => {
     const exported = await jsonOf(await call(source, "GET", "/export", ALICE));
-    await call(target, "POST", "/import", ALICE, exported);
-    await updateProject(target.env.DB, target.aliceWs, "site", { name: "Renamed here", aliases: ["mine"] });
+    await importAll(target, ALICE, exported);
+    await updateProject(target.env.DB, target.aliceWs, "site", { name: "Renamed here", aliases: ["mine"] }, target.sqlite.admitEnv(target.env));
 
-    const again = await jsonOf(await call(target, "POST", "/import", ALICE, exported));
+    const again = await jsonOf(await importAll(target, ALICE, exported));
 
     expect(again).toMatchObject({ projects_imported: 0, projects_skipped: 2, projects_failed: 0 });
     const site = (await projectsOf(target)).find((p: any) => p.id === "site");
@@ -127,15 +170,21 @@ describe("round trip through POST /import", () => {
 
   it("restores the entries tagged with a project alongside it", async () => {
     const exported = await jsonOf(await call(source, "GET", "/export", ALICE));
-    await call(target, "POST", "/import", ALICE, exported);
+    await importAll(target, ALICE, exported);
 
-    const listed = await jsonOf(await call(target, "GET", "/list?project=site", ALICE));
+    const listed = await jsonOf(await call(target, "POST", "/list", ALICE, { project: "site" }));
 
     expect(listed.map((e: any) => e.id)).toEqual(["e1"]);
   });
 });
 
 describe("POST /import of files without projects", () => {
+  it("version 1の記憶をProjectsなしで復元する", async () => {
+    const res = await call(target, "POST", "/import", ALICE, { version: 1, entries: [{ id: "v1", content: "以前の記憶" }] });
+    expect(res.status).toBe(200);
+    expect(await jsonOf(res)).toMatchObject({ imported: 1, remaining_projects: 0 });
+  });
+
   it("accepts a version 2 file taken before projects existed", async () => {
     const res = await call(target, "POST", "/import", ALICE, {
       version: 2,
@@ -157,7 +206,7 @@ describe("POST /import of files without projects", () => {
   it("still rejects an unknown version and a non-array projects field", async () => {
     const future = await call(target, "POST", "/import", ALICE, { version: 4, entries: [] });
     expect(future.status).toBe(400);
-    expect((await jsonOf(future)).error).toMatch(/version must be 2 or 3/);
+    expect((await jsonOf(future)).error).toMatch(/version must be 1, 2 or 3/);
     const bad = await call(target, "POST", "/import", ALICE, { version: 3, entries: [], projects: {} });
     expect(bad.status).toBe(400);
     expect((await jsonOf(bad)).error).toMatch(/projects must be an array/);

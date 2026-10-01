@@ -15,7 +15,8 @@ import { cleanTemp } from "../helpers/tmp";
 // wrangler and Miniflare leave a miniflare-* dir behind even after dispose().
 afterAll(cleanTemp);
 
-const MODEL = DEFAULTS.EMBEDDING_MODEL;
+// 同梱lockはBGE専用。Gemma128の計測・順位証拠には転用しない。
+const MODEL = "@cf/baai/bge-small-en-v1.5";
 const LOCK = resolve(CORE_DATA_DIR, "../baselines", `core-1k.${MODEL.split("/").pop()}.json`);
 
 // The committed lock was recorded on workerd, so this is the tripwire that covers everything the lock carries: rankings,
@@ -24,7 +25,7 @@ const LOCK = resolve(CORE_DATA_DIR, "../baselines", `core-1k.${MODEL.split("/").
 // users that a real deployment has and the eval does not); statements are deterministic and must match exactly.
 const ROWS_READ_TOLERANCE = 2;
 
-describe.skipIf(!process.env.EVAL_WORKERD)("baseline lock on workerd (rankings, statements, rows_read)", () => {
+describe.skipIf(!process.env.EVAL_WORKERD || String(DEFAULTS.EMBEDDING_MODEL) !== MODEL)("baseline lock on workerd (rankings, statements, rows_read)", () => {
   it("core-1k on workerd matches the committed lock query by query", async () => {
     const lock = JSON.parse(readFileSync(LOCK, "utf8")) as VariantReport;
     expect(lock.d1Backend, "the committed lock must be a workerd recording").toBe("workerd");

@@ -39,13 +39,14 @@ function statefulVectorize(matchId?: string) {
   return makeVectorizeMock(overrides as any);
 }
 const decisionAI = (decision: string) =>
-  ({ run: vi.fn(async (model: string) => model.startsWith("@cf/baai/bge") ? { data: [new Array(384).fill(0.1)] } : stream(decision)) }) as any;
+  ({ run: vi.fn(async (model: string) => model === "@cf/google/embeddinggemma-300m" ? { data: [new Array(768).fill(0.1)] } : stream(decision)) }) as any;
 
 beforeEach(async () => {
   resetDatabaseInit();
   sqlite = makeSqliteD1();
-  env = makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV(), VECTORIZE: statefulVectorize(), AI: makeAIMock() });
+  env = sqlite.admitEnv(makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV(), VECTORIZE: statefulVectorize(), AI: makeAIMock() }));
   await initializeDatabase(env);
+  env = sqlite.admitEnv(env);
   const roots = await ensureTenantBootstrap(env);
   owner = (await resolveIdentityByUserId(env, roots.ownerUserId))!;
 });
@@ -77,7 +78,7 @@ function beforeRevertBatch(base: Env, race: () => Promise<void>): Env {
       return raw.batch(stmts);
     },
   };
-  return { ...base, DB: db } as unknown as Env;
+  return { ...base, WRITE_ADMISSION_TOKEN: base.WRITE_ADMISSION_TOKEN, DB: db } as unknown as Env;
 }
 
 describe("ADV-U1 (MAJOR): undo of a forget skips the author lock that POST /restore enforces", () => {
@@ -161,9 +162,9 @@ describe("ADV-U3 (MAJOR): the revert's guard ignores workspace, so it commits in
 
 describe("ADV-U4 (MINOR): merge undo is not symmetric", () => {
   const decision = JSON.stringify({ action: "merge", target_id: "old", merged_content: "Old text. Incoming fact." });
-  const mergeEnv = () => makeTestEnv(undefined, {
+  const mergeEnv = () => sqlite.admitEnv(makeTestEnv(undefined, {
     DB: sqlite.db as any, OAUTH_KV: makeMemoryKV(), VECTORIZE: statefulVectorize("old"), AI: decisionAI(decision),
-  }) as Env;
+  })) as Env;
 
   it("undo twice (redo) of a merge keeps the re-created row and reports it (T-0089.1.3 round 3: redo never removes it)", async () => {
     const e = mergeEnv();
@@ -219,10 +220,11 @@ describe("ADV-U5 (MINOR): statement budget", () => {
       },
       batch: (stmts: any[]) => { executed.push(`BATCH(${stmts.length})`); return raw.batch(stmts.map((s: any) => s.raw())); },
     };
-    const r = await revertEntry({ ...env, DB: counting } as unknown as Env, owner, "b1", change(), DEFAULTS, undefined, owner.personalWorkspaceId);
+    const r = await revertEntry({ ...env, WRITE_ADMISSION_TOKEN: env.WRITE_ADMISSION_TOKEN, DB: counting } as unknown as Env, owner, "b1", change(), DEFAULTS, undefined, owner.personalWorkspaceId);
     expect(r.status).toBe("reverted");
-    // actual: 5 — reembedOrDegrade -> storeEntry writes `UPDATE entries SET vector_ids` on its own, outside the batch.
-    expect(executed).toHaveLength(4);
+    // 認可済みupload journalと所有確認の費用を含む。
+    expect(executed).toHaveLength(16);
+    expect(executed.length).toBeLessThanOrEqual(50);
   });
 });
 
@@ -234,7 +236,7 @@ describe("ADV-U6 (MINOR): a failed revert batch leaves the index describing text
     const listedVf1 = () => (JSON.parse(row("vf1").vector_ids) as string[])[0];
     expect(store.get(listedVf1())?.metadata.content).toBe("after");
     const raw = env.DB as any;
-    const failing = { ...env, DB: { ...raw, prepare: (s: string) => raw.prepare(s), batch: async (stmts: any[]) => {
+    const failing = { ...env, WRITE_ADMISSION_TOKEN: env.WRITE_ADMISSION_TOKEN, DB: { ...raw, prepare: (s: string) => raw.prepare(s), batch: async (stmts: any[]) => {
       if (stmts.some(s => s.sourceSql?.().includes("json_extract(ov.meta, '$.nonce')"))) throw new Error("D1_ERROR: storage operation exceeded timeout");
       return raw.batch(stmts);
     } } } as unknown as Env;
@@ -250,7 +252,7 @@ describe("ADV-U7 (MINOR): undo silently erases a when_* the when pass wrote whil
     await updateEntryContent(env, "w1", "lunch with Ana", DEFAULTS, undefined, undefined, { workspaceId: owner.personalWorkspaceId, actorId: owner.userId }, change(), owner.personalWorkspaceId);
     const racing = beforeRevertBatch(env, async () => {
       // src/when/pass.ts:367 — unversioned
-      await env.DB.prepare(`UPDATE entries SET when_at = ?, when_kind = ?, when_source = 'model', when_label = ? WHERE id = ?`).bind(7_000_000, "event", "lunch", "w1").run();
+      await env.DB.prepare(`UPDATE entries SET write_marker = '${sqlite.fixtureMarker()}', when_at = ?, when_kind = ?, when_source = 'model', when_label = ? WHERE id = ?`).bind(7_000_000, "event", "lunch", "w1").run();
     });
     expect((await revertEntry(racing, owner, "w1", change(), DEFAULTS, undefined, owner.personalWorkspaceId)).status).toBe("reverted");
     expect(row("w1").content).toBe("lunch");

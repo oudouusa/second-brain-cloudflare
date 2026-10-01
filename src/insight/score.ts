@@ -4,8 +4,13 @@
 // preference.
 import { topicTagsOf } from "./eligibility";
 
-/** Below this two entries are not about the same thing. */
-export const MIN_SIMILARITY = 0.80;
+/**
+ * Below this two entries are not the same evolving thought. Gemma MRL128
+ * calibration puts curated near-duplicates at 0.8265–0.9590, broad related
+ * pairs at no more than 0.5945, and unrelated pairs at no more than 0.3785.
+ * Keep this prefilter narrow before paid LLM reasoning.
+ */
+export const MIN_SIMILARITY = 0.82;
 
 /** Below this the pair is one thought written twice, not a position that moved. */
 export const MIN_GAP_MS = 30 * 86400000;

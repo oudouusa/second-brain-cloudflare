@@ -368,11 +368,14 @@ function normalizeEntry(e) {
  * missing. Returns null when healthy or when health is unknown, so a transient
  * fetch failure never raises a false alarm. */
 function vectorizeHealthBanner(health) {
+  if (health && health.ai && health.ai.status === 'quota_exhausted' && health.vectorize && health.vectorize.ok) {
+    return { title: t('home.aiQuotaNotice'), notice: true };
+  }
   if (!health || !health.vectorize || health.vectorize.ok) return null;
-  const name = health.vectorize.indexName || 'second-brain-vectors';
+  const name = health.vectorize.indexName || 'second-brain-cf-eg128-v1';
   return {
     title: t('upkeep.vectorizeBannerTitle', { name }),
-    command: 'npx wrangler vectorize create ' + name + ' --dimensions=384 --metric=cosine',
+    command: 'npx wrangler vectorize create ' + name + ' --dimensions=128 --metric=cosine',
     gui: t('upkeep.vectorizeBannerGui'),
   };
 }
@@ -380,6 +383,7 @@ function vectorizeHealthBanner(health) {
 /* Build the inner HTML for the dashboard warning banner. Kept separate from the
  * DOM mutation so it can be unit-tested: it must escape every interpolated field. */
 function vectorizeBannerHtml(banner) {
+  if (banner.notice) return '<strong>' + escHtml(banner.title) + '</strong>';
   return (
     '<strong>' + escHtml(banner.title) + '</strong> ' +
     '<details style="margin-top:6px"><summary style="cursor:pointer">' + escHtml(t('upkeep.vectorizeBannerHowToFix')) + '</summary>' +

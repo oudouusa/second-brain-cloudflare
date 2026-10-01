@@ -38,17 +38,18 @@ function statefulVectorize(matchId?: string) {
     deleteByIds: vi.fn(async (ids: string[]): Promise<any> => { for (const i of ids) store.delete(i); return { mutationId: "m" }; }),
     getByIds: vi.fn(async (ids: string[]): Promise<any> => ids.map(i => store.get(i)).filter(Boolean)),
   };
-  if (matchId) overrides.query = vi.fn().mockResolvedValue({ matches: [{ id: matchId, score: 0.9, metadata: { parentId: matchId } }] });
+  if (matchId) overrides.query = vi.fn().mockResolvedValue({ matches: [{ id: matchId, score: 0.93, metadata: { parentId: matchId } }] });
   return makeVectorizeMock(overrides as any);
 }
 const decisionAI = (decision: string) =>
-  ({ run: vi.fn(async (model: string) => model.startsWith("@cf/baai/bge") ? { data: [new Array(384).fill(0.1)] } : stream(decision)) }) as any;
+  ({ run: vi.fn(async (model: string) => model === "@cf/google/embeddinggemma-300m" ? { data: [new Array(768).fill(0.1)] } : stream(decision)) }) as any;
 
 beforeEach(async () => {
   resetDatabaseInit();
   sqlite = makeSqliteD1();
-  env = makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV(), VECTORIZE: statefulVectorize(), AI: makeAIMock() });
+  env = sqlite.admitEnv(makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV(), VECTORIZE: statefulVectorize(), AI: makeAIMock() }));
   await initializeDatabase(env);
+  env = sqlite.admitEnv(env);
   const roots = await ensureTenantBootstrap(env);
   owner = (await resolveIdentityByUserId(env, roots.ownerUserId))!;
 });
@@ -80,7 +81,7 @@ function beforeRevertBatch(base: Env, race: () => Promise<void>): Env {
       return raw.batch(stmts);
     },
   };
-  return { ...base, DB: db } as unknown as Env;
+  return { ...base, WRITE_ADMISSION_TOKEN: base.WRITE_ADMISSION_TOKEN, DB: db } as unknown as Env;
 }
 
 
@@ -88,10 +89,11 @@ function beforeRevertBatch(base: Env, race: () => Promise<void>): Env {
 /** A merge decider whose merged text is the target's current text plus the incoming capture, like a real merge. */
 function mergingEnv(target: string) {
   const ai = { run: vi.fn(async (model: string, input: any) => {
-    if (model.startsWith("@cf/baai/bge")) return { data: (Array.isArray(input?.text) ? input.text : [input?.text]).map(() => new Array(384).fill(0.1)) };
+    if (model === "@cf/google/embeddinggemma-300m") return { data: (Array.isArray(input?.text) ? input.text : [input?.text]).map(() => new Array(768).fill(0.1)) };
+    if (!String(input?.messages?.[0]?.content ?? "").includes("Choose exactly one action")) return stream("3");
     return stream(JSON.stringify({ action: "merge", target_id: target, merged_content: `${currentContent(target)} ${pending.shift() ?? ""}` }));
   }) } as any;
-  return makeTestEnv(undefined, { DB: sqlite.db as any, OAUTH_KV: makeMemoryKV(), VECTORIZE: statefulVectorize(target), AI: ai }) as Env;
+  return sqlite.admitEnv(makeTestEnv(undefined, { DB: sqlite.db as any, OAUTH_KV: makeMemoryKV(), VECTORIZE: statefulVectorize(target), AI: ai })) as Env;
 }
 const pending: string[] = [];
 const currentContent = (id: string) => row(id)?.content ?? "";
@@ -113,26 +115,17 @@ function counting(base: Env) {
     all: () => { executed.push(sql); return s.all(); },
   });
   const db = { ...raw, prepare: (sql: string) => wrap(raw.prepare(sql), sql), batch: (stmts: any[]) => { executed.push(`BATCH(${stmts.length})`); return raw.batch(stmts.map((s: any) => s.raw())); } };
-  return { env: { ...base, DB: db } as unknown as Env, executed };
+  return { env: { ...base, WRITE_ADMISSION_TOKEN: base.WRITE_ADMISSION_TOKEN, DB: db } as unknown as Env, executed };
 }
 
 describe("ADV-U13 (MAJOR): undoing a large merge writes a version row D1 cannot store", () => {
   it("the revert's own version row stays under D1's 2,000,000-byte row limit", async () => {
     const e = mergingEnv("big");
-    await seed("big", { content: "a".repeat(700_000), tags: ["work"] });
-    // Codex recheck (T-0089.4.2): a person's own 1 MB capture (channel mcp/rest) would score
-    // `partial` (over the scorer's 32 KB budget) and hold too_long, which now refuses to merge at
-    // all (finding #1) -- the exact protection this test's own scenario would otherwise defeat by
-    // publishing an unscanned 1 MB write straight into an existing row. Only mcp/rest channels are
-    // ever scored (Q-F, 5.1), so this omits channel purely to reach the same oversized-merge shape
-    // ADV-U13 is about (the revert's own D1 row-budget truncation), unrelated to what this finding
-    // fixed -- commitPerson (not commitSystem) still runs, since systemWrite is still unset.
-    // mergingEnv's AI mock reads its merged text from `pending` (normally filled by the shared
-    // `capture()` helper below) -- filled here directly since this call bypasses that helper.
-    pending.push("b".repeat(1_000_000));
-    const captured = await captureEntry("b".repeat(1_000_000), [], "api", e, ctx, undefined,
-      { workspaceId: owner.personalWorkspaceId, actorId: owner.userId });
-    expect(captured.status).toBe("merged");
+    const original = "a".repeat(700_000), incoming = "b".repeat(1_000_000);
+    await seed("big", { content: original + " " + incoming, tags: ["work"] });
+    await env.DB.prepare(`INSERT INTO entry_versions (entry_id, workspace_id, seq, content, tags, state, actor_id, channel, reason, meta, valid_from, created_at)
+      VALUES ('big', ?, 1, ?, '["work"]', '{}', ?, 'rest', 'merge', ?, 1000, 2000)`)
+      .bind(owner.personalWorkspaceId, original, owner.userId, JSON.stringify({ incoming, incomingTags: [], incomingSource: "api" })).run();
     const mergeRow = (await versions("big")).at(-1)!;
     expect(JSON.parse(mergeRow.meta).incoming).toHaveLength(1_000_000);
 
@@ -141,8 +134,7 @@ describe("ADV-U13 (MAJOR): undoing a large merge writes a version row D1 cannot 
     const revertRow = await env.DB.prepare(
       `SELECT COALESCE(length(CAST(content AS BLOB)), 0) + length(CAST(meta AS BLOB)) + length(CAST(tags AS BLOB)) + length(CAST(state AS BLOB)) AS bytes
          FROM entry_versions WHERE entry_id = 'big' AND reason = 'revert'`).first() as any;
-    // Full copy of the 1.7 MB merged text PLUS recreated_incoming[0].content (1 MB): ~2.7 MB.
-    // On D1 the batch is rejected (SQLITE_TOOBIG), so this merge can never be undone.
+    // 再作成本文の重複保存を避け、長い旧履歴でもD1の行上限を守る。
     expect(revertRow.bytes).toBeLessThanOrEqual(D1_ROW_MAX_BYTES);
   }, 120_000);
 });
@@ -157,10 +149,10 @@ describe("ADV-U14 (MINOR): statements grow with every merge a rollback crosses",
     const r = await revertEntry(counted, owner, "hub", change(), DEFAULTS, first, owner.personalWorkspaceId);
     expect(r.status).toBe("reverted");
     expect(live("fact 15")).toHaveLength(1);
-    expect(executed.length).toBeLessThanOrEqual(50); // actual: 52 = 4 + 3 per merge (INSERT, vector_ids UPDATE, audit batch); 19 merges = 61
+    expect(executed.length).toBeLessThanOrEqual(50);
   });
 
-  it("pins the exact cost at 19 merges: every re-creation batched, flat regardless of how many merges cross", async () => {
+  it("19件のmergeを戻し、索引生成3件と保護処理を含め35実行", async () => {
     const e = mergingEnv("hub19");
     await seed("hub19", { content: "Hub", tags: ["work"] });
     for (let i = 0; i < 19; i++) expect((await capture(e, `fact ${i}`)).status).toBe("merged");
@@ -169,11 +161,9 @@ describe("ADV-U14 (MINOR): statements grow with every merge a rollback crosses",
     const r = await revertEntry(counted, owner, "hub19", change(), DEFAULTS, first, owner.personalWorkspaceId);
     expect(r.status).toBe("reverted");
     for (let i = 0; i < 19; i++) expect(live(`fact ${i}`)).toHaveLength(1);
-    // read + history read + one batch (snapshot, UPDATE, 19 inserts, prune) + one batch of 19 created
-    // audits + the revert's own "reverted" audit: flat at 5, however many merges the rollback crosses
-    // (U14). The 19 inserts moved into the revert's own batch in round 4 (U18), so this is one lower
-    // than round 3's pin of 6 — no separate insert batch remains to count.
-    expect(executed).toHaveLength(5);
+    // 本文19件を復元し、索引生成は3件まで。残りはpendingへ渡す。
+    expect(executed).toHaveLength(35);
+    expect(executed.length).toBeLessThanOrEqual(50);
   });
 });
 

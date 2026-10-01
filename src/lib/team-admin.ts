@@ -1,3 +1,4 @@
+import { memoryWriteMarker } from "../migration/write-lock";
 import type { Env } from "../env";
 import { resolveConfig } from "../config";
 import { hashToken } from "./identity";
@@ -200,10 +201,9 @@ export async function lookupAuditNames(env: Env, ids: string[]): Promise<Map<str
   //
   // Each id is bound ONCE, so the chunk is the whole ceiling rather than the
   // halved one the two-alias slice in insight/weekly.ts needs. That makes the
-  // worst case two statements — two of the ~5 D1 calls this route spends of
-  // its self-imposed ~50-call budget per invocation (the platform's real
-  // ceiling is 1,000) — and the common case, a page naming a hundred people or
-  // fewer, is the one statement it has always been.
+  // worst case two statements — two of the ~5 subrequests this route spends of
+  // its 50 — and the common case, a page naming a hundred people or fewer, is
+  // the one statement it has always been.
   //
   // The maps are MERGED, not replaced: a person whose id lands in the second
   // chunk is named in the response exactly like one in the first.
@@ -527,26 +527,26 @@ export async function cleanupMemberData(
   const units = [...slices("A", [...idsA]), ...slices("B", idsB)];
   let executions = 0;
   while (units.length && executions < MEMBER_HISTORY_MAX_CHUNKS) {
-    const chunk = Math.min(MEMBER_HISTORY_CHUNK, Math.floor(left() / 2));
+    const chunk = Math.min(MEMBER_HISTORY_CHUNK, Math.floor(left() / 3));
     if (chunk < 1) break;
     const unit = units[0];
-    const res = unit.kind === "A"
-      ? await env.DB.prepare(
-        // scope-exempt: offboarding: oldest versions first of entries the removed member owns
-        `DELETE FROM entry_versions WHERE id IN (
-           SELECT id FROM entry_versions WHERE entry_id IN (SELECT value FROM json_each(?1)) ORDER BY seq LIMIT ?2)`,
-      ).bind(JSON.stringify(unit.ids), chunk).run()
-      : await env.DB.prepare(
-        // scope-exempt: offboarding: versions up to the newest one stamped with the removed member's personal workspace, oldest first
-        `DELETE FROM entry_versions WHERE id IN (
-           SELECT v.id FROM entry_versions v
-            WHERE v.entry_id IN (SELECT value FROM json_each(?1))
-              AND v.seq <= (SELECT MAX(w.seq) FROM entry_versions w WHERE w.entry_id = v.entry_id AND w.workspace_id = ?2)
-            ORDER BY v.seq LIMIT ?3)`,
-      ).bind(JSON.stringify(unit.ids), personalWid, chunk).run();
+    const predicate = unit.kind === "A"
+      ? `entry_id IN (SELECT value FROM json_each(?1))`
+      : `entry_id IN (SELECT value FROM json_each(?1)) AND seq <= (SELECT MAX(w.seq) FROM entry_versions w WHERE w.entry_id = entry_versions.entry_id AND w.workspace_id = ?2)`;
+    const args = unit.kind === "A" ? [JSON.stringify(unit.ids)] : [JSON.stringify(unit.ids), personalWid];
+    const limitParam = `?${args.length + 1}`;
+    const markerParam = `?${args.length + 2}`;
+    // scope-checked: predicateは削除対象の所有ID集合かそのworkspaceの旧version境界。
+    const selected = `id IN (SELECT id FROM entry_versions WHERE ${predicate} ORDER BY seq LIMIT ${limitParam})`;
+    const [, res] = await env.DB.batch([
+      env.DB.prepare(`UPDATE entry_versions SET write_marker = ${markerParam} WHERE ${selected}`).bind(...args, chunk, memoryWriteMarker(env, "delete")),
+      // scope-checked: 上のpredicateと同じremoved-member集合を同一batchで削除する。
+    // write-fence: parent-capability=entries（同batchのsnapshot・認可済み記憶をtriggerで検証）
+      env.DB.prepare(`DELETE FROM entry_versions WHERE ${selected}`).bind(...args, chunk),
+    ]);
     executions++;
     const n = changedRows(res);
-    rowsWritten += 2 * n;
+    rowsWritten += 3 * n;
     if (n < chunk) units.shift();
   }
   if (units.length) {
@@ -577,17 +577,31 @@ export async function cleanupMemberData(
   // idx_entry_events_entry, idx_entry_events_created, idx_entry_events_actor, and
   // idx_entry_events_life_end -- R23 -- since a life-end marker always matches that last index's
   // own predicate).
-  const estimate = 10 * removedEntries + 3 * (count?.trashed ?? 0) + 6 * (count?.edges ?? 0)
+  // markerのstage書込みも予算に含める。
+  const estimate = 11 * removedEntries + 4 * (count?.trashed ?? 0) + 7 * (count?.edges ?? 0)
     + 6 * removedEntries + 6 * (count?.trashed ?? 0);
   if (opts.rowsLeft !== undefined && estimate > left() && !opts.allowOversize) {
     return { done: false, removedEntries: 0, vectorIds: [], ownedVectors: [], remaining: removedEntries + (count?.trashed ?? 0), rowsWritten, blockedByBudget: true };
   }
 
+  const edgePredicate = `source_id IN (SELECT id FROM entries WHERE workspace_id = ?)
+    OR target_id IN (SELECT id FROM entries WHERE workspace_id = ?)`;
   const offboardNow = Date.now();
+  // versioning: exempt: 同batchのoffboarding削除を認可するmarkerのみ。
+  const entryStamp = env.DB.prepare(`UPDATE entries SET write_marker = ? WHERE workspace_id = ?`).bind(memoryWriteMarker(env, "delete"), personalWid);
+  // versioning: hard-delete: offboardingの同batchでライフサイクル終端を記録する。
+  // validity: retraction-exempt: 個人workspaceのoffboardingは閉じた行と対象を同時に削除する。
+  const entryDelete = env.DB.prepare(`DELETE FROM entries WHERE workspace_id = ?`).bind(personalWid);
+  const trashStamp = env.DB.prepare(`UPDATE entries_trash SET write_marker = ? WHERE workspace_id = ?`).bind(memoryWriteMarker(env, "delete"), personalWid);
+  const trashDelete = env.DB.prepare(`DELETE FROM entries_trash WHERE workspace_id = ?`).bind(personalWid);
   await env.DB.batch([
+    // versioning: exempt: offboardingの同batch削除を認可するmarkerのみを更新。
+    entryStamp,
+    trashStamp,
     // A version written between the chunks and here (a racing writer) must not outlive its entry.
     env.DB.prepare(
       // scope-exempt: offboarding: leftover versions of the removed member's rows and trash rows
+    // write-fence: parent-capability=entries（同batchのsnapshot・認可済み記憶をtriggerで検証）
       `DELETE FROM entry_versions WHERE entry_id IN (SELECT id FROM entries WHERE workspace_id = ?1 UNION SELECT id FROM entries_trash WHERE workspace_id = ?1)`,
     ).bind(personalWid),
     // A life-end marker, in the SAME batch as the DELETE below -- a fire-and-forget write here
@@ -610,13 +624,15 @@ export async function cleanupMemberData(
     // Edges before entries: the edge delete resolves endpoints through the
     // entries table, so it has to run while the rows still exist.
     env.DB.prepare(
+      `UPDATE edges SET write_marker = ? WHERE ${edgePredicate}`,
+    ).bind(memoryWriteMarker(env, "delete"), personalWid, personalWid),
+    env.DB.prepare(
       // scope-exempt: offboarding: deletes exactly the edges whose endpoints are in the removed member's workspace, per the two subselects
-      `DELETE FROM edges WHERE source_id IN (SELECT id FROM entries WHERE workspace_id = ?) OR target_id IN (SELECT id FROM entries WHERE workspace_id = ?)`,
+      `DELETE FROM edges WHERE ${edgePredicate}`,
     ).bind(personalWid, personalWid),
-    // versioning: hard-delete: member removal
-    // validity: retraction-exempt: the member's own rows go together, closers and the rows they closed alike
-    env.DB.prepare(`DELETE FROM entries WHERE workspace_id = ?`).bind(personalWid),
-    env.DB.prepare(`DELETE FROM entries_trash WHERE workspace_id = ?`).bind(personalWid),
+    // versioning: exempt: offboarding。直前にライフサイクル終端を同batchへ記録済み。
+    entryDelete,
+    trashDelete,
     env.DB.prepare(`DELETE FROM memberships WHERE user_id = ?`).bind(userId),
     env.DB.prepare(`DELETE FROM workspaces WHERE id = ?`).bind(personalWid),
   ]);

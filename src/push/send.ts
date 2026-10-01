@@ -1,3 +1,4 @@
+import { reserveD1Sql, remainingD1Sql } from "../runtime/d1-budget";
 /**
  * The Web Push sender: reads due items for one workspace, encrypts a
  * notification per subscription (RFC 8291, src/push/crypto.ts), and posts it
@@ -42,7 +43,7 @@ export const PLATFORM_EXTERNAL_FETCH_BUDGET_PER_RUN = 50;
  * so the worst case is 1 + 2 x 50 + 1 = 102 D1 calls per invocation, well
  * under the 1,000 cap. The ring cursor below brings the rest in later runs.
  */
-export const MAX_PUSH_WORKSPACES_PER_RUN = 50;
+export const MAX_PUSH_WORKSPACES_PER_RUN = 4;
 /** Consecutive send failures a subscription tolerates before it is dropped. */
 const MAX_FAIL_COUNT = 5;
 /** Per-workspace delivery record: {entryId: {w: when_at, s: endpoint hashes that received it at that when_at}}. */
@@ -546,6 +547,7 @@ function computeTasks(push: WorkspacePush): void {
   push.candidates = [];
   push.tasks = [];
   for (const row of push.dueRows) {
+    if (!Number.isFinite(new Date(row.when_at as number).getTime())) continue;
     if (push.candidates.length >= MAX_NOTIFICATIONS_PER_RUN) break;
     const record = push.delivery[row.id as string];
     const have = new Set(record && record.w === row.when_at ? record.s : []);
@@ -599,6 +601,24 @@ async function sendReserved(env: Env, reserved: SendTask[]): Promise<void> {
   }
 }
 
+/** 送信前の重複抑止は維持し、失敗が確定した端末だけ次回の再試行へ戻す。 */
+async function retryFailedSends(env: Env, push: WorkspacePush, reserved: SendTask[], budget: PushBudget): Promise<boolean> {
+  let changed = false;
+  for (let i = 0; i < push.sends.length; i++) {
+    if (push.sends[i].result !== "failed") continue;
+    const { candidate, sub } = reserved[i];
+    const record = push.delivery[candidate.id];
+    if (record?.w === candidate.when_at) {
+      record.s = record.s.filter(hash => hash !== sub.endpoint_hash);
+      changed = true;
+    }
+  }
+  if (!changed) return false;
+  try { await env.OAUTH_KV.put(pushedKvKey(push.workspaceId), JSON.stringify(push.delivery)); }
+  catch (error) { logKvWriteFailure(budget, error); }
+  return true;
+}
+
 /** Re-reads the delivery record under the lease, so sends a run finished meanwhile are not repeated. */
 async function refreshTasks(env: Env, push: WorkspacePush): Promise<void> {
   push.delivery = await readDeliveryMap(env, push.workspaceId);
@@ -627,25 +647,36 @@ export type PushSkip = "busy" | "kv_write_failed" | "daily_kv_cap";
 export async function pushDueItems(
   env: Env, workspaceId: string, resolved?: Readonly<Config>, budget: PushBudget = newPushBudget(),
 ): Promise<PushDueItemsResult & { skipped?: PushSkip }> {
+  // 候補・購読の2読取と、失敗回数別の結果更新を送信前に確保する。
+  const allowance = Math.min(9, remainingD1Sql(env));
+  if (allowance < 2) return { sent: 0, candidates: 0, subscriptions: 0, results: [] };
+  const reservation = reserveD1Sql(env, allowance);
+  if (!reservation) return { sent: 0, candidates: 0, subscriptions: 0, results: [] };
+  env = reservation.env;
   budget.users = (budget.users ?? 0) + 1;
   try {
     const config = resolved ?? await resolveConfig(env);
     const push = await prepareWorkspacePush(env, workspaceId, Date.now(), config.TIMEZONE);
     const base = { candidates: push.candidates.length, subscriptions: push.subs.length };
     if (!push.tasks.length) return { sent: 0, ...base, results: [] };
+    if (remainingD1Sql(env) < Math.min(push.subs.length, 7)) return { sent: 0, ...base, results: [] };
 
     const lease = await acquireRunLease(env, budget);
     if (lease !== "held") return { sent: 0, ...base, results: [], skipped: lease };
 
     await refreshTasks(env, push);
     const reserved = reserve(push.tasks, budget);
-    if (reserved.length && await recordAhead(env, push, reserved, budget)) await sendReserved(env, reserved);
+    if (reserved.length && await recordAhead(env, push, reserved, budget)) {
+      await sendReserved(env, reserved);
+      await retryFailedSends(env, push, reserved, budget);
+    }
     await applySubscriptionOutcomes(env, push.sends);
     return {
       sent: okCount(push.sends), candidates: push.candidates.length, subscriptions: push.subs.length,
       results: toReportedOutcomes(push.sends), ...(budget.kvWriteFailed ? { skipped: "kv_write_failed" as const } : {}),
     };
   } finally {
+    reservation.release();
     budget.users--;
     if (budget.users === 0) await releaseRunLease(env, budget);
   }
@@ -688,7 +719,7 @@ function interleave(pushes: WorkspacePush[]): SendTask[] {
  * plus 1 lease delete. A run with nothing new writes nothing, and never reaches
  * the daily-cap check (FX3 finding 4) at all.
  */
-export async function pushDueItemsAllWorkspaces(
+async function pushDueItemsAllWorkspacesReserved(
   env: Env, resolved?: Readonly<Config>, budget: PushBudget = newPushBudget(),
 ): Promise<{ sent: number; skipped?: PushSkip }> {
   const ring = (((await env.DB.prepare(
@@ -726,6 +757,9 @@ export async function pushDueItemsAllWorkspaces(
       recorded.push(...own);
     }
     await sendReserved(env, reserved.filter(task => recorded.includes(task)));
+    for (const [push, own] of byPush) {
+      if (push.sends.length && await retryFailedSends(env, push, own, budget)) writesThisRun++;
+    }
     await applySubscriptionOutcomes(env, pushes.flatMap(p => p.sends));
 
     if (!budget.kvWriteFailed) {
@@ -774,4 +808,15 @@ export async function sendTestNotification(
   await applySubscriptionOutcomes(env, sends);
 
   return { sent: okCount(sends), subscriptions: subs.length, results: toReportedOutcomes(sends) };
+}
+
+export async function pushDueItemsAllWorkspaces(env: Env, resolved?: Readonly<Config>, budget: PushBudget = newPushBudget()): Promise<{ sent: number; skipped?: PushSkip }> {
+  const allowance = Math.min(49, remainingD1Sql(env));
+  if (allowance < 10) return { sent: 0 };
+  // 4 workspaceの候補・購読SELECTと、送信ごとの最悪1更新文を確保する。
+  budget.fetchesLeft = Math.min(budget.fetchesLeft, allowance - 9);
+  const reservation = reserveD1Sql(env, allowance);
+  if (!reservation) return { sent: 0 };
+  try { return await pushDueItemsAllWorkspacesReserved(reservation.env, resolved, budget); }
+  finally { reservation.release(); }
 }

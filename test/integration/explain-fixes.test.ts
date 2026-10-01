@@ -4,6 +4,7 @@ import { makeExplainFixture, restRecall, mcpRecall, NOW, type ExplainFixture } f
 import { rerankWithTimeDecayTraced, type VectorizeMatch } from "../../src/recall/math";
 import { renderRecallText } from "../../src/recall/render";
 import type { RecallMatch, WhyTrace } from "../../src/recall/types";
+import { embeddingMetadata } from "../../src/embedding/profile";
 import { DEFAULTS } from "../../src/config";
 
 const DAY = 86_400_000;
@@ -13,7 +14,7 @@ afterEach(() => f.close());
 
 const Q = "query=atlas%20ledger&topK=5&explain=1";
 const vec = (id: string, score: number, ageDays: number, tags: string[], extra: Record<string, unknown> = {}) =>
-  ({ id, score, metadata: { parentId: id, isUpdate: false, created_at: NOW - ageDays * DAY, tags, ...extra } });
+  ({ id, score, metadata: { ...embeddingMetadata(), parentId: id, isUpdate: false, created_at: NOW - ageDays * DAY, tags, ...extra } });
 
 describe("dense_rank leaks no private match", () => {
   it("a foreign vector ranked above the caller's does not shift the caller's dense_rank", async () => {

@@ -2,9 +2,9 @@
  * The guard the schema-parity tests structurally cannot be.
  *
  * test/unit/db-init.test.ts and test/integration/graph-read-budget.test.ts both
- * compare `db/schema.sql` against `src/db/init.ts`. Those two agreeing says
- * nothing about the database an upgraded brain is actually running: schema.sql
- * only ever runs against a fresh install (`npm run db:migrate`), and init.ts's
+ * compare the two-file reference schema against `src/db/init.ts`. Those agreeing says
+ * nothing about the database an upgraded brain is actually running: the SQL files
+ * run only in local fresh-DB tests, and init.ts's
  * `CREATE TABLE IF NOT EXISTS` is a no-op the moment the table exists. A column
  * added to a table that already shipped therefore reaches every NEW brain and no
  * EXISTING one, and both declarations agree the whole time. That is how
@@ -13,22 +13,21 @@
  *
  * So this asks the only question that distinguishes the two: take a database
  * carrying an EARLIER version of a table, run the real initialisation against
- * it, and require that every column db/schema.sql declares today is there
+ * it, and require that every column the reference SQL declares today is there
  * afterwards — and that a write binding all of them lands.
  *
  * The legacy shapes below are frozen historical DDL, deliberately not derived
- * from schema.sql. Deriving them would make this test vacuous: a newly added
+ * from the reference SQL. Deriving them would make this test vacuous: a newly added
  * column would appear in the "old" table too and there would be nothing to
- * migrate. Frozen, a column added to schema.sql without a matching entry in
+ * migrate. Frozen, a column added to either SQL file without a matching entry in
  * init.ts's ALTER maps fails here on the next run, which is the whole point.
  * Adding a TABLE fails the coverage test until its shape is recorded here.
  */
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
 import { initializeDatabase, resetDatabaseInit } from "../../src/db/init";
 import { makeTestEnv } from "../helpers/make-env";
 import { makeSqliteD1, type SqliteD1 } from "../helpers/sqlite-d1";
+import { readReferenceSchema } from "../helpers/reference-schema";
 
 /**
  * Every table shape a brain could have been created with before the columns it
@@ -39,6 +38,7 @@ import { makeSqliteD1, type SqliteD1 } from "../helpers/sqlite-d1";
  * fail here rather than silently only reaching new brains.
  */
 const LEGACY_SHAPES: Record<string, string> = {
+  schema_meta: `CREATE TABLE schema_meta (id TEXT PRIMARY KEY, version INTEGER NOT NULL, applied_at INTEGER NOT NULL)`,
   // v1. Everything after vector_ids arrived by ALTER.
   entries: `CREATE TABLE entries (id TEXT PRIMARY KEY, content TEXT NOT NULL, tags TEXT NOT NULL DEFAULT '[]', source TEXT NOT NULL DEFAULT 'api', created_at INTEGER NOT NULL, vector_ids TEXT NOT NULL DEFAULT '[]')`,
   // Issue #16, before v3 denormalised the workspace onto each edge.
@@ -57,6 +57,18 @@ const LEGACY_SHAPES: Record<string, string> = {
   // target_user_id and workspace_id a release later.
   admin_events: `CREATE TABLE admin_events (id TEXT PRIMARY KEY, actor_id TEXT NOT NULL DEFAULT '', event TEXT NOT NULL, payload TEXT NOT NULL DEFAULT '{}', created_at INTEGER NOT NULL)`,
   maintenance_cursor: `CREATE TABLE maintenance_cursor (id INTEGER PRIMARY KEY CHECK (id = 1), workspace_id TEXT NOT NULL DEFAULT '', advanced_at INTEGER NOT NULL DEFAULT 0)`,
+  // Existing single-purpose infrastructure tables. Shapes with a comment below
+  // predate a later ALTER; the rest have never widened since first release.
+  migration_control: `CREATE TABLE migration_control (id TEXT PRIMARY KEY, locked_at INTEGER NOT NULL, reason TEXT NOT NULL)`,
+  memory_write_admissions: `CREATE TABLE memory_write_admissions (token TEXT PRIMARY KEY, started_at INTEGER NOT NULL, expires_at INTEGER NOT NULL)`,
+  memory_write_epoch: `CREATE TABLE memory_write_epoch (id TEXT PRIMARY KEY, generation TEXT NOT NULL)`,
+  embedding_migration_generation: `CREATE TABLE embedding_migration_generation (id TEXT PRIMARY KEY, generation TEXT NOT NULL)`,
+  integration_state_generation: `CREATE TABLE integration_state_generation (id TEXT PRIMARY KEY, generation TEXT NOT NULL, restore_count INTEGER NOT NULL DEFAULT 0)`,
+  integration_provider_generation: `CREATE TABLE integration_provider_generation (provider TEXT PRIMARY KEY, generation TEXT NOT NULL, version INTEGER NOT NULL DEFAULT 0, draining INTEGER NOT NULL DEFAULT 0, lease_owner TEXT, lease_expires_at INTEGER)`,
+  oauth_registration_quota: `CREATE TABLE oauth_registration_quota (id TEXT PRIMARY KEY, window_start INTEGER NOT NULL, registration_count INTEGER NOT NULL)`,
+  vector_cleanup_ops: `CREATE TABLE vector_cleanup_ops (op_id TEXT PRIMARY KEY, entry_id TEXT NOT NULL, vector_ids TEXT NOT NULL, created_at INTEGER NOT NULL, ready INTEGER NOT NULL DEFAULT 0, expires_at INTEGER NOT NULL)`,
+  append_receipts: `CREATE TABLE append_receipts (entry_id TEXT PRIMARY KEY, operation_id TEXT NOT NULL UNIQUE, request_hash TEXT NOT NULL, indexed INTEGER NOT NULL, completed_at INTEGER NOT NULL)`,
+  restore_state: `CREATE TABLE restore_state (id TEXT PRIMARY KEY, backup_id TEXT NOT NULL, started_at INTEGER NOT NULL, next_offset INTEGER NOT NULL DEFAULT 0, next_edge_offset INTEGER NOT NULL DEFAULT 0, completed_at INTEGER)`,
   // Projects registry. Never widened since it shipped.
   projects: `CREATE TABLE projects (id TEXT NOT NULL, workspace_id TEXT NOT NULL, name TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', aliases TEXT NOT NULL DEFAULT '[]', status TEXT NOT NULL DEFAULT 'active', created_at INTEGER NOT NULL, updated_at INTEGER, PRIMARY KEY (workspace_id, id))`,
   // Web Push subscriptions. Never widened since it shipped.
@@ -94,10 +106,14 @@ function stripSqlComments(sql: string): string {
 /** Table-level constraints, which sit in the column list but are not columns. */
 const CONSTRAINT_KEYWORDS = new Set(["primary", "unique", "check", "foreign", "constraint"]);
 
-/** Column name -> declared type, per table, as db/schema.sql declares them today. */
+/** Column name -> declared type, per table, as the reference SQL declares them today. */
 function declaredTables(sql: string): Record<string, Record<string, string>> {
   const tables: Record<string, Record<string, string>> = {};
-  for (const match of stripSqlComments(sql).matchAll(/CREATE TABLE (?:IF NOT EXISTS )?(\w+)\s*\(([\s\S]*?)\n\s*\);/g)) {
+  // entry_counts is an atomic derived-index unit covered by db-init tests. Its
+  // one-line CREATE used to sit at EOF; after the reference schema was split it
+  // would otherwise consume the next file's first multiline CREATE.
+  const declarations = stripSqlComments(sql).replace(/CREATE TABLE IF NOT EXISTS entry_counts \([^;]*\);/g, "");
+  for (const match of declarations.matchAll(/CREATE TABLE (?:IF NOT EXISTS )?(\w+)\s*\(([\s\S]*?)\n\s*\);/g)) {
     const [, table, body] = match;
     const columns: Record<string, string> = {};
     let depth = 0;
@@ -123,7 +139,7 @@ function declaredTables(sql: string): Record<string, Record<string, string>> {
   return tables;
 }
 
-const DECLARED = declaredTables(readFileSync(resolve(import.meta.dirname, "../../db/schema.sql"), "utf8"));
+const DECLARED = declaredTables(readReferenceSchema());
 
 /** A value SQLite will accept for a column of this declared type. */
 const sampleFor = (type: string, index: number): string | number =>
@@ -163,7 +179,8 @@ describe("an existing database gains every column db/schema.sql declares", () =>
       await d1.db.exec(legacyDdl);
       // One row written by the release that shipped this shape. It must survive,
       // and it must be readable through the columns the table gains.
-      const legacyValues = legacyColumns.map((c, i) => sampleForColumn(table, c, declared[c], i + 1));
+      const legacyValues = legacyColumns.map((c, i) =>
+        table === "schema_meta" && c === "version" ? 1 : sampleForColumn(table, c, declared[c], i + 1));
       await d1.db
         .prepare(`INSERT INTO ${table} (${legacyColumns.join(", ")}) VALUES (${legacyColumns.map(() => "?").join(", ")})`)
         .bind(...legacyValues)
@@ -196,10 +213,25 @@ describe("an existing database gains every column db/schema.sql declares", () =>
       // them is the behaviour every caller depends on. OR REPLACE only so the
       // fixture row's key constraints do not decide the outcome.
       const columns = Object.keys(declared);
+      const values = columns.map((c, i) => {
+        if (c === "write_marker") return d1.fixtureMarker();
+        if (table === "maintenance_cursor" && c === "id") return 1;
+        return sampleForColumn(table, c, declared[c], i + 100);
+      });
+      if (table === "edges") {
+        const sourceId = String(values[columns.indexOf("source_id")]);
+        const targetId = String(values[columns.indexOf("target_id")]);
+        for (const id of [sourceId, targetId]) {
+          await d1.db.prepare(
+            `INSERT INTO entries (id, content, tags, source, created_at, vector_ids, write_marker)
+             VALUES (?, ?, '[]', 'test', 1, '[]', ?)`,
+          ).bind(id, id, d1.fixtureMarker()).run();
+        }
+      }
       await expect(
         d1.db
           .prepare(`INSERT OR REPLACE INTO ${table} (${columns.join(", ")}) VALUES (${columns.map(() => "?").join(", ")})`)
-          .bind(...columns.map((c, i) => (table === "maintenance_cursor" && c === "id" ? 1 : sampleForColumn(table, c, declared[c], i + 100))))
+          .bind(...values)
           .run(),
       ).resolves.toMatchObject({ success: true });
     });

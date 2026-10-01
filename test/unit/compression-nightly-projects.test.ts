@@ -29,7 +29,7 @@ function digestAI() {
   });
   return {
     run: vi.fn().mockImplementation(async (model: string, opts: any) => {
-      if (model.startsWith("@cf/baai/bge")) return { data: [new Array(384).fill(0.1)] };
+      if (model.includes("embeddinggemma")) return { data: [new Array(768).fill(0.1)] };
       if (opts?.stream) return sse("A digest of the memories.");
       return { response: "3" };
     }),
@@ -54,7 +54,7 @@ describe("nightly per-project digests", () => {
   async function run(workspaceId?: string | null) {
     const pending: Promise<unknown>[] = [];
     const ctx = { waitUntil: (p: Promise<unknown>) => pending.push(p) } as unknown as ExecutionContext;
-    const result = await runNightlyCompression(env, ctx, workspaceId);
+    const result = await runNightlyCompression(sqlite.admitEnv(env), ctx, workspaceId);
     await Promise.allSettled(pending);
     return result;
   }
@@ -81,7 +81,7 @@ describe("nightly per-project digests", () => {
   afterEach(() => sqlite.close());
 
   it("digests a project with 25 eligible entries into a synthesized, project-tagged entry", async () => {
-    await createProject(db, WS, { id: "site", name: "Site" });
+    await createProject(db, WS, { id: "site", name: "Site" }, sqlite.admitEnv(env));
     seed(WS, ["project:site"], 25);
 
     const { digestsWritten } = await run(WS);
@@ -91,8 +91,24 @@ describe("nightly per-project digests", () => {
     expect(await rolledUp()).toBe(25);
   });
 
+  it("汎用タグを共有しても登録Projectの外の記憶を要約へ混ぜない", async () => {
+    await createProject(db, WS, { id: "site", name: "Site" }, sqlite.admitEnv(env));
+    seed(WS, ["project:site", "work"], 12);
+    seed(WS, ["work"], 12);
+
+    const { digestsWritten } = await run(WS);
+
+    expect(digestsWritten).toBe(1);
+    expect(await digests()).toEqual([{ tags: ["project:site"], workspace_id: WS }]);
+    expect(await rolledUp()).toBe(12);
+    const row = await sqlite.db.prepare(
+      `SELECT COUNT(*) AS c FROM entries WHERE tags = '["work"]' AND workspace_id = ?`
+    ).bind(WS).first() as { c: number };
+    expect(row.c).toBe(12);
+  });
+
   it("labels the digest with the project's name, not its raw key or 'tagged'", async () => {
-    await createProject(db, WS, { id: "signpath", name: "SignPath", aliases: ["hosting"] });
+    await createProject(db, WS, { id: "signpath", name: "SignPath", aliases: ["hosting"] }, sqlite.admitEnv(env));
     seed(WS, ["project:signpath"], 6);
     seed(WS, ["hosting"], 6);
 
@@ -109,8 +125,8 @@ describe("nightly per-project digests", () => {
   });
 
   it("uses the existing 10-entry threshold: 9 is skipped, 10 is digested", async () => {
-    await createProject(db, WS, { id: "thin", name: "Thin" });
-    await createProject(db, WS, { id: "enough", name: "Enough" });
+    await createProject(db, WS, { id: "thin", name: "Thin" }, sqlite.admitEnv(env));
+    await createProject(db, WS, { id: "enough", name: "Enough" }, sqlite.admitEnv(env));
     seed(WS, ["project:thin"], 9);
     seed(WS, ["project:enough"], 10);
 
@@ -121,7 +137,7 @@ describe("nightly per-project digests", () => {
   it("counts entries carrying an alias as members", async () => {
     // 10 stays under the frequency-driven topic threshold (more than 10), so only the
     // project digest can claim these.
-    await createProject(db, WS, { id: "site", name: "Site", aliases: ["hosting"] });
+    await createProject(db, WS, { id: "site", name: "Site", aliases: ["hosting"] }, sqlite.admitEnv(env));
     seed(WS, ["hosting"], 10);
 
     expect((await run(WS)).digestsWritten).toBe(1);
@@ -129,8 +145,8 @@ describe("nightly per-project digests", () => {
   });
 
   it("skips archived projects", async () => {
-    await createProject(db, WS, { id: "old", name: "Old" });
-    await updateProject(db, WS, "old", { status: "archived" });
+    await createProject(db, WS, { id: "old", name: "Old" }, sqlite.admitEnv(env));
+    await updateProject(db, WS, "old", { status: "archived" }, sqlite.admitEnv(env));
     seed(WS, ["project:old"], 25);
 
     expect((await run(WS)).digestsWritten).toBe(0);
@@ -139,7 +155,7 @@ describe("nightly per-project digests", () => {
   });
 
   it("keeps the frequency-driven topic digests alongside the project ones", async () => {
-    await createProject(db, WS, { id: "site", name: "Site" });
+    await createProject(db, WS, { id: "site", name: "Site" }, sqlite.admitEnv(env));
     seed(WS, ["project:site"], 12);
     seed(WS, ["gardening"], 15);
 
@@ -155,8 +171,8 @@ describe("nightly per-project digests", () => {
   });
 
   it("only digests the night's workspace and never pools another workspace's members", async () => {
-    await createProject(db, WS, { id: "site", name: "Site" });
-    await createProject(db, OTHER_WS, { id: "site", name: "Site B" });
+    await createProject(db, WS, { id: "site", name: "Site" }, sqlite.admitEnv(env));
+    await createProject(db, OTHER_WS, { id: "site", name: "Site B" }, sqlite.admitEnv(env));
     seed(WS, ["project:site"], 11);
     seed(OTHER_WS, ["project:site"], 11);
 
@@ -172,8 +188,8 @@ describe("nightly per-project digests", () => {
     const rolledIds = async () =>
       ((await sqlite.db.prepare(`SELECT id FROM entries WHERE tags LIKE '%"rolled-up"%'`).all()).results as { id: string }[]).map(r => r.id);
     const seedTwoWorkspaces = async () => {
-      await createProject(db, WS, { id: "roadmap", name: "Roadmap", aliases: ["q3"] });
-      await createProject(db, OTHER_WS, { id: "roadmap", name: "Roadmap", aliases: ["pricing"] });
+      await createProject(db, WS, { id: "roadmap", name: "Roadmap", aliases: ["q3"] }, sqlite.admitEnv(env));
+      await createProject(db, OTHER_WS, { id: "roadmap", name: "Roadmap", aliases: ["pricing"] }, sqlite.admitEnv(env));
       seed(WS, ["project:roadmap"], 12);
       seed(OTHER_WS, ["project:roadmap"], 12);
       // Only 10 each, so the topic pass (more than 10) cannot claim them either.
@@ -206,8 +222,8 @@ describe("nightly per-project digests", () => {
     });
 
     it("does roll up a workspace's own alias entries", async () => {
-      await createProject(db, WS, { id: "roadmap", name: "Roadmap", aliases: ["q3"] });
-      await createProject(db, OTHER_WS, { id: "roadmap", name: "Roadmap", aliases: ["pricing"] });
+      await createProject(db, WS, { id: "roadmap", name: "Roadmap", aliases: ["q3"] }, sqlite.admitEnv(env));
+      await createProject(db, OTHER_WS, { id: "roadmap", name: "Roadmap", aliases: ["pricing"] }, sqlite.admitEnv(env));
       seed(WS, ["project:roadmap"], 4);
       seed(WS, ["q3"], 8);
       seed(OTHER_WS, ["pricing"], 10);
@@ -223,7 +239,7 @@ describe("nightly per-project digests", () => {
       .prepare(`INSERT INTO projects (id, workspace_id, name, description, aliases, status, created_at) VALUES ('big', ?, 'Big', '', ?, 'active', 1)`)
       .bind(WS, JSON.stringify(aliases))
       .run();
-    await createProject(db, WS, { id: "small", name: "Small" });
+    await createProject(db, WS, { id: "small", name: "Small" }, sqlite.admitEnv(env));
     seed(WS, ["project:big"], 12);
     seed(WS, ["project:small"], 12);
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
@@ -236,15 +252,15 @@ describe("nightly per-project digests", () => {
   });
 
   it("does not digest entries of a workspace that has no registry row for the slug", async () => {
-    await createProject(db, WS, { id: "site", name: "Site" });
+    await createProject(db, WS, { id: "site", name: "Site" }, sqlite.admitEnv(env));
     seed(OTHER_WS, ["project:site"], 25);
 
     expect((await run(WS)).digestsWritten).toBe(0);
   });
 
   it("with no workspace slice (pre-v3 fallback) digests every active project inside its own workspace", async () => {
-    await createProject(db, WS, { id: "site", name: "Site" });
-    await createProject(db, OTHER_WS, { id: "app", name: "App" });
+    await createProject(db, WS, { id: "site", name: "Site" }, sqlite.admitEnv(env));
+    await createProject(db, OTHER_WS, { id: "app", name: "App" }, sqlite.admitEnv(env));
     seed(WS, ["project:site"], 12);
     seed(OTHER_WS, ["project:app"], 12);
 
@@ -258,7 +274,7 @@ describe("nightly per-project digests", () => {
   it(`stays inside the ${COMPRESSION_MAX_TAGS_PER_RUN}-per-run bound and the rotation reaches every project`, async () => {
     const slugs = ["p1", "p2", "p3", "p4", "p5", "p6"];
     for (const slug of slugs) {
-      await createProject(db, WS, { id: slug, name: slug });
+      await createProject(db, WS, { id: slug, name: slug }, sqlite.admitEnv(env));
       seed(WS, [`project:${slug}`], 12);
     }
 
@@ -266,23 +282,23 @@ describe("nightly per-project digests", () => {
     expect(first.digestsWritten).toBe(COMPRESSION_MAX_TAGS_PER_RUN);
     expect(await digests()).toHaveLength(COMPRESSION_MAX_TAGS_PER_RUN);
 
-    await run(WS);
+    for (let i = COMPRESSION_MAX_TAGS_PER_RUN; i < slugs.length; i += COMPRESSION_MAX_TAGS_PER_RUN) await run(WS);
     expect((await digests()).map(d => d.tags[0]).sort()).toEqual(slugs.map(s => `project:${s}`));
   });
 
   it("names project members in the shared rotation cursor", async () => {
     for (const slug of ["p1", "p2", "p3", "p4", "p5"]) {
-      await createProject(db, WS, { id: slug, name: slug });
+      await createProject(db, WS, { id: slug, name: slug }, sqlite.admitEnv(env));
       seed(WS, [`project:${slug}`], 12);
     }
 
     await run(WS);
 
-    expect(await env.OAUTH_KV.get("compression:tag-cursor")).toBe("project:p4");
+    expect(await env.OAUTH_KV.get("compression:tag-cursor")).toBe(`project:p${COMPRESSION_MAX_TAGS_PER_RUN}`);
   });
 
   it("a project with too few entries does not stop topic digests", async () => {
-    await createProject(db, WS, { id: "thin", name: "Thin" });
+    await createProject(db, WS, { id: "thin", name: "Thin" }, sqlite.admitEnv(env));
     seed(WS, ["project:thin"], 3);
     seed(WS, ["gardening"], 15);
 
@@ -291,7 +307,7 @@ describe("nightly per-project digests", () => {
   });
 
   it("reads the registry in the same batch as the candidate query, at no extra subrequest", async () => {
-    await createProject(db, WS, { id: "site", name: "Site" });
+    await createProject(db, WS, { id: "site", name: "Site" }, sqlite.admitEnv(env));
     seed(WS, ["gardening"], 15);
     sqlite.batches.length = 0;
     sqlite.issued.length = 0;
@@ -305,7 +321,7 @@ describe("nightly per-project digests", () => {
     expect(first[1]).toMatch(/FROM projects WHERE workspace_id IN \(\?\) AND status = 'active'/);
     expect(first[2]).toMatch(/idx_entries_conflict_held/);
     // Nothing else read the registry: one candidate read, whatever the number of projects.
-    expect(sqlite.issued.filter(s => /FROM projects/.test(s))).toEqual([]);
+    expect(sqlite.issued.filter(s => /FROM projects/.test(s))).toHaveLength(1);
   });
 
   it("falls back to topic digests alone when the registry read cannot be batched", async () => {

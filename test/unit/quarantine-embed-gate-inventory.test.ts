@@ -47,18 +47,11 @@ function scanDirectCalls(): Site[] {
  * exists to catch: an embed of a row whose current tags were never checked.
  */
 const ACCOUNTED_FOR: { file: string; line: number; why: string }[] = [
-  {
-    file: "src/capture/store.ts", line: 204,
-    why: "upsertEntryVectors' OWN upsert loop — the gate that refuses held tags sits at the top of this same function, before any chunking or embedding runs.",
-  },
-  {
-    file: "src/capture/store.ts", line: 832,
-    why: "appendToEntry's short branch: gated inline by `!heldTags && !alreadyHeld && !chunk` immediately above — a newly-held or already-held row never reaches this call. A retry that discovers the row became held after an earlier attempt's chunk landed here retires and forgets that chunk before re-checking the gate (Codex recheck, T-0089.4.2).",
-  },
-  {
-    file: "src/capture/share.ts", line: 171,
-    why: "restampVectorWorkspace re-stamps EXISTING vectors' metadata (workspace_id) fetched by getByIds — it embeds no new content and adds no vector. Codex recheck (T-0089.4.2, class A): the earlier reasoning here (\"a held row has vector_ids = '[]' so the loop never runs\") assumed the vectorIds this fire-and-forget call re-stamps were read at the SAME moment as the check — they are read earlier by its caller, and a hold landing in that gap empties vector_ids in D1 and deletes its vectors separately, not atomically, so a stale-but-not-yet-deleted vector could still be named here. Fixed with a fresh isHeld re-check of each vector's owning row immediately before the upsert, proven by test/unit/restamp-held-race.test.ts — not by this comment alone.",
-  },
+  {"file": "src/capture/store.ts", "line": 282, "why": "索引移行・普通storeの入口でisHeld(tags)を拒否する。"},
+  {"file": "src/capture/store.ts", "line": 552, "why": "upsertEntryVectors自身の入口でisHeld(tags)を拒否する。"},
+  {"file": "src/capture/store.ts", "line": 1072, "why": "appendはheldRowなら埋込みを省略し、空配列だけを渡す。競合後のholdも再検査する。"},
+  {"file": "src/capture/store.ts", "line": 1328, "why": "保留追記の復旧はINDEXABLE_SQLとvalidateIndexableMemoryで現在のholdを拒否する。"},
+  {"file": "src/capture/share.ts", "line": 172, "why": "既存vectorのworkspace再stampだけ。upsert直前に現在の親行のisHeldを再検査する。"},
 ];
 
 describe("every direct Vectorize upsert/insert call outside upsertEntryVectors's own gate is accounted for", () => {

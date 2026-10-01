@@ -16,7 +16,7 @@ import { resetDatabaseInit, initializeDatabase } from "../../src/db/init";
 import { makeSqliteD1, type SqliteD1 } from "../helpers/sqlite-d1";
 import { makeTestEnv, makeMemoryKV } from "../helpers/make-env";
 import { ftsShortToken, resetFtsReadyMemo } from "../../src/recall/fts";
-import { tokenizeQuery } from "../../src/text/tokenize";
+import { tokenizeQueryDetailed } from "../../src/text/lexical-query";
 import { FTS_READY_KV_KEY, QUERY_SATURATION_FRACTION } from "../../src/constants";
 import type { Env } from "../../src/env";
 import type { Identity } from "../../src/lib/identity";
@@ -122,7 +122,7 @@ describe("T-0059 equivalence: FTS-counted distillation vs the LIKE scan it repla
 
       // T-0074: a short token's df is sampled, not counted, so the two paths may rank it differently
       // (by design: it can only fill a slot the counted terms leave, see distill-short-token-skew.test.ts).
-      const hasShortToken = tokenizeQuery(trial.query).some(ftsShortToken);
+      const hasShortToken = tokenizeQueryDetailed(trial.query).some(term => ftsShortToken(term.value));
       if (!hasShortToken && ftsOut.query !== likeOut.query) {
         divergences.push(`${label}: rebuilt query differs — like=${JSON.stringify(likeOut.query)} fts=${JSON.stringify(ftsOut.query)}`);
         continue;
@@ -225,8 +225,46 @@ const memberOf = (personal: string): Identity => ({
 
 function seedIn(sqlite: SqliteD1, id: string, workspaceId: string, content: string, createdAt: number) {
   sqlite.seed({ id, content, createdAt });
-  sqlite.db.prepare(`UPDATE entries SET workspace_id = ? WHERE id = ?`).bind(workspaceId, id).run();
+  return sqlite.db.prepare(`UPDATE entries SET workspace_id = ? WHERE id = ?`).bind(workspaceId, id).run();
 }
+
+describe("single-token df uses the same scoped FTS/LIKE path as multi-token df", () => {
+  it.each(["like", "fts"] as const)("counts a single term with workspace and time bounds via %s", async mode => {
+    resetDatabaseInit();
+    resetFtsReadyMemo();
+    const sqlite = makeSqliteD1();
+    try {
+      const env: Env = makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV() });
+      await initializeDatabase(env);
+      await seedIn(sqlite, "early", "ws-a", "quartz first", 100);
+      await seedIn(sqlite, "inside", "ws-a", "quartz second", 200);
+      await seedIn(sqlite, "late", "ws-a", "ordinary note", 250);
+      await seedIn(sqlite, "company", "ws-co", "quartz team", 200);
+      await seedIn(sqlite, "foreign", "ws-other", "quartz outsider", 200);
+      if (mode === "fts") {
+        await env.OAUTH_KV.put(FTS_READY_KV_KEY, "1");
+        resetFtsReadyMemo();
+      }
+      const identity: Identity = { ...memberOf("ws-a"), companyWorkspaceIds: ["ws-co"] };
+      const bounded = await distillToRareTerms("quartz", env, undefined, { after: 150, before: 225 }, identity, "personal");
+      expect(bounded.distillSource).toBe(mode);
+      expect(bounded.total).toBe(1);
+      expect(bounded.df?.get("quartz")).toBe(1);
+
+      const personal = await distillToRareTerms("quartz", env, undefined, {}, identity, "personal");
+      expect(personal.distillSource).toBe(mode);
+      expect(personal.total).toBe(3);
+      expect(personal.df?.get("quartz")).toBe(2);
+
+      const company = await distillToRareTerms("quartz", env, undefined, {}, identity, "company", "ws-co");
+      expect(company.distillSource).toBe(mode);
+      expect(company.total).toBe(1);
+      expect(company.df?.get("quartz")).toBe(1);
+    } finally {
+      sqlite.close();
+    }
+  });
+});
 
 describe("T-0059 scope: the FTS count path never counts another workspace's rows", () => {
   it("a foreign workspace's matching rows do not inflate df or total", async () => {
@@ -592,7 +630,7 @@ describe("pricing the df counts with entries_fts_vocab", () => {
 
   it("drops the price, not the combined counts, when the vocabulary probes would pass D1's bound-parameter limit", async () => {
     const { sqlite, env } = await brain(10);
-    sqlite.db.prepare(`UPDATE entries SET workspace_id = 'ws-personal'`).run();
+    await sqlite.db.prepare(`UPDATE entries SET workspace_id = 'ws-personal' WHERE 1`).run();
     const out = await distillToRareTerms(sixteen.join(" "), env, undefined, {}, memberOfTeams(30));
     expect(out.distillSource).toBe("fts");
     const combined = sqlite.batches.flat().find(sql => sql.startsWith("WITH RECURSIVE g AS MATERIALIZED"));
@@ -603,7 +641,7 @@ describe("pricing the df counts with entries_fts_vocab", () => {
 
   it("keeps the per-term counts when even the unpriced statement would pass the limit", async () => {
     const { sqlite, env } = await brain(10);
-    sqlite.db.prepare(`UPDATE entries SET workspace_id = 'ws-personal'`).run();
+    await sqlite.db.prepare(`UPDATE entries SET workspace_id = 'ws-personal' WHERE 1`).run();
     const out = await distillToRareTerms(sixteen.join(" "), env, undefined, {}, memberOfTeams(70));
     expect(out.distillSource).toBe("fts");
     expect(sqlite.batches.flat().some(sql => sql.startsWith("WITH RECURSIVE g AS MATERIALIZED"))).toBe(false);

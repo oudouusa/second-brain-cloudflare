@@ -281,24 +281,9 @@ function buildRecallPlan(project, workspace, now = Date.now()) {
   return [{ query: 'recent decisions and context', topK: 5, workspace, after: now - FOURTEEN_DAYS_MS }];
 }
 
-function buildRecallUrl(baseUrl, step) {
-  const p = new URLSearchParams();
-  p.set('query', step.query);
-  p.set('topK', String(step.topK));
-  p.set('workspace', step.workspace);
-  if (step.project) p.set('project', step.project);
-  if (step.after) p.set('after', String(step.after));
-  // 4.0 decision (director + UX advisor): no hook-initiated recall pays for
-  // LLM insight synthesis. The Claude Code hook used at most 200 characters
-  // of that synthesized text (see frameOutput's own insight line, now
-  // removed below) at a cost of 47-76 neurons of the user's free daily
-  // allowance per call - the AI tool reasons over the raw memories itself,
-  // so the synthesis was wasted spend for every client, Claude included.
-  // src/routes/recall.ts does not read this parameter yet (a separate BE
-  // lane is adding it on v4/ux-be-2), so the Worker ignores it harmlessly
-  // until that merges; sending it now is forward compatible and safe.
-  p.set('synthesize', '0');
-  return `${baseUrl}/recall?${p.toString()}`;
+function buildRecallUrl(baseUrl) { return `${baseUrl}/recall`; }
+function buildRecallBody(step) {
+  return JSON.stringify({ ...step, synthesize: false });
 }
 
 function buildBriefUrl(baseUrl, project, workspace) {
@@ -623,7 +608,9 @@ async function performRecall({
     const stepTimeoutMs = deadline !== null ? remaining() : recallTimeoutMs;
     try {
       res = await fetchWithTimeout(buildRecallUrl(creds.baseUrl, step), {
-        headers: { Authorization: `Bearer ${creds.token}` },
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${creds.token}` },
+        body: buildRecallBody(step),
       }, stepTimeoutMs);
     } catch (e) {
       fail(`recall failed: ${e?.name === 'TimeoutError' ? `no reply within ${(stepTimeoutMs / 1000).toFixed(1)}s` : e?.message ?? 'network error'}`);
@@ -1138,7 +1125,7 @@ module.exports = {
   parseProjectLabel, projectSlug, parseProjectName, gitRemoteUrl,
   fetchWithTimeout, fail, hintFor, cachePath, workerMajorVersion, noticeOncePerDay,
   sessionCacheFile, writeSessionCache, readSessionCache, hasMarker, setMarker,
-  buildRecallPlan, buildRecallUrl, buildBriefUrl, fetchBrief, startBrief,
+  buildRecallPlan, buildRecallUrl, buildRecallBody, buildBriefUrl, fetchBrief, startBrief,
   cleanSnippet, compactBriefLines, frameOutput,
   performRecall,
   redactSecrets, stripInjectedContext, buildSessionCaptureBody, shouldCaptureSession, performCapture,

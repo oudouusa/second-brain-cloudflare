@@ -24,7 +24,7 @@ async function migrated(): Promise<SqliteD1> {
   return s;
 }
 function envFor(sq: SqliteD1) {
-  return makeTestEnv(undefined, { DB: sq.db as unknown as D1Database, OAUTH_KV: makeMemoryKV() });
+  return sq.admitEnv(makeTestEnv(undefined, { DB: sq.db as unknown as D1Database, OAUTH_KV: makeMemoryKV() }));
 }
 
 const mcpChange = { actorId: "u-1", channel: "mcp" as const };
@@ -55,7 +55,7 @@ describe("short append retry cannot reuse a vector after the row becomes held", 
     sq.seed({ id: "retry-held", content: "A plain note.", createdAt: 1000, tags: ["work"], vectorIds: [] });
     const base = envFor(sq);
     let injected = false;
-    const env = { ...base, DB: {
+    const env = { ...base, WRITE_ADMISSION_TOKEN: base.WRITE_ADMISSION_TOKEN, DB: {
       ...base.DB,
       prepare: (sql: string) => base.DB.prepare(sql),
       batch: async (statements: D1PreparedStatement[]) => {

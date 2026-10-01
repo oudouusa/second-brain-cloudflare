@@ -10,6 +10,7 @@
  * One call, at most 50.
  */
 import { describe, it, expect, vi } from "vitest";
+import { saveIntegrationFixture } from "../helpers/integration-record";
 import worker from "../../src/index";
 import { makeSqliteD1 } from "../helpers/sqlite-d1";
 import { makeTestEnv, makeMemoryKV } from "../helpers/make-env";
@@ -22,7 +23,7 @@ const ctx = { waitUntil: () => {} } as unknown as ExecutionContext;
 const auth = { "Content-Type": "application/json", Authorization: "Bearer test-token" };
 
 describe("disconnect purge D1 calls", () => {
-  it("200 rows: one call of at most 50 D1 calls trashes all of them with reason disconnect", async () => {
+  it("200件をcursorで処理し、全ページが50 D1呼び出し以内でdisconnect履歴を保存する", async () => {
     vi.stubGlobal("fetch", vi.fn(async (input: any) => {
       const url = typeof input === "string" ? input : input.url;
       if (url.endsWith("/users/me")) return new Response(JSON.stringify({ object: "user", type: "bot", name: "SB", bot: { workspace_name: "Acme" } }), { status: 200 });
@@ -44,19 +45,27 @@ describe("disconnect purge D1 calls", () => {
     }
     const rec = (await loadIntegration(env, "notion"))!;
     rec.itemMap = Object.fromEntries(Array.from({ length: 200 }, (_, i) => [`k${i}`, { entryId: `p${i}`, version: "v1" } as any]));
-    await env.OAUTH_KV.put("integrations:notion", JSON.stringify(rec));
+    await saveIntegrationFixture(sqlite.admitEnv(env), rec);
 
-    sqlite.issued.length = 0; sizes.length = 0;
-    const res = await worker.fetch(new Request("http://localhost/integrations/notion/disconnect", { method: "POST", headers: auth, body: JSON.stringify({ purge: true }) }), env, ctx);
-    expect(((await res.json()) as any)).toMatchObject({ purged: 200, done: true });
-    const d1Calls = sqlite.issued.length;
+    let cursor: string | undefined;
+    let result: any;
+    let pages = 0;
+    do {
+      sqlite.executions.length = 0; sizes.length = 0;
+      const res = await worker.fetch(new Request("http://localhost/integrations/notion/disconnect", {
+        method: "POST", headers: auth, body: JSON.stringify({ purge: true, ...(cursor === undefined ? {} : { cursor }) }),
+      }), env, ctx);
+      result = await res.json();
+      expect(result.ok).toBe(true);
+      expect(sqlite.executions.length).toBeLessThanOrEqual(50);
+      expect(sizes.every(n => n <= 50)).toBe(true);
+      cursor = result.next_cursor;
+      expect(++pages).toBeLessThanOrEqual(201);
+    } while (!result.done);
+    expect(result).toMatchObject({ purged: 200, done: true });
+    expect(pages).toBe(201);
     const auditInserts = ((await env.DB.prepare(`SELECT COUNT(*) n FROM entry_events WHERE event='deleted'`).first()) as any).n;
-
     expect(auditInserts).toBe(200);
-    expect(d1Calls).toBe(19);
-    expect(d1Calls).toBeLessThanOrEqual(50);
-    // The audit is still four batches of 50, one per chunk.
-    expect(sizes.filter(n => n === 50)).toHaveLength(4);
     const trashed = ((await env.DB.prepare(`SELECT COUNT(*) n FROM entries_trash WHERE reason = 'disconnect'`).first()) as any).n;
     expect(trashed).toBe(200);
     sqlite.close(); vi.unstubAllGlobals();

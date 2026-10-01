@@ -105,7 +105,7 @@ async function build(shape: Shape): Promise<Env> {
         metadata: { parentId: id, isUpdate: false, created_at: NOW - byId.get(id)!.age * DAY, tags: byId.get(id)!.tags ?? [] },
       })),
     });
-  const env = makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV(), VECTORIZE: makeVectorizeMock({ query }) });
+  const env = sqlite.admitEnv(makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV(), VECTORIZE: makeVectorizeMock({ query }) }));
   await initializeDatabase(env);
   const roots = await ensureTenantBootstrap(env);
   const ws = roots.ownerPersonalWorkspaceId;

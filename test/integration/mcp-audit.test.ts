@@ -2,27 +2,32 @@
  * MCP mutations must write the same entry_events trail as REST.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { Client } from "@modelcontextprotocol/client";
+import { InMemoryTransport } from "@modelcontextprotocol/client";
 import { buildMcpServer } from "../../src/mcp/server";
 import { makeSqliteD1, type SqliteD1 } from "../helpers/sqlite-d1";
 import { makeTestEnv, makeMemoryKV, makeVectorizeMock } from "../helpers/make-env";
 import { resetDatabaseInit, initializeDatabase } from "../../src/db/init";
 import { ensureTenantBootstrap } from "../../src/lib/tenancy";
 import { resolveIdentityFromToken } from "../../src/lib/identity";
+import { beginMemoryWriteAdmission } from "../../src/migration/write-lock";
 import type { Env } from "../../src/env";
 
-const ctx = { waitUntil: (p: Promise<unknown>) => { void p; } } as ExecutionContext;
-
-async function withClient(env: Env, identity: Awaited<ReturnType<typeof resolveIdentityFromToken>>, run: (c: Client) => Promise<void>) {
-  const server = buildMcpServer(env, ctx, identity ?? undefined);
+async function withClient(env: Env, identity: Awaited<ReturnType<typeof resolveIdentityFromToken>>, run: (c: Client, drain: () => Promise<void>) => Promise<void>) {
+  const pending: Promise<unknown>[] = [];
+  const ctx = { waitUntil: (p: Promise<unknown>) => { pending.push(p); } } as ExecutionContext;
+  const drain = async () => { while (pending.length) await Promise.allSettled(pending.splice(0)); };
+  const admission = await beginMemoryWriteAdmission(env, ctx);
+  const server = buildMcpServer(admission.env, admission.ctx, identity ?? undefined);
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   const client = new Client({ name: "audit-test", version: "1.0.0" });
   await Promise.all([client.connect(clientTransport), server.connect(serverTransport)]);
   try {
-    await run(client);
+    await run(client, drain);
   } finally {
     await client.close();
+    await drain();
+    await admission.finish();
   }
 }
 
@@ -44,7 +49,7 @@ describe("MCP audit trail", () => {
       }),
       AI: {
         run: vi.fn().mockImplementation(async (model: string) => {
-          if (model === "@cf/baai/bge-small-en-v1.5") return { data: [new Array(384).fill(0.1)] };
+          if (model === "@cf/google/embeddinggemma-300m") return { data: [new Array(768).fill(0.1)] };
           return { response: '{"importance":2,"canonical":false,"kind":"semantic"}' };
         }),
       } as unknown as Ai,
@@ -74,10 +79,12 @@ describe("MCP audit trail", () => {
 
   it("records appended on append", async () => {
     let id = "";
-    await withClient(env, identity, async (client) => {
+    await withClient(env, identity, async (client, drain) => {
       const stored = await client.callTool({ name: "remember", arguments: { content: "Base memory for append audit" } });
+      await drain();
       id = /ID: ([^\s]+)/.exec((stored.content as { text: string }[])[0].text)?.[1] ?? "";
-      await client.callTool({ name: "append", arguments: { id, addition: "follow-up detail" } });
+      const appended = await client.callTool({ name: "append", arguments: { id, addition: "follow-up detail" } });
+      expect(appended.isError, JSON.stringify(appended.content)).not.toBe(true);
     });
     expect(id).toBeTruthy();
     const trail = await events();
@@ -86,10 +93,12 @@ describe("MCP audit trail", () => {
 
   it("records updated on update", async () => {
     let id = "";
-    await withClient(env, identity, async (client) => {
+    await withClient(env, identity, async (client, drain) => {
       const stored = await client.callTool({ name: "remember", arguments: { content: "Base memory for update audit" } });
+      await drain();
       id = /ID: ([^\s]+)/.exec((stored.content as { text: string }[])[0].text)?.[1] ?? "";
-      await client.callTool({ name: "update", arguments: { id, content: "Replaced body for audit" } });
+      const updated = await client.callTool({ name: "update", arguments: { id, content: "Replaced body for audit" } });
+      expect(updated.isError, JSON.stringify(updated.content)).not.toBe(true);
     });
     const trail = await events();
     expect(trail.some(e => e.entry_id === id && e.event === "updated")).toBe(true);
@@ -97,8 +106,9 @@ describe("MCP audit trail", () => {
 
   it("records status_changed on set_status", async () => {
     let id = "";
-    await withClient(env, identity, async (client) => {
+    await withClient(env, identity, async (client, drain) => {
       const stored = await client.callTool({ name: "remember", arguments: { content: "Memory to canonicalize" } });
+      await drain();
       id = /ID: ([^\s]+)/.exec((stored.content as { text: string }[])[0].text)?.[1] ?? "";
       await client.callTool({ name: "set_status", arguments: { id, status: "canonical" } });
     });
@@ -124,8 +134,9 @@ describe("MCP audit trail", () => {
 
   it("records deleted on forget", async () => {
     let id = "";
-    await withClient(env, identity, async (client) => {
+    await withClient(env, identity, async (client, drain) => {
       const stored = await client.callTool({ name: "remember", arguments: { content: "Memory to delete via MCP" } });
+      await drain();
       id = /ID: ([^\s]+)/.exec((stored.content as { text: string }[])[0].text)?.[1] ?? "";
       await client.callTool({ name: "forget", arguments: { id } });
     });

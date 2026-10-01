@@ -141,12 +141,12 @@ export function meterAI(ai: Ai, meter: Meter): Ai {
   } as unknown as Ai;
 }
 
-export function meterVectorize(v: VectorizeIndex, meter: Meter): VectorizeIndex {
+export function meterVectorize(v: Vectorize, meter: Meter): Vectorize {
   return {
     ...v,
     upsert: (...a: Parameters<VectorizeIndex["upsert"]>) => { meter.vectorizeUpsert++; return (v.upsert as any)(...a); },
     insert: (...a: Parameters<VectorizeIndex["insert"]>) => { meter.vectorizeUpsert++; return (v.insert as any)(...a); },
     query: (...a: Parameters<VectorizeIndex["query"]>) => { meter.vectorizeQuery++; return (v.query as any)(...a); },
     deleteByIds: (...a: Parameters<VectorizeIndex["deleteByIds"]>) => { meter.vectorizeDelete++; return (v.deleteByIds as any)(...a); },
-  } as unknown as VectorizeIndex;
+  } as unknown as Vectorize;
 }

@@ -1,4 +1,19 @@
--- Run with: wrangler d1 execute second-brain-db --file=schema.sql
+-- Base reference schema for local SQLite tests and inspection of a completely empty DB.
+-- Apply db/fork-write-protection.sql after this file to complete the fork schema.
+-- Never execute this file directly against an existing or production D1: CREATE TABLE
+-- does not add missing columns before later triggers. Deploy the Worker, then call the
+-- authenticated /health endpoint so src/db/init.ts applies ordered runtime upgrades.
+
+-- Single-row cold-start schema check. Bump alongside DATABASE_SCHEMA_VERSION in
+-- src/db/init.ts whenever the runtime schema changes.
+CREATE TABLE IF NOT EXISTS schema_meta (
+  id         TEXT PRIMARY KEY,
+  version    INTEGER NOT NULL,
+  applied_at INTEGER NOT NULL
+);
+INSERT INTO schema_meta (id, version, applied_at)
+VALUES ('current', 9, 0)
+ON CONFLICT(id) DO NOTHING;
 
 CREATE TABLE IF NOT EXISTS entries (
   id               TEXT PRIMARY KEY,
@@ -11,11 +26,23 @@ CREATE TABLE IF NOT EXISTS entries (
   importance_score     INTEGER DEFAULT 0,
   contradiction_wins   INTEGER DEFAULT 0,
   contradiction_losses INTEGER DEFAULT 0,
-  workspace_id     TEXT NOT NULL DEFAULT '',     -- owning workspace ('' = legacy owner-private rows pending backfill)
-  actor_id         TEXT NOT NULL DEFAULT ''      -- user who wrote it ('' = the owner, pre-team writes)
-  -- Runtime ALTER columns (see src/db/init.ts): updated_at, staleness_checked_at, when_at, when_kind, when_source, when_label, valid_from, valid_until
-  -- valid_from:  when the fact became true (ms). NULL means "since created_at".
-  -- valid_until: when it stopped being true (ms). NULL means "still true".
+  updated_at INTEGER,
+  staleness_checked_at INTEGER,
+  memory_tier TEXT DEFAULT 'warm',
+  pinned INTEGER DEFAULT 0,
+  last_recalled_at INTEGER,
+  restore_lease_owner  TEXT,
+  migration_lease_owner TEXT,
+  write_marker TEXT,
+  workspace_id TEXT NOT NULL DEFAULT '',
+  actor_id TEXT NOT NULL DEFAULT '',
+  pending_append_passages TEXT NOT NULL DEFAULT '[]',
+  when_at INTEGER,
+  when_kind TEXT,
+  when_source TEXT,
+  when_label TEXT,
+  valid_from INTEGER,
+  valid_until INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS idx_entries_created_at ON entries(created_at DESC);
@@ -39,11 +66,13 @@ CREATE TABLE IF NOT EXISTS edges (
   metadata    TEXT NOT NULL DEFAULT '{}',          -- JSON escape-hatch for future per-edge fields
   created_at  INTEGER NOT NULL,
   updated_at  INTEGER NOT NULL,
-  workspace_id TEXT NOT NULL DEFAULT '',           -- denormalized from the source entry so graph walks scope without a join
+  restore_lease_owner TEXT,
+  write_marker TEXT,
+  workspace_id TEXT NOT NULL DEFAULT '',
   UNIQUE(source_id, target_id, type)
 );
 
-CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source_id);
+-- UNIQUE(source_id, target_id, type) already covers source_id-first lookups.
 CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_id);
 -- The graph view reads the strongest edges (ORDER BY weight DESC LIMIT n). Without an
 -- ordered path to weight, SQLite scans every edge into a temp b-tree before the LIMIT
@@ -53,6 +82,16 @@ CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_id);
 -- saving pays for many times over. Must stay in step with src/db/init.ts, which creates
 -- the same index at runtime for brains that were migrated before it existed.
 CREATE INDEX IF NOT EXISTS idx_edges_weight ON edges(weight DESC);
+
+-- A backup containing a dangling edge cannot be restored because import validates
+-- both endpoints. Keep the invariant at the database boundary for every writer.
+CREATE TRIGGER IF NOT EXISTS trg_edges_endpoint_guard_v1
+BEFORE INSERT ON edges
+WHEN NOT EXISTS (SELECT 1 FROM entries WHERE id = NEW.source_id)
+  OR NOT EXISTS (SELECT 1 FROM entries WHERE id = NEW.target_id)
+BEGIN
+  SELECT RAISE(ABORT, 'missing-edge-endpoint');
+END;
 
 -- Candidate pairs for the weekly insight pass. Must stay in step with
 -- src/db/init.ts, which creates the same objects at runtime for brains that
@@ -67,23 +106,20 @@ CREATE TABLE IF NOT EXISTS insight_candidates (
   signal      TEXT NOT NULL DEFAULT 'vector',      -- vector | supersedes
   status      TEXT NOT NULL DEFAULT 'pending',     -- pending | used | rejected
   created_at  INTEGER NOT NULL,
+  write_marker TEXT,
   UNIQUE(a_id, b_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_insight_candidates_queue
   ON insight_candidates(status, score DESC);
 
--- Team edition tenancy (v3). Additive like edges/insight_candidates: a single-user
--- brain never reads these tables and rollback is a no-op.
---
--- The bootstrap seeds one company workspace, one owner user, one personal workspace
--- per user, and membership rows for both. Legacy entries keep workspace_id '' until
--- the one-time backfill assigns them to the owner's personal workspace.
+-- Team Edition tenancy. Legacy rows use workspace_id/actor_id '' until the
+-- owner bootstrap assigns them to the owner's personal workspace.
 CREATE TABLE IF NOT EXISTS workspaces (
-  id          TEXT PRIMARY KEY,
-  kind        TEXT NOT NULL DEFAULT 'personal',  -- personal | company (validated in app code)
-  name        TEXT NOT NULL DEFAULT '',
-  created_at  INTEGER NOT NULL
+  id TEXT PRIMARY KEY,
+  kind TEXT NOT NULL DEFAULT 'personal',
+  name TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL
 );
 
 -- Authoritative version for each workspace's Prompt Capsule. The full Capsule
@@ -142,20 +178,17 @@ END;
 CREATE INDEX IF NOT EXISTS idx_workspaces_kind ON workspaces(kind);
 
 CREATE TABLE IF NOT EXISTS users (
-  id            TEXT PRIMARY KEY,
-  name          TEXT NOT NULL DEFAULT '',
-  email         TEXT,
-  role          TEXT NOT NULL DEFAULT 'member',    -- admin | member (validated in app code)
-  token_hash    TEXT NOT NULL,                     -- SHA-256 hex of the bearer token (the token itself is never stored)
-  suspended     INTEGER NOT NULL DEFAULT 0,
-  created_at    INTEGER NOT NULL,
-  default_share TEXT NOT NULL DEFAULT '',          -- capture-visibility override ('' = inherit org TEAM_DEFAULT_WORKSPACE)
-  removed_at    INTEGER,                            -- soft offboarding, NULL/0 = active member
-  last_used_at  INTEGER                             -- last successful identity resolution (throttled; NULL = never seen since the column shipped)
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL DEFAULT '',
+  email TEXT,
+  role TEXT NOT NULL DEFAULT 'member',
+  token_hash TEXT NOT NULL UNIQUE,
+  suspended INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL,
+  default_share TEXT NOT NULL DEFAULT '',
+  removed_at INTEGER,
+  last_used_at INTEGER
 );
-
-CREATE UNIQUE INDEX IF NOT EXISTS idx_users_token_hash ON users(token_hash);
-
 -- Email uniqueness among members. createMember's check-then-INSERT guard left a
 -- two-writer race (both SELECTs miss, both INSERTs land); this index is the real
 -- constraint and the app code maps the loser to the same 409 the winner's guard
@@ -165,34 +198,30 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_users_token_hash ON users(token_hash);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users(email);
 
 CREATE TABLE IF NOT EXISTS memberships (
-  user_id      TEXT NOT NULL,
+  user_id TEXT NOT NULL,
   workspace_id TEXT NOT NULL,
-  role         TEXT NOT NULL DEFAULT 'member',   -- reserved for future per-workspace roles
-  created_at   INTEGER NOT NULL,
+  role TEXT NOT NULL DEFAULT 'member',
+  created_at INTEGER NOT NULL,
   PRIMARY KEY (user_id, workspace_id)
 );
 
 -- listTeamWorkspaces (GET /team/roster) joins memberships on workspace_id; the
 -- composite PK above only serves user_id-first lookups. Same trade as
--- idx_workspaces_kind: a tiny table, a cheap index, and the join stays a seek.
+-- the other bounded Team indexes: a tiny table, a cheap index, and the join stays a seek.
 CREATE INDEX IF NOT EXISTS idx_memberships_workspace ON memberships(workspace_id);
 
 -- Immutable audit trail. Application code only ever INSERTs here — no UPDATE or
 -- DELETE exists anywhere in src/, by design. Tamper evidence is absence of a way
 -- to rewrite it, not cryptography.
 CREATE TABLE IF NOT EXISTS entry_events (
-  id         TEXT PRIMARY KEY,
-  entry_id   TEXT NOT NULL,
-  actor_id   TEXT NOT NULL DEFAULT '',
-  event      TEXT NOT NULL,                      -- created | updated | appended | deleted | status_changed | shared | unshared | insight_confirmed | insight_dismissed
-  payload    TEXT NOT NULL DEFAULT '{}',         -- JSON escape hatch for per-event detail
+  id TEXT PRIMARY KEY,
+  entry_id TEXT NOT NULL,
+  actor_id TEXT NOT NULL DEFAULT '',
+  event TEXT NOT NULL,
+  payload TEXT NOT NULL DEFAULT '{}',
   created_at INTEGER NOT NULL
 );
-
 CREATE INDEX IF NOT EXISTS idx_entry_events_entry ON entry_events(entry_id, created_at DESC);
--- The per-entry index above needs an entry_id to seek on. GET /team/activity has
--- none: it orders the whole trail by time. Without this the feed scans
--- entry_events and sorts all of it to return one page.
 CREATE INDEX IF NOT EXISTS idx_entry_events_created ON entry_events(created_at DESC);
 -- brief/changes.ts's raw event scan reserves index-backed branches for actor_id = reader and
 -- event = 'held' so a teammate's own burst cannot crowd either out of the raw scan's cap.
@@ -202,30 +231,31 @@ CREATE INDEX IF NOT EXISTS idx_entry_events_held ON entry_events(created_at DESC
 -- json_extract in the WHERE -- must never throw on a non-JSON payload; readers check trash=0 on top.
 CREATE INDEX IF NOT EXISTS idx_entry_events_life_end ON entry_events(entry_id) WHERE event IN ('purged', 'deleted');
 
--- Immutable administration audit trail. Same contract as entry_events:
--- application code only ever INSERTs here. Consumed by Phase 4.2.
 CREATE TABLE IF NOT EXISTS admin_events (
-  id             TEXT PRIMARY KEY,
-  actor_id       TEXT NOT NULL DEFAULT '',
+  id TEXT PRIMARY KEY,
+  actor_id TEXT NOT NULL DEFAULT '',
   target_user_id TEXT NOT NULL DEFAULT '',
-  workspace_id   TEXT NOT NULL DEFAULT '',
-  event          TEXT NOT NULL,
-  payload        TEXT NOT NULL DEFAULT '{}',
-  created_at     INTEGER NOT NULL
+  workspace_id TEXT NOT NULL DEFAULT '',
+  event TEXT NOT NULL,
+  payload TEXT NOT NULL DEFAULT '{}',
+  created_at INTEGER NOT NULL
 );
-
 CREATE INDEX IF NOT EXISTS idx_admin_events_created ON admin_events(created_at DESC);
 
--- Single-row table driving the nightly round-robin over workspaces so free-plan
--- invocations stay inside their subrequest budget. P6 wires the readers.
 CREATE TABLE IF NOT EXISTS maintenance_cursor (
-  id           INTEGER PRIMARY KEY CHECK (id = 1),
+  id INTEGER PRIMARY KEY CHECK (id = 1),
   workspace_id TEXT NOT NULL DEFAULT '',
-  advanced_at  INTEGER NOT NULL DEFAULT 0
+  advanced_at INTEGER NOT NULL DEFAULT 0
 );
 
-INSERT INTO maintenance_cursor (id, workspace_id, advanced_at) VALUES (1, '', 0)
-  ON CONFLICT DO NOTHING;
+-- Strong daily guard in front of anonymous OAuth dynamic client registration.
+-- DCR itself writes to the shared OAuth KV namespace; bounding accepted requests
+-- here prevents one caller from consuming the namespace's Free daily write quota.
+CREATE TABLE IF NOT EXISTS oauth_registration_quota (
+  id                 TEXT PRIMARY KEY,
+  window_start       INTEGER NOT NULL,
+  registration_count INTEGER NOT NULL
+);
 
 -- Capsule-only index: missing project ids never scan ordinary memories.
 CREATE INDEX IF NOT EXISTS idx_entries_capsule ON entries(workspace_id, id)
@@ -243,6 +273,8 @@ CREATE TABLE IF NOT EXISTS projects (
   status       TEXT NOT NULL DEFAULT 'active',   -- active | archived (validated in app code)
   created_at   INTEGER NOT NULL,                 -- Unix ms timestamp
   updated_at   INTEGER,                          -- Unix ms, NULL until first edit
+  restore_lease_owner TEXT,
+  write_marker TEXT,
   PRIMARY KEY (workspace_id, id)
 );
 
@@ -258,7 +290,9 @@ CREATE INDEX IF NOT EXISTS idx_entries_conflict_held ON entries(workspace_id, id
 WHERE instr(lower(tags), '"conflict-held"') > 0;
 -- Agent brief queues: each scans only its own rows, not every memory. The WHERE clauses are the
 -- instr(...) forms src/brief/compute.ts repeats. Must stay in step with src/db/init.ts.
--- idx_entries_when (when_at) lives only in src/db/init.ts: when_at is a runtime ALTER column.
+-- schema 9の参照DDLにも、runtimeと同じ日付queue用indexを含める。
+CREATE INDEX IF NOT EXISTS idx_entries_when ON entries(workspace_id, when_at) WHERE when_at IS NOT NULL;
+
 CREATE INDEX IF NOT EXISTS idx_entries_task ON entries(workspace_id, created_at)
 WHERE instr(lower(tags), '"task"') > 0;
 CREATE INDEX IF NOT EXISTS idx_entries_insight ON entries(workspace_id, created_at)
@@ -297,6 +331,8 @@ CREATE INDEX IF NOT EXISTS idx_push_subscriptions_workspace ON push_subscription
 -- update or link on a returned id within 30 minutes) within the same row, never a new one.
 -- Must stay in step with src/db/init.ts.
 CREATE TABLE IF NOT EXISTS recall_log (
+  write_marker TEXT,
+  restore_lease_owner TEXT,
   id           TEXT PRIMARY KEY,
   workspace_id TEXT NOT NULL,
   created_at   INTEGER NOT NULL,
@@ -314,6 +350,8 @@ CREATE INDEX IF NOT EXISTS idx_recall_log_ws ON recall_log(workspace_id, created
 -- Content history (4.0, T-0089.1.1). One row per retired state of an entry,
 -- written in the same batch as the change. Must stay in step with src/db/init.ts.
 CREATE TABLE IF NOT EXISTS entry_versions (
+  write_marker TEXT,
+  restore_lease_owner TEXT,
   id           INTEGER PRIMARY KEY,           -- rowid alias: no extra index row per insert
   entry_id     TEXT NOT NULL,
   workspace_id TEXT NOT NULL DEFAULT '',      -- the entry's workspace at change time; decides who may read it
@@ -339,6 +377,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_entry_versions_entry ON entry_versions(ent
 -- Soft delete (4.0, T-0089.1.2). A forgotten entry waits here for
 -- TRASH_RETENTION_DAYS. Must stay in step with src/db/init.ts.
 CREATE TABLE IF NOT EXISTS entries_trash (
+  write_marker TEXT,
+  restore_lease_owner TEXT,
   id           TEXT PRIMARY KEY,              -- the original entry id
   workspace_id TEXT NOT NULL DEFAULT '',      -- scopes restore and permanent delete
   actor_id     TEXT NOT NULL DEFAULT '',      -- the entry's author, for the permission check

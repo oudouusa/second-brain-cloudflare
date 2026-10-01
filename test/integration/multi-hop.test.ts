@@ -31,7 +31,7 @@ function denseEnv(db: D1Mock, matches: { id: string; score: number }[]) {
 function suppressKeywordSearch(db: D1Mock) {
   const prepare = db.prepare.bind(db);
   (db as any).prepare = (sql: string) => {
-    if (sql.includes("WHERE content LIKE") && sql.includes("ORDER BY created_at DESC LIMIT")) {
+    if (/WHERE \(?content LIKE/.test(sql) && /ORDER BY (?:\(CASE WHEN content LIKE|created_at DESC LIMIT)/.test(sql)) {
       return { bind: () => ({ all: async () => ({ results: [] }) }) };
     }
     return prepare(sql);
@@ -90,6 +90,13 @@ describe("multi-hop recall (issue #16)", () => {
     expect(res.matches.map(m => m.id)).toEqual(["seed", "neighbor"]);
     expect(res.matches[0].hop).toBe(0);
     expect(res.matches[1].hop).toBe(1);
+    expect(res.graphContribution).toEqual({
+      requestedHops: 1,
+      seedCount: 1,
+      expandedCount: 1,
+      eligibleCount: 1,
+      selectedCount: 1,
+    });
   });
 
   it("applies the related-slot cap when fewer than topK direct rows survive", async () => {
@@ -133,6 +140,7 @@ describe("multi-hop recall (issue #16)", () => {
     expect(hop.viaProvenance).toBe("inferred");
     expect(hop.viaFrom).toBe("seed");
     expect(hop.viaLinkedAt).toBe(1);
+    expect(hop).toMatchObject({ viaSourceId: "seed", viaTargetId: "neighbor", viaDirection: "undirected" });
     // a direct seed match carries no via* fields
     expect(res.matches.find(m => m.id === "seed")!.viaProvenance).toBeUndefined();
   });
@@ -242,7 +250,7 @@ describe("multi-hop recall (issue #16)", () => {
 
     const models = (testEnv: Env) => (testEnv.AI.run as ReturnType<typeof vi.fn>).mock.calls.map(call => call[0]);
     expect(models(graphEnv)).toEqual(models(directEnv));
-    expect(models(graphEnv)).toEqual(["@cf/baai/bge-small-en-v1.5"]);
+    expect(models(graphEnv)).toEqual(["@cf/google/embeddinggemma-300m"]);
   });
 
   it("keeps a hop-2 answer's root score when the hop-1 bridge is filtered from hydration", async () => {

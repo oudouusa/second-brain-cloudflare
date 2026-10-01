@@ -132,7 +132,7 @@ function statefulVectorize() {
       deleteByIds: vi.fn(async (ids: string[]) => { for (const id of ids) store.delete(id); return { mutationId: "m" }; }),
       getByIds: vi.fn(async (ids: string[]) => ids.filter((id) => store.has(id)).map((id) => ({ id, metadata: store.get(id) }))),
       describe: vi.fn().mockResolvedValue({}),
-    } as unknown as VectorizeIndex,
+    } as unknown as Vectorize,
   };
 }
 
@@ -147,8 +147,7 @@ describe("adversary: Delete forever racing a restore (ADV-trash-4)", () => {
     const realBatch = t.env.DB.batch.bind(t.env.DB);
     let injected = false;
     (t.env.DB as any).batch = async (stmts: any[]) => {
-      const first = String(stmts[0]?.sourceSql?.() ?? "");
-      if (!injected && first.includes("'permanent'")) {
+      if (!injected && stmts.some(s => String(s?.sourceSql?.() ?? "").includes("'permanent'"))) {
         injected = true;
         // After the route authorized the TRASH row, before its batch: a restore commits.
         const { getTrashedEntry, restoreEntry } = await import("../../src/memory/trash");
@@ -268,8 +267,8 @@ describe("round 3 adversary (MAJOR, R3-1), superseded by nonce-only Delete forev
 });
 
 async function withMcp(env: any, run: (client: any) => Promise<void>) {
-  const { Client } = await import("@modelcontextprotocol/sdk/client/index.js");
-  const { InMemoryTransport } = await import("@modelcontextprotocol/sdk/inMemory.js");
+  const { Client } = await import("@modelcontextprotocol/client");
+  const { InMemoryTransport } = await import("@modelcontextprotocol/client");
   const { buildMcpServer } = await import("../../src/mcp/server");
   const server = buildMcpServer(env, ctx);
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();

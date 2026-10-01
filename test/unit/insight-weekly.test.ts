@@ -1,17 +1,38 @@
+import { pricingInsight, PRICING_INSIGHTS } from "../helpers/insight-fixture";
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { runWeeklyInsights, MAX_INSIGHTS_PER_RUN } from "../../src/insight/weekly";
+import { runWeeklyInsights as runWeeklyInsightsImpl, MAX_INSIGHTS_PER_RUN, INSIGHT_RETRY_STATUS } from "../../src/insight/weekly";
 import { resetDatabaseInit } from "../../src/db/init";
 import { makeTestEnv, makeMemoryKV, makeVectorizeMock } from "../helpers/make-env";
 import { makeSqliteD1, type SqliteD1 } from "../helpers/sqlite-d1";
+import type { Env } from "../../src/env";
+import { beginMemoryWriteAdmission } from "../../src/migration/write-lock";
 
 const DAY = 86400000;
 const NOW = 400 * DAY;
 const ctx = { waitUntil: () => {} } as unknown as ExecutionContext;
 
+async function runWeeklyInsights(env: Env, executionCtx: ExecutionContext) {
+  const pending: Promise<unknown>[] = [];
+  const localCtx = Object.create(executionCtx) as ExecutionContext;
+  localCtx.waitUntil = promise => { pending.push(Promise.resolve(promise)); };
+  const admitted = await beginMemoryWriteAdmission(env, localCtx);
+  // Domain time is frozen far in the past; SQLite trigger time is not.
+  await admitted.env.DB.prepare(
+    `UPDATE memory_write_admissions SET expires_at = ? WHERE token = ?`,
+  ).bind(Number.MAX_SAFE_INTEGER, admitted.env.WRITE_ADMISSION_TOKEN).run();
+  try {
+    const result = await runWeeklyInsightsImpl(admitted.env, admitted.ctx);
+    await Promise.allSettled(pending);
+    return result;
+  } finally {
+    await admitted.finish();
+  }
+}
+
 // Split out so the cross-run restatement test can seed an already-persisted
 // insight entry with the exact same reasoned text without duplicating it.
-const GOOD_TEXT = "You priced that tier at nine dollars flat, then reversed course to usage-based pricing instead.";
-const GOOD = `{"insight": true, "shape": "contradiction", "text": "${GOOD_TEXT}"}`;
+const GOOD_TEXT = PRICING_INSIGHTS["0"];
+const GOOD = pricingInsight(GOOD_TEXT);
 
 /** The AI mock must serve three callers: embeddings, the classifier inside
  *  captureEntry (streaming SSE), and the reasoning call (also streaming). */
@@ -25,7 +46,7 @@ function makeAI(insightPayload: string) {
   });
   return {
     run: vi.fn().mockImplementation(async (model: string, opts: any) => {
-      if (model === "@cf/baai/bge-small-en-v1.5") return { data: [new Array(384).fill(0.1)] };
+      if (model === "@cf/google/embeddinggemma-300m") return { data: [new Array(768).fill(0.1)] };
       const prompt = String(opts?.messages?.[0]?.content ?? "");
       // The reasoning prompt is the only one that mentions two memories.
       return sse(prompt.includes("Memory A:") ? insightPayload : "3");
@@ -146,6 +167,103 @@ describe("runWeeklyInsights()", () => {
     expect(await statusOf(sqlite, "cand-0")).toBe("used");
   });
 
+  it("検証失敗は1回だけ再試行し、上限後にはモデルを呼ばない", async () => {
+    const logs = vi.spyOn(console, "log").mockImplementation(() => {});
+    seedCandidates(sqlite, 1);
+    const ai = makeAI("JSONではない応答");
+    const env = makeTestEnv(undefined, { DB: sqlite.db as any, AI: ai, OAUTH_KV: makeMemoryKV() });
+    await runWeeklyInsights(env, ctx);
+    expect(await statusOf(sqlite, "cand-0")).toBe(INSIGHT_RETRY_STATUS);
+    await runWeeklyInsights(env, ctx);
+    expect(await statusOf(sqlite, "cand-0")).toBe("invalid:evidence-v1:format");
+    const calls = (ai.run as any).mock.calls.length;
+    await runWeeklyInsights(env, ctx);
+    expect((ai.run as any).mock.calls.length).toBe(calls);
+    expect(calls).toBe(2);
+    expect(await insightCount(sqlite)).toBe(0);
+    expect(await drawnFrom(sqlite)).toEqual([]);
+    const weekly = logs.mock.calls.filter(c => String(c[0]).includes('"event":"insight_weekly"'))
+      .map(c => JSON.parse(String(c[0])));
+    expect(weekly[0]).toMatchObject({ declined_by_model: 0, validation_deferred: 1,
+      validation_exhausted: 0, invalid_format: 1, invalid_evidence: 0 });
+    expect(weekly[1]).toMatchObject({ declined_by_model: 0, validation_deferred: 0,
+      validation_exhausted: 1, invalid_format: 1 });
+    expect(JSON.stringify(weekly)).not.toContain("JSONではない応答");
+    logs.mockRestore();
+  });
+
+  it.each([
+    [GOOD, "used", 1],
+    ['{"insight":false}', "rejected", 0],
+  ])("再試行からの正常応答で候補を確定する (%s)", async (payload, expected, count) => {
+    seedCandidates(sqlite, 1);
+    const env = makeTestEnv(undefined, {
+      DB: sqlite.db as any, AI: makeAI("壊れた応答"), OAUTH_KV: makeMemoryKV(),
+    });
+    await runWeeklyInsights(env, ctx);
+    expect(await statusOf(sqlite, "cand-0")).toBe(INSIGHT_RETRY_STATUS);
+    env.AI = makeAI(payload);
+    await runWeeklyInsights(env, ctx);
+    expect(await statusOf(sqlite, "cand-0")).toBe(expected);
+    expect(await insightCount(sqlite)).toBe(count);
+  });
+
+  it("再試行中の通信障害は検証回数を消費しない", async () => {
+    seedCandidates(sqlite, 1);
+    const env = makeTestEnv(undefined, {
+      DB: sqlite.db as any, AI: makeAI("壊れた応答"), OAUTH_KV: makeMemoryKV(),
+    });
+    await runWeeklyInsights(env, ctx);
+    env.AI = { run: vi.fn().mockRejectedValue(new Error("AI down")) } as unknown as Ai;
+    await runWeeklyInsights(env, ctx);
+    expect(await statusOf(sqlite, "cand-0")).toBe(INSIGHT_RETRY_STATUS);
+    env.AI = makeAI(GOOD);
+    await runWeeklyInsights(env, ctx);
+    expect(await statusOf(sqlite, "cand-0")).toBe("used");
+    expect(await insightCount(sqlite)).toBe(1);
+  });
+
+  it("前の検証版の失敗だけを再評価し、旧rejectedは戻さない", async () => {
+    seedCandidates(sqlite, 2);
+    await sqlite.db.prepare("UPDATE insight_candidates SET status = 'invalid:old:evidence' WHERE id = 'cand-0'").run();
+    await sqlite.db.prepare("UPDATE insight_candidates SET status = 'rejected' WHERE id = 'cand-1'").run();
+    const ai = makeAI("壊れた応答");
+    const env = makeTestEnv(undefined, { DB: sqlite.db as any, AI: ai, OAUTH_KV: makeMemoryKV() });
+    await runWeeklyInsights(env, ctx);
+    expect(await statusOf(sqlite, "cand-0")).toBe(INSIGHT_RETRY_STATUS);
+    expect(await statusOf(sqlite, "cand-1")).toBe("rejected");
+    expect((ai.run as any).mock.calls.length).toBe(1);
+  });
+
+  it.each(["used", "rejected"])("遅れて届く検証失敗で確定済み %s を上書きしない", async settled => {
+    seedCandidates(sqlite, 1);
+    const ai = makeAI("壊れた応答");
+    (ai.run as any).mockImplementation(async (...args: any[]) => {
+      // 別実行が判定待ちの間に確定する状況を、実SQLiteで再現する。
+      await sqlite.db.prepare("UPDATE insight_candidates SET status = ?, write_marker = ? WHERE id = 'cand-0'")
+        .bind(settled, sqlite.fixtureMarker()).run();
+      // makeAIの応答を新しいmockから取得して、再帰呼出しを避ける。
+      return makeAI("壊れた応答").run(...args as Parameters<Ai["run"]>);
+    });
+    const env = makeTestEnv(undefined, { DB: sqlite.db as any, AI: ai, OAUTH_KV: makeMemoryKV() });
+    await runWeeklyInsights(env, ctx);
+    expect(await statusOf(sqlite, "cand-0")).toBe(settled);
+    expect(await insightCount(sqlite)).toBe(0);
+  });
+
+  it("引用の検証に失敗した応答からtyped edgeを作らない", async () => {
+    seedCandidates(sqlite, 1);
+    const env = makeTestEnv(undefined, {
+      DB: sqlite.db as any, OAUTH_KV: makeMemoryKV(),
+      AI: makeAI(JSON.stringify({ insight: true, shape: "contradiction", text: GOOD_TEXT,
+        relationship: "follows", source: "B", target: "A" })),
+    });
+    await runWeeklyInsights(env, ctx);
+    expect(await statusOf(sqlite, "cand-0")).toBe(INSIGHT_RETRY_STATUS);
+    const edges = await sqlite.db.prepare("SELECT type FROM edges").all();
+    expect(edges.results).toEqual([]);
+  });
+
   it("marks a duplicate-blocked candidate used, not rejected, and writes nothing", async () => {
     // A blocked capture is not a refusal from reasonOverPair — the insight was
     // good, but captureEntry found it duplicates an earlier one. This is the
@@ -255,7 +373,7 @@ describe("runWeeklyInsights()", () => {
             c.close();
           },
         });
-        if (model === "@cf/baai/bge-small-en-v1.5") return { data: [new Array(384).fill(0.1)] };
+        if (model === "@cf/google/embeddinggemma-300m") return { data: [new Array(768).fill(0.1)] };
         const prompt = String(opts?.messages?.[0]?.content ?? "");
         if (!prompt.includes("Memory A:")) return sse("3");
         const tier = prompt.match(/tier (\d+)/)?.[1] ?? "0";
@@ -268,15 +386,9 @@ describe("runWeeklyInsights()", () => {
         // below; restatesRecent needs the three texts to share under 60% of
         // their OWN distinctive tokens pairwise, which a shared template
         // cannot give no matter which single word varies.
-        const perTier: Record<string, string> = {
-          "0": "You priced this tier at nine dollars flat, then moved it entirely to usage-based billing.",
-          "1": "This tier's predictable monthly amount got swapped for money tied to actual usage.",
-          "2": "That flat monthly price got left behind once usage-based charges took over.",
-          "3": "A fixed quarterly fee here was dropped in favor of billing that scales with usage.",
-          "4": "The old flat charge on this plan gave way to invoicing based on money actually spent.",
-        };
+        const perTier: Record<string, string> = PRICING_INSIGHTS;
         return sse(
-          `{"insight": true, "shape": "contradiction", "text": "${perTier[tier] ?? perTier["0"]}"}`,
+          pricingInsight(perTier[tier] ?? perTier["0"]),
         );
       }),
     } as unknown as Ai;
@@ -409,6 +521,7 @@ describe("runWeeklyInsights()", () => {
       tags: ["kind:semantic", "status:canonical"],
       content: `${GOOD_TEXT}\n\n[Insight: contradiction — drawn from 2 memories]`,
     });
+    sqlite.seed({ id: "some-source", createdAt: NOW - 5 * DAY, content: "source memory" });
     await sqlite.db.prepare(
       `INSERT INTO edges (id, source_id, target_id, type, weight, provenance, metadata, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -565,7 +678,7 @@ describe("runWeeklyInsights()", () => {
     //  - cand-3: both sides assistant-authored — D1 (this task's FIX 3)
     //    rejects the pair before reasonOverPair is ever called, so it must
     //    NOT inflate "candidates reasoned".
-    const TIER0_TEXT = "You priced this tier at nine dollars flat, then moved it entirely to usage-based billing.";
+    const TIER0_TEXT = PRICING_INSIGHTS["0"];
     const tieredAI = {
       run: vi.fn().mockImplementation(async (model: string, opts: any) => {
         const sse = (text: string) => new ReadableStream({
@@ -575,15 +688,15 @@ describe("runWeeklyInsights()", () => {
             c.close();
           },
         });
-        if (model === "@cf/baai/bge-small-en-v1.5") return { data: [new Array(384).fill(0.1)] };
+        if (model === "@cf/google/embeddinggemma-300m") return { data: [new Array(768).fill(0.1)] };
         const prompt = String(opts?.messages?.[0]?.content ?? "");
         if (!prompt.includes("Memory A:")) return sse("3");
         const tier = prompt.match(/tier (\d+)/)?.[1] ?? "0";
         if (tier === "1") return sse(`{"insight": false}`);
         if (tier === "2") {
-          return sse(`{"insight": true, "shape": "contradiction", "text": ${JSON.stringify(TIER0_TEXT)}}`);
+          return sse(pricingInsight(TIER0_TEXT));
         }
-        return sse(`{"insight": true, "shape": "contradiction", "text": ${JSON.stringify(TIER0_TEXT)}}`);
+        return sse(pricingInsight(TIER0_TEXT));
       }),
     } as unknown as Ai;
 
@@ -623,11 +736,12 @@ describe("runWeeklyInsights()", () => {
 
     const insightLogs = logSpy.mock.calls.filter(c => String(c[0]).includes("insight"));
     expect(insightLogs).toHaveLength(1);
-    const [, payload] = insightLogs[0];
+    const payload = JSON.parse(String(insightLogs[0][0]));
     expect(payload).toMatchObject({
-      candidatesReasoned: 3,
-      declinedByModel: 1,
-      restatementsSuppressed: 1,
+      event: "insight_weekly",
+      candidates_reasoned: 3,
+      declined_by_model: 1,
+      restatements_suppressed: 1,
       written: 1,
     });
     logSpy.mockRestore();
@@ -680,7 +794,7 @@ describe("runWeeklyInsights()", () => {
       });
       return {
         run: vi.fn().mockImplementation(async (model: string, opts: any) => {
-          if (model === "@cf/baai/bge-small-en-v1.5") return { data: [new Array(384).fill(0.1)] };
+          if (model === "@cf/google/embeddinggemma-300m") return { data: [new Array(768).fill(0.1)] };
           const prompt = String(opts?.messages?.[0]?.content ?? "");
           prompts.push(prompt);
           return sse(prompt.includes("Memory A:") ? GOOD : "3");
@@ -779,8 +893,13 @@ describe("runWeeklyInsights()", () => {
 
       await runWeeklyInsights(env, ctx);
 
-      const [, payload] = logSpy.mock.calls.filter(c => String(c[0]).includes("insight"))[0];
-      expect(payload).toMatchObject({ candidatesDrawn: 1, candidatesReasoned: 0, written: 0 });
+      const [line] = logSpy.mock.calls.filter(c => String(c[0]).includes("insight_weekly"))[0];
+      const payload = JSON.parse(String(line));
+      expect(payload).toMatchObject({
+        candidates_drawn: 1,
+        candidates_reasoned: 0,
+        written: 0,
+      });
       logSpy.mockRestore();
     });
   });
@@ -803,7 +922,7 @@ describe("runWeeklyInsights()", () => {
   it("does not throw when the pass fails", async () => {
     const broken = { prepare: () => { throw new Error("D1 down"); } } as any;
     await expect(
-      runWeeklyInsights(makeTestEnv(undefined, { DB: broken, OAUTH_KV: makeMemoryKV() }), ctx),
+      runWeeklyInsightsImpl(makeTestEnv(undefined, { DB: broken, OAUTH_KV: makeMemoryKV() }), ctx),
     ).resolves.toBeUndefined();
   });
 });

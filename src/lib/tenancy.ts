@@ -1,5 +1,12 @@
 import type { Env } from "../env";
 import { hashToken } from "./identity";
+import {
+  acquireMemoryWriteAdmission,
+  envWithMemoryWriteAdmission,
+  isMemoryWriteFenceError,
+  memoryWriteMarker,
+  releaseMemoryWriteAdmissionWithRetry,
+} from "../migration/write-lock";
 
 /**
  * Tenant bootstrap: makes the tenancy tables true on any database, old or new.
@@ -64,7 +71,7 @@ async function ownerHasPersonalWorkspace(env: Env, userId: string): Promise<bool
 /**
  * Each piece is idempotent so a partial cold start can be completed safely.
  */
-async function bootstrap(env: Env): Promise<TenantRoots> {
+async function bootstrap(env: Env, mayRetryWithAdmission = true): Promise<TenantRoots> {
   const now = Date.now();
   const statements: D1PreparedStatement[] = [];
 
@@ -124,13 +131,37 @@ async function bootstrap(env: Env): Promise<TenantRoots> {
 
   // One-time legacy backfill for pre-team rows.
   statements.push(
-    // versioning: exempt: one-time '' backfill, not a user or agent change
-    env.DB.prepare(`UPDATE entries SET workspace_id = ? WHERE workspace_id = ''`).bind(owner.personalWorkspaceId),
-    env.DB.prepare(`UPDATE edges SET workspace_id = ? WHERE workspace_id = ''`).bind(owner.personalWorkspaceId),
+    // versioning: exempt: 旧workspaceから所有者への一度だけの移行。
+    env.DB.prepare(`UPDATE entries SET workspace_id = ?, write_marker = ? WHERE workspace_id = ''`)
+      .bind(owner.personalWorkspaceId, memoryWriteMarker(env)),
+  );
+  statements.push(
+    env.DB.prepare(`UPDATE edges SET workspace_id = ?, write_marker = ? WHERE workspace_id = ''`)
+      .bind(owner.personalWorkspaceId, memoryWriteMarker(env)),
   );
 
-  // Keep bootstrap writes in one D1 batch.
-  await env.DB.batch(statements);
+  // Keep bootstrap writes in one D1 batch. A pre-fence database may need one
+  // admitted retry to backfill legacy entry and edge workspaces.
+  try {
+    await env.DB.batch(statements);
+  } catch (error) {
+    // A v2 fork already has capability-enforcing entry/edge triggers. The first
+    // Team Edition bootstrap therefore cannot move legacy rows with an anonymous
+    // UPDATE. Retry the whole transactional batch once under a normal admission;
+    // genuine migration/restore barriers are still rejected by the admission claim.
+    if (mayRetryWithAdmission && !env.WRITE_ADMISSION_TOKEN && isMemoryWriteFenceError(error)) {
+      const admission = await acquireMemoryWriteAdmission(env);
+      try {
+        return await bootstrap(envWithMemoryWriteAdmission(env, admission), false);
+      } finally {
+        await releaseMemoryWriteAdmissionWithRetry(env, admission).catch(() => {
+          // 初期化済みの認証を500へ変えず、失敗した解放は既存TTLで失効させる。
+          console.error("Tenant bootstrap admission release failed");
+        });
+      }
+    }
+    throw error;
+  }
   return {
     companyWorkspaceId: companyId,
     ownerUserId: owner.userId,

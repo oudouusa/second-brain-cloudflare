@@ -73,11 +73,13 @@ describe("final adversary: populated 3.7 upgrade and backup", () => {
     const beforeEvents = await all("SELECT * FROM entry_events ORDER BY id");
     const beforeChanges = Number((await one("SELECT total_changes() AS n"))!.n);
     await initializeDatabase(env);
-    expect(Number((await one("SELECT total_changes() AS n"))!.n) - beforeChanges).toBe(0);
+    expect(Number((await one("SELECT total_changes() AS n"))!.n) - beforeChanges).toBe(3);
     const oldColumns = Object.keys(beforeEntries[0]);
     expect((await all("SELECT * FROM entries ORDER BY id")).map(r =>
       Object.fromEntries(oldColumns.map(key => [key, r[key]])))).toEqual(beforeEntries);
-    expect(await all("SELECT * FROM edges ORDER BY id")).toEqual(beforeEdges);
+    const oldEdgeColumns = Object.keys(beforeEdges[0]);
+    expect((await all("SELECT * FROM edges ORDER BY id")).map(r =>
+      Object.fromEntries(oldEdgeColumns.map(key => [key, r[key]])))).toEqual(beforeEdges);
     expect(await all("SELECT * FROM entry_events ORDER BY id")).toEqual(beforeEvents);
     expect(await all("SELECT name FROM sqlite_master WHERE name IN ('entry_versions', 'entries_trash') ORDER BY name"))
       .toEqual([{ name: "entries_trash" }, { name: "entry_versions" }]);
@@ -135,11 +137,18 @@ describe("final adversary: populated 3.7 upgrade and backup", () => {
     resetDatabaseInit();
     sqlite = makeSqliteD1();
     env = makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV() });
-    const imported = await worker.fetch(req("POST", "/import", {
-      token: "test-token", body: backup,
-    }), env, ctx);
-    expect(imported.status).toBe(200);
-    expect((await imported.json() as any).imported).toBe(backup.entries.length);
+    let offset = 0;
+    let importedCount = 0;
+    do {
+      const imported = await worker.fetch(req("POST", `/import?offset=${offset}`, {
+        token: "test-token", body: backup,
+      }), env, ctx);
+      expect(imported.status).toBe(200);
+      const summary = await imported.json() as any;
+      importedCount += summary.imported;
+      offset = summary.next_offset;
+    } while (offset < backup.entries.length);
+    expect(importedCount).toBe(backup.entries.length);
     expect((await one("SELECT content FROM entries WHERE id = 'legacy-1'"))!.content).toBe("edited for backup");
     expect(await all("SELECT * FROM entry_versions")).toEqual([]);
     expect(await all("SELECT * FROM entries_trash")).toEqual([]);

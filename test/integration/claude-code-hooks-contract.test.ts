@@ -53,9 +53,9 @@ beforeAll(async () => {
         if (req.url?.startsWith("/recall")) {
           recallReplied = true;
           if (behaviour.recallStatus && behaviour.recallStatus >= 400) return reply(behaviour.recallStatus, { ok: false, code: "unauthorized" });
-          if (behaviour.unknownProject && req.url.includes("project="))
+          if (behaviour.unknownProject && JSON.parse(body || "{}").project)
             return reply(404, { ok: false, error: 'unknown project "x"', known_projects: [] });
-          if (behaviour.badProject && req.url.includes("project="))
+          if (behaviour.badProject && JSON.parse(body || "{}").project)
             return reply(400, { ok: false, code: "invalid_project" });
           return reply(200, { ok: true, results: behaviour.recallResults ?? [{ id: "m1", content: "a remembered thing", truncated: false }], insight: null });
         }
@@ -98,7 +98,8 @@ beforeEach(async () => {
   sqlite = makeSqliteD1();
   env = makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV() });
   await initializeDatabase(env);
-  await ensureTenantBootstrap(env);
+  const roots = await ensureTenantBootstrap(env);
+  await sqlite.db.prepare("INSERT INTO projects (id, workspace_id, name, created_at) VALUES (?, ?, ?, ?)").bind("brain-app", roots.ownerPersonalWorkspaceId, "Brain App", 1).run();
 });
 afterEach(() => sqlite?.close());
 
@@ -139,15 +140,19 @@ const startPayload = (source = "startup") => ({ session_id: "s1", transcript_pat
 const endPayload = (transcript_path: string, reason = "prompt_input_exit") => ({ session_id: "fx", transcript_path, cwd: project, hook_event_name: "SessionEnd", reason });
 
 describe("session-start.js", () => {
-  it("makes a recall request GET /recall accepts, and prints framed context", async () => {
+  it("makes a private POST /recall the Worker accepts, and prints framed context", async () => {
     const r = await runHook("session-start.js", startPayload());
     expect(r.code).toBe(0);
     expect(r.stdout.startsWith("[Second Brain] Context recalled")).toBe(true);
     expect(r.stdout).not.toContain("Bearer");
     expect(r.stdout.trimStart().startsWith("{")).toBe(false);
 
-    const recalls = captured.filter(c => c.url.startsWith("/recall?"));
+    const recalls = captured.filter(c => c.url === "/recall");
     expect(recalls.length).toBeGreaterThanOrEqual(1);
+    expect(recalls[0].method).toBe("POST");
+    const requestBody = JSON.parse(recalls[0].body);
+    expect(requestBody.query).toBeTruthy();
+    expect(requestBody.workspace).toBe("personal");
     const briefs = captured.filter(c => c.url.startsWith("/brief?"));
     expect(briefs).toHaveLength(1);
     expect(new URL(`http://x${briefs[0].url}`).searchParams.get("project")).toBeTruthy();
@@ -155,12 +160,9 @@ describe("session-start.js", () => {
     expect(new URL(`http://x${briefs[0].url}`).searchParams.get("preview")).toBe("1");
     expect(r.stdout).toContain("Due: 2");
     expect(r.stdout).toContain("Open commitments: 1");
-    const url = new URL(`http://x${recalls[0].url}`);
-    expect(url.searchParams.get("query")).toBeTruthy();
-    expect(url.searchParams.get("workspace")).toBe("personal");
     // The project arm 404s until the project's first capture registers it,
     // so seed one capture with the same project before replaying.
-    const slug = url.searchParams.get("project");
+    const slug = requestBody.project;
     expect(slug).toBeTruthy();
     const seed = await worker.fetch(
       new Request("http://localhost/capture", {
@@ -192,10 +194,10 @@ describe("session-start.js", () => {
   it("falls back from the project arm to free text when the project arm is empty", async () => {
     behaviour.recallResults = [];
     await runHook("session-start.js", startPayload());
-    const recalls = captured.filter(c => c.url.startsWith("/recall?"));
+    const recalls = captured.filter(c => c.url === "/recall");
     expect(recalls).toHaveLength(2);
-    expect(new URL(`http://x${recalls[0].url}`).searchParams.get("project")).toBeTruthy();
-    expect(new URL(`http://x${recalls[1].url}`).searchParams.get("project")).toBeNull();
+    expect(JSON.parse(recalls[0].body).project).toBeTruthy();
+    expect(JSON.parse(recalls[1].body).project).toBeUndefined();
   });
 
   it("asks for the lean brief in the same workspace as recall", async () => {
@@ -240,10 +242,10 @@ describe("session-start.js", () => {
     const r = await runHook("session-start.js", startPayload());
     expect(r.code).toBe(0);
     expect(r.stdout.startsWith("[Second Brain] Context recalled")).toBe(true);
-    const recalls = captured.filter(c => c.url.startsWith("/recall?"));
+    const recalls = captured.filter(c => c.url === "/recall");
     expect(recalls).toHaveLength(2);
-    expect(new URL(`http://x${recalls[0].url}`).searchParams.get("project")).toBeTruthy();
-    expect(new URL(`http://x${recalls[1].url}`).searchParams.get("project")).toBeNull();
+    expect(JSON.parse(recalls[0].body).project).toBeTruthy();
+    expect(JSON.parse(recalls[1].body).project).toBeUndefined();
   });
 
   it("falls back to free text when the Worker rejects the project slug (400)", async () => {
@@ -251,9 +253,9 @@ describe("session-start.js", () => {
     const r = await runHook("session-start.js", startPayload());
     expect(r.code).toBe(0);
     expect(r.stdout.startsWith("[Second Brain] Context recalled")).toBe(true);
-    const recalls = captured.filter(c => c.url.startsWith("/recall?"));
+    const recalls = captured.filter(c => c.url === "/recall");
     expect(recalls).toHaveLength(2);
-    expect(new URL(`http://x${recalls[1].url}`).searchParams.get("project")).toBeNull();
+    expect(JSON.parse(recalls[1].body).project).toBeUndefined();
   });
 
   it("still fails loudly on other project-arm errors (500)", async () => {
@@ -261,7 +263,7 @@ describe("session-start.js", () => {
     const r = await runHook("session-start.js", startPayload());
     expect(r.code).toBe(1);
     expect(r.stderr).toMatch(/recall failed: HTTP 500/);
-    expect(captured.filter(c => c.url.startsWith("/recall?"))).toHaveLength(1);
+    expect(captured.filter(c => c.url === "/recall")).toHaveLength(1);
   });
 
   it("surfaces a rejected token: stderr line and exit 1 (the #327 failure mode, made visible)", async () => {
@@ -285,7 +287,7 @@ describe("session-start.js", () => {
     const first = await runHook("session-start.js", startPayload("startup"));
     expect(first.code, first.stderr).toBe(0);
     expect(first.stdout).toContain("Context recalled");
-    expect(captured.filter(c => c.url.startsWith("/recall?")).length).toBeGreaterThanOrEqual(1);
+    expect(captured.filter(c => c.url === "/recall").length).toBeGreaterThanOrEqual(1);
 
     captured = [];
     const second = await runHook("session-start.js", startPayload("compact"));
@@ -298,7 +300,7 @@ describe("session-start.js", () => {
     const r = await runHook("session-start.js", { ...startPayload("compact"), session_id: "never-seen-before" });
     expect(r.code, r.stderr).toBe(0);
     expect(r.stdout).toContain("Context recalled");
-    expect(captured.filter(c => c.url.startsWith("/recall?")).length).toBeGreaterThanOrEqual(1);
+    expect(captured.filter(c => c.url === "/recall").length).toBeGreaterThanOrEqual(1);
   });
 
   it("does nothing without credentials, and honours the opt-out", async () => {

@@ -20,7 +20,7 @@ import { D1Mock } from "../helpers/d1-mock";
 
 const ctx = { waitUntil: (_: Promise<any>) => {} } as any;
 
-describe("GET /digest", () => {
+describe("POST /digest", () => {
   let env: Env;
   let db: D1Mock;
 
@@ -46,12 +46,12 @@ describe("GET /digest", () => {
   });
 
   it("returns 401 without auth", async () => {
-    const res = await worker.fetch(req("GET", "/digest?tag=work", { token: null }), env, ctx);
+    const res = await worker.fetch(req("POST", "/digest?tag=work", { token: null }), env, ctx);
     expect(res.status).toBe(401);
   });
 
   it("requires a tag", async () => {
-    const res = await worker.fetch(req("GET", "/digest"), env, ctx);
+    const res = await worker.fetch(req("POST", "/digest"), env, ctx);
     expect(res.status).toBe(400);
   });
 
@@ -68,10 +68,10 @@ describe("GET /digest", () => {
     "status:canonical",
     "volatility:state",
   ])("refuses to compress the system tag %s", async (tag) => {
-    seed([tag, "work"]);
+    seed([tag, "project-atlas"]);
     const before = snapshot();
 
-    const res = await worker.fetch(req("GET", `/digest?tag=${encodeURIComponent(tag)}`), env, ctx);
+    const res = await worker.fetch(req("POST", `/digest?tag=${encodeURIComponent(tag)}`), env, ctx);
 
     expect(res.status).toBe(200);
     const data = await res.json() as any;
@@ -85,7 +85,7 @@ describe("GET /digest", () => {
   it("still compresses an ordinary tag", async () => {
     seed(["holiday-plans"]);
 
-    const res = await worker.fetch(req("GET", "/digest?tag=holiday-plans"), env, ctx);
+    const res = await worker.fetch(req("POST", "/digest?tag=holiday-plans"), env, ctx);
 
     const data = await res.json() as any;
     expect(data.entry_id).toBeTruthy();
@@ -98,10 +98,10 @@ describe("GET /digest", () => {
   it("names the real eligibility threshold when a tag has too few entries", async () => {
     seed(["thin-tag"], 3);
 
-    const res = await worker.fetch(req("GET", "/digest?tag=thin-tag"), env, ctx);
+    const res = await worker.fetch(req("POST", "/digest", { body: { tag: "thin-tag" } }), env, ctx);
 
     const data = await res.json() as any;
-    expect(data.error).toBe("Could not create digest: the tag may have fewer than 10 eligible entries, or it was recently compressed.");
+    expect(data.error).toBe("Could not create digest: the tag may have fewer than 10 eligible entries or was recently compressed");
     expect(data.source_count).toBe(0);
   });
 });

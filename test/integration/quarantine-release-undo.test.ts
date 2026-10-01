@@ -34,8 +34,9 @@ beforeEach(async () => {
   resetDatabaseInit();
   deleted = [];
   sqlite = makeSqliteD1();
-  env = makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV(), VECTORIZE: statefulVectorize(), AI: makeAIMock() });
+  env = sqlite.admitEnv(makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV(), VECTORIZE: statefulVectorize(), AI: makeAIMock() }));
   await initializeDatabase(env);
+  env = sqlite.admitEnv(env);
   const roots = await ensureTenantBootstrap(env);
   owner = (await resolveIdentityByUserId(env, roots.ownerUserId))!;
 });
@@ -107,7 +108,7 @@ describe("reembed_failed leaves the row held", () => {
   it("Vectorize throwing a non-degrade error leaves the hold in place", async () => {
     await seedHeldByItsOwnHold("h3", ["work"]);
     const failing = makeVectorizeMock({ upsert: vi.fn().mockRejectedValue(new Error("boom")) });
-    const failingEnv = makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV(), VECTORIZE: failing, AI: makeAIMock() });
+    const failingEnv = sqlite.admitEnv(makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV(), VECTORIZE: failing, AI: makeAIMock() }));
 
     const r = await revertEntry(failingEnv, owner, "h3", change(), DEFAULTS, undefined, owner.personalWorkspaceId);
 
@@ -121,7 +122,7 @@ describe("reembed_failed leaves the row held", () => {
       upsert: vi.fn().mockRejectedValue(new Error("index unavailable")),
       describe: vi.fn().mockRejectedValue(new Error("index unavailable")),
     });
-    const outageEnv = makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV(), VECTORIZE: unavailable, AI: makeAIMock() });
+    const outageEnv = sqlite.admitEnv(makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV(), VECTORIZE: unavailable, AI: makeAIMock() }));
 
     const result = await revertEntry(outageEnv, owner, "h-outage", change(), DEFAULTS, undefined, owner.personalWorkspaceId);
 

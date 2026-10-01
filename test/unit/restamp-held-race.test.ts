@@ -44,7 +44,7 @@ describe("restampVectorWorkspace never revives a vector whose row became held si
       // call) has not landed yet, exactly the race this test reproduces.
       store.set("now-held:v1", { id: "now-held:v1", values: [0.1], metadata: { parentId: "now-held", workspace_id: "ws-personal" } });
       store.set("still-fine:v1", { id: "still-fine:v1", values: [0.2], metadata: { parentId: "still-fine", workspace_id: "ws-personal" } });
-      const env = makeTestEnv(undefined, { DB: sq.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV(), VECTORIZE: vectorize });
+      const env = sq.admitEnv(makeTestEnv(undefined, { DB: sq.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV(), VECTORIZE: vectorize }));
 
       const res = await restampVectorWorkspace(env, ["now-held:v1", "still-fine:v1"], "ws-company");
 

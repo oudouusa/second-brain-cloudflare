@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import worker from "../../src/index"; import { buildMcpServer } from "../../src/mcp/server"; import { recallEntries } from "../../src/recall/search";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { Client } from "@modelcontextprotocol/client";
+import { InMemoryTransport } from "@modelcontextprotocol/client";
 import { makeTestEnv, makeTestDb, makeVectorizeMock } from "../helpers/make-env";
 import { req } from "../helpers/make-request";
 import type { Env } from "../../src/env";
@@ -97,7 +97,7 @@ describe("recall insight synthesis: MCP skips it, HTTP keeps it", () => {
   });
 
   it("GET /recall still synthesizes an insight (web path unchanged)", async () => {
-    const res = await worker.fetch(req("GET", "/recall?query=memory"), env, ctx);
+    const res = await worker.fetch(req("POST", "/recall?query=memory"), env, ctx);
 
     expect(res.status).toBe(200);
     const data = await res.json() as any;

@@ -1,4 +1,3 @@
-import { parentIdOfVectorId } from "../../src/vectorize/ids";
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import worker from "../../src/index";
 import { makeSqliteD1, type SqliteD1 } from "../helpers/sqlite-d1";
@@ -21,12 +20,14 @@ let ownerId = "";
 let store: Map<string, any>;
 let deleted: string[] = [];
 let inserts: string[] = [];
+let uploadedOwners: Map<string, string>;
 
 function statefulVectorize() {
   store = new Map();
+  uploadedOwners = new Map();
   return makeVectorizeMock({
-    insert: vi.fn(async (vs: any[]) => { for (const v of vs) { inserts.push(v.id); if (!store.has(v.id)) store.set(v.id, v); } return { mutationId: "m" } as any; }),
-    upsert: vi.fn(async (vs: any[]) => { for (const v of vs) store.set(v.id, v); return { mutationId: "m" } as any; }),
+    insert: vi.fn(async (vs: any[]) => { for (const v of vs) { inserts.push(v.id); uploadedOwners.set(v.id, v.metadata.parentId); if (!store.has(v.id)) store.set(v.id, v); } return { mutationId: "m" } as any; }),
+    upsert: vi.fn(async (vs: any[]) => { for (const v of vs) { store.set(v.id, v); uploadedOwners.set(v.id, v.metadata.parentId); } return { mutationId: "m" } as any; }),
     deleteByIds: vi.fn(async (ids: string[]) => { deleted.push(...ids); for (const i of ids) store.delete(i); return { mutationId: "m" } as any; }),
   });
 }
@@ -35,8 +36,9 @@ beforeEach(async () => {
   resetDatabaseInit();
   deleted = []; inserts = [];
   d1 = makeSqliteD1();
-  env = makeTestEnv(undefined, { DB: d1.db as unknown as D1Database, OAUTH_KV: makeMemoryKV(), VECTORIZE: statefulVectorize(), AI: makeAIMock() });
+  env = d1.admitEnv(makeTestEnv(undefined, { DB: d1.db as unknown as D1Database, OAUTH_KV: makeMemoryKV(), VECTORIZE: statefulVectorize(), AI: makeAIMock() }));
   await initializeDatabase(env);
+  env = d1.admitEnv(env);
   const roots = await ensureTenantBootstrap(env);
   wsId = roots.ownerPersonalWorkspaceId;
   ownerId = roots.ownerUserId;
@@ -59,12 +61,12 @@ function racingEnv(mutate: () => Promise<void>, times = Infinity): Env {
     ...raw,
     prepare(sql: string) {
       const st = raw.prepare(sql);
-      if (!sql.startsWith("SELECT content, tags, source, vector_ids")) return st;
+      if (!sql.startsWith("SELECT content, tags, source, ")) return st;
       return { bind: (...a: unknown[]) => ({ first: async () => { const r = await st.bind(...a).first(); if (left-- > 0) await mutate(); return r; } }) };
     },
     batch: (stmts: unknown[]) => raw.batch(stmts),
   };
-  return { ...env, DB } as unknown as Env;
+  return { ...env, WRITE_ADMISSION_TOKEN: env.WRITE_ADMISSION_TOKEN, DB } as unknown as Env;
 }
 
 describe("append concurrency (T-0089.9)", () => {
@@ -96,14 +98,16 @@ describe("append concurrency (T-0089.9)", () => {
     const racing = racingEnv(async () => {
       if (raced) return;
       raced = true;
-      await d1.db.prepare(`UPDATE entries SET tags = '["a","status:canonical"]' WHERE id = 'e1'`).run();
+      await d1.db.prepare(`UPDATE entries SET write_marker = '${d1.fixtureMarker()}', tags = '["a","status:canonical"]' WHERE id = 'e1'`).run();
     });
     await append(racing, "e1", "addition");
     const row = await live("e1");
     expect(row.content).toContain("addition");
     expect(JSON.parse(row.tags)).toEqual(expect.arrayContaining(["a", "status:canonical"]));
     // The addition's chunk vector is independent of the row text: inserted once, not per attempt.
-    expect(inserts.filter(i => parentIdOfVectorId(i) === "e1")).toHaveLength(1);
+    // forkは失った試行のpassageを削除し、再試行の新しいIDを確定する。
+    expect(inserts.filter(i => uploadedOwners.get(i) === "e1")).toHaveLength(2);
+    expect(deleted).toContain(inserts[0]);
     expect(JSON.parse(row.vector_ids)).toHaveLength(1);
     // The lost attempt wrote no version.
     expect(await versions("e1")).toHaveLength(1);
@@ -113,17 +117,17 @@ describe("append concurrency (T-0089.9)", () => {
     await seed("e1", "base", ["t0"]);
     let n = 0;
     const racing = racingEnv(async () => {
-      await d1.db.prepare(`UPDATE entries SET tags = ? WHERE id = 'e1'`).bind(JSON.stringify([`t${++n}`])).run();
+      await d1.db.prepare(`UPDATE entries SET write_marker = ?, tags = ? WHERE id = 'e1'`).bind(d1.fixtureMarker(), JSON.stringify([`t${++n}`])).run();
     });
     await expect(append(racing, "e1", "addition")).rejects.toBeInstanceOf(WriteConflictError);
     expect((await live("e1")).content).toBe("base");
     expect(await versions("e1")).toEqual([]);
-    expect(deleted.some(id => parentIdOfVectorId(id) === "e1")).toBe(true);
+    expect(deleted.some(id => uploadedOwners.get(id) === "e1")).toBe(true);
 
     // And through the route: HTTP 409.
     n = 0;
     const res = await worker.fetch(req("POST", "/append", { body: { id: "e1", addition: "again" } }), racingEnv(async () => {
-      await d1.db.prepare(`UPDATE entries SET tags = ? WHERE id = 'e1'`).bind(JSON.stringify([`r${++n}`])).run();
+      await d1.db.prepare(`UPDATE entries SET write_marker = ?, tags = ? WHERE id = 'e1'`).bind(d1.fixtureMarker(), JSON.stringify([`r${++n}`])).run();
     }), ctx);
     expect(res.status).toBe(409);
   });
@@ -151,7 +155,7 @@ describe("append concurrency (T-0089.9)", () => {
     await seed("e1", base);
     let n = 0;
     const racing = racingEnv(async () => {
-      await d1.db.prepare(`UPDATE entries SET content = content || ? WHERE id = 'e1'`).bind(`!${++n}`).run();
+      await d1.db.prepare(`UPDATE entries SET write_marker = ?, content = content || ? WHERE id = 'e1'`).bind(d1.fixtureMarker(), `!${++n}`).run();
     });
     await expect(append(racing, "e1", "will-not-land")).rejects.toBeInstanceOf(WriteConflictError);
     const { content } = await live("e1");
@@ -161,7 +165,7 @@ describe("append concurrency (T-0089.9)", () => {
     const indexed = [...store.values()].map(v => v.metadata.content as string).join("");
     expect(indexed).not.toContain("will-not-land");
     expect((await live("e1")).vector_ids).toBe("[]");
-    expect([...store.keys()].filter(k => parentIdOfVectorId(k) === "e1")).toEqual([]);
+    expect([...store.keys()].filter(k => uploadedOwners.get(k) === "e1")).toEqual([]);
   });
 
   it("appendToEntry ignores a stale existingContent passed by the caller", async () => {
@@ -174,9 +178,9 @@ describe("append concurrency (T-0089.9)", () => {
 
   it("an append to a row forgotten meanwhile throws EntryGoneError and deletes its chunk", async () => {
     await seed("e1", "base");
-    const racing = racingEnv(async () => { await d1.db.prepare(`DELETE FROM entries WHERE id = 'e1'`).run(); }, 1);
+    const racing = racingEnv(async () => { await d1.db.prepare(`UPDATE entries SET write_marker = ? WHERE id = 'e1'`).bind(d1.fixtureMarker("delete")).run(); await d1.db.prepare(`DELETE FROM entries WHERE id = 'e1'`).run(); }, 1);
     // The first read finds the row; the delete lands after it, so the CAS misses and the retry finds nothing.
     await expect(append(racing, "e1", "addition")).rejects.toBeInstanceOf(EntryGoneError);
-    expect(deleted.some(id => parentIdOfVectorId(id) === "e1")).toBe(true);
+    expect(deleted.some(id => uploadedOwners.get(id) === "e1")).toBe(true);
   });
 });

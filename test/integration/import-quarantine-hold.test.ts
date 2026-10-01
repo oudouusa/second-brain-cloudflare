@@ -36,12 +36,13 @@ let ownerWorkspaceId: string;
 beforeEach(async () => {
   resetDatabaseInit();
   sqlite = makeSqliteD1();
-  env = makeTestEnv(undefined, {
+  env = sqlite.admitEnv(makeTestEnv(undefined, {
     DB: sqlite.db as unknown as Env["DB"],
     OAUTH_KV: makeMemoryKV(),
     VECTORIZE: makeVectorizeMock(),
-  });
+  }));
   await initializeDatabase(env);
+  env = sqlite.admitEnv(env);
   const roots = await ensureTenantBootstrap(env);
   owner = (await resolveIdentityByUserId(env, roots.ownerUserId))!;
   ownerWorkspaceId = roots.ownerPersonalWorkspaceId;
@@ -234,7 +235,10 @@ describe("B3: an imported id that reuses a purged id's freed slot keeps the id (
       edges: [{ source_id: "reused-with-edge", target_id: "other", type: "relates_to" }],
     });
     expect(summary.imported).toBe(2);
-    expect(summary.edges_imported).toBe(1);
+    const edgesPage = await importExportPayload(env, {
+      entries: [], edges: [{ source_id: "reused-with-edge", target_id: "other", type: "relates_to" }],
+    });
+    expect(edgesPage.edges_imported).toBe(1);
     // relates_to is symmetric, so bindEdgeInsert orders endpoints lexicographically ("other" <
     // "reused-with-edge") rather than preserving the export's own source/target order.
     const edge = await (sqlite.db as any).prepare(

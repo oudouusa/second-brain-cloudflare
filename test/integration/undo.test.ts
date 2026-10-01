@@ -40,15 +40,16 @@ function statefulVectorize(decision?: string, matchId?: string, matchScore = 0.9
   return makeVectorizeMock(overrides as any);
 }
 function decisionAI(decision: string) {
-  return { run: vi.fn(async (model: string) => model.startsWith("@cf/baai/bge") ? { data: [new Array(384).fill(0.1)] } : stream(decision)) } as any;
+  return { run: vi.fn(async (model: string) => model === "@cf/google/embeddinggemma-300m" ? { data: [new Array(768).fill(0.1)] } : stream(decision)) } as any;
 }
 
 beforeEach(async () => {
   resetDatabaseInit();
   deleted = [];
   sqlite = makeSqliteD1();
-  env = makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV(), VECTORIZE: statefulVectorize(), AI: makeAIMock() });
+  env = sqlite.admitEnv(makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV(), VECTORIZE: statefulVectorize(), AI: makeAIMock() }));
   await initializeDatabase(env);
+  env = sqlite.admitEnv(env);
   const roots = await ensureTenantBootstrap(env);
   owner = (await resolveIdentityByUserId(env, roots.ownerUserId))!;
 });
@@ -89,10 +90,10 @@ describe("undo, one case per reason", () => {
 
   it("merge: undo restores the target and re-creates the incoming memory", async () => {
     const merged = await makeTestEnv(undefined, {
-      DB: sqlite.db as any, OAUTH_KV: makeMemoryKV(), VECTORIZE: statefulVectorize(JSON.stringify({ action: "merge", target_id: "old", merged_content: "combined" }), "old"),
+      DB: env.DB, WRITE_ADMISSION_TOKEN: env.WRITE_ADMISSION_TOKEN, OAUTH_KV: makeMemoryKV(), VECTORIZE: statefulVectorize(JSON.stringify({ action: "merge", target_id: "old", merged_content: "combined" }), "old"),
       AI: decisionAI(JSON.stringify({ action: "merge", target_id: "old", merged_content: "combined" })),
     }) as Env;
-    await seed("old", { content: "Old text", tags: ["work"] });
+    await seed("old", { content: "Old text", tags: ["rocket-project"] });
     const captured = await captureEntry("Incoming fact", [], "api", merged, ctx, undefined, { workspaceId: owner.personalWorkspaceId, actorId: owner.userId }, undefined, { channel: "rest" });
     expect(captured.status).toBe("merged");
     const r = await revertEntry(merged, owner, "old", change(), DEFAULTS, undefined, owner.personalWorkspaceId);
@@ -105,10 +106,10 @@ describe("undo, one case per reason", () => {
 
   it("replace: undo restores the target's prior text", async () => {
     const replaced = makeTestEnv(undefined, {
-      DB: sqlite.db as any, OAUTH_KV: makeMemoryKV(), VECTORIZE: statefulVectorize(JSON.stringify({ action: "replace", target_id: "old2" }), "old2"),
+      DB: env.DB, WRITE_ADMISSION_TOKEN: env.WRITE_ADMISSION_TOKEN, OAUTH_KV: makeMemoryKV(), VECTORIZE: statefulVectorize(JSON.stringify({ action: "replace", target_id: "old2" }), "old2"),
       AI: decisionAI(JSON.stringify({ action: "replace", target_id: "old2" })),
     }) as Env;
-    await seed("old2", { content: "Stale fact", tags: ["work"] });
+    await seed("old2", { content: "Stale fact", tags: ["rocket-project"] });
     const captured = await captureEntry("Fresh fact", [], "api", replaced, ctx, undefined, { workspaceId: owner.personalWorkspaceId, actorId: owner.userId }, undefined, { channel: "rest" });
     expect(captured.status).toBe("replaced");
     const r = await revertEntry(replaced, owner, "old2", change(), DEFAULTS, undefined, owner.personalWorkspaceId);
@@ -117,9 +118,9 @@ describe("undo, one case per reason", () => {
   });
 
   it("rollup: undo removes the digest marker and the rolled-up tag", async () => {
-    const digestEnv = makeTestEnv(undefined, { DB: sqlite.db as any, OAUTH_KV: makeMemoryKV(), AI: decisionAI("Synthesized text"), VECTORIZE: statefulVectorize() }) as Env;
-    for (let i = 0; i < 12; i++) await seed(`src-${i}`, { content: `Work fact number ${i}, detailed enough to be eligible`, tags: ["work"], createdAt: 1000 + i });
-    const result = await compressTag("work", digestEnv, ctx);
+    const digestEnv = makeTestEnv(undefined, { DB: env.DB, WRITE_ADMISSION_TOKEN: env.WRITE_ADMISSION_TOKEN, OAUTH_KV: makeMemoryKV(), AI: decisionAI("Synthesized text"), VECTORIZE: statefulVectorize() }) as Env;
+    for (let i = 0; i < 12; i++) await seed(`src-${i}`, { content: `Work fact number ${i}, detailed enough to be eligible`, tags: ["rocket-project"], createdAt: 1000 + i });
+    const result = await compressTag("rocket-project", digestEnv, ctx);
     expect(result.synthesizedId).not.toBeNull();
     const before = row("src-0").content;
     const r = await revertEntry(digestEnv, owner, "src-0", change(), DEFAULTS, undefined, owner.personalWorkspaceId);
@@ -130,7 +131,7 @@ describe("undo, one case per reason", () => {
   });
 
   it("status: undo un-deprecates and re-embeds", async () => {
-    await seed("s1", { content: "some fact", tags: ["work"] });
+    await seed("s1", { content: "some fact", tags: ["rocket-project"] });
     await deprecateEntry("s1", env, change(), DEFAULTS, owner.personalWorkspaceId);
     expect(JSON.parse(String(row("s1").tags))).toContain("status:deprecated");
     expect(row("s1").vector_ids).toBe("[]");
@@ -152,7 +153,7 @@ describe("undo, one case per reason", () => {
   });
 
   it("mirror: undo restores the pre-sync text", async () => {
-    const mirrorEnv = makeTestEnv(undefined, { DB: sqlite.db as any, OAUTH_KV: makeMemoryKV(), VECTORIZE: statefulVectorize(), AI: makeAIMock() }) as Env;
+    const mirrorEnv = makeTestEnv(undefined, { DB: env.DB, WRITE_ADMISSION_TOKEN: env.WRITE_ADMISSION_TOKEN, OAUTH_KV: makeMemoryKV(), VECTORIZE: statefulVectorize(), AI: makeAIMock() }) as Env;
     const mirror = makeMirrorStore(mirrorEnv, { workspaceId: owner.personalWorkspaceId, actorId: owner.userId }, undefined, "notion");
     const id = await mirror.createEntry("mirror v1", ["work"], "notion");
     await mirror.updateEntry(id, "mirror v2");
@@ -179,7 +180,7 @@ describe("undo, one case per reason", () => {
   it("insight dismiss: undo restores the tags and re-embeds", async () => {
     let deletedIds: string[] = [];
     const insightEnv = makeTestEnv(undefined, {
-      DB: sqlite.db as any, OAUTH_KV: makeMemoryKV(), AI: makeAIMock(),
+      DB: env.DB, WRITE_ADMISSION_TOKEN: env.WRITE_ADMISSION_TOKEN, OAUTH_KV: makeMemoryKV(), AI: makeAIMock(),
       VECTORIZE: statefulVectorize(),
     }) as Env;
     (insightEnv.VECTORIZE.deleteByIds as any) = vi.fn(async (ids: string[]) => { deletedIds.push(...ids); for (const i of ids) store.delete(i); return { mutationId: "m" }; });
@@ -222,7 +223,7 @@ describe("undo mechanics", () => {
   it("a person's undo of a digest merge adds user-edited, and the next digest run cannot merge into it", async () => {
     const decision = JSON.stringify({ action: "merge", target_id: "digest1", merged_content: "digest v2" });
     const digestMergeEnv = makeTestEnv(undefined, {
-      DB: sqlite.db as any, OAUTH_KV: makeMemoryKV(), VECTORIZE: statefulVectorize(decision, "digest1"), AI: decisionAI(decision),
+      DB: env.DB, WRITE_ADMISSION_TOKEN: env.WRITE_ADMISSION_TOKEN, OAUTH_KV: makeMemoryKV(), VECTORIZE: statefulVectorize(decision, "digest1"), AI: decisionAI(decision),
     }) as Env;
     await seed("digest1", { content: "digest v1", tags: ["synthesized", "work"], source: "system", actorId: "" });
     const captured = await captureEntry("my addition", [], "api", digestMergeEnv, ctx, undefined, { workspaceId: owner.personalWorkspaceId, actorId: owner.userId }, undefined, { channel: "rest" });
@@ -289,16 +290,17 @@ describe("undo mechanics", () => {
     await seed("gone1", { content: "before" });
     await updateEntryContent(env, "gone1", "after", DEFAULTS, undefined, undefined, { workspaceId: owner.personalWorkspaceId, actorId: owner.userId }, change(), owner.personalWorkspaceId);
     const raw = env.DB as any;
+    const realBatch = raw.batch.bind(raw);
     let raced = false;
-    const racing = { ...env, DB: { ...raw, prepare: (sql: string) => {
-      const st = raw.prepare(sql);
-      if (!raced && sql.startsWith("INSERT INTO entry_versions")) {
+    const racing = { ...env, DB: { ...raw, batch: async (statements: any[]) => {
+      if (!raced && statements.some(stmt => /^UPDATE entries AS e SET.*content = /s.test(stmt.sourceSql()))) {
         raced = true;
-        sqlite.db.prepare(`DELETE FROM entries WHERE id = 'gone1'`).run();
+        await sqlite.deleteFixtureRows("DELETE FROM entries WHERE id = 'gone1'");
       }
-      return st;
+      return realBatch(statements);
     } } } as unknown as Env;
     const r = await revertEntry(racing, owner, "gone1", change(), DEFAULTS, undefined, owner.personalWorkspaceId);
+    expect(raced).toBe(true);
     expect(r.status).toBe("not_found");
   });
 
@@ -309,7 +311,7 @@ describe("undo mechanics", () => {
     // A version made while the row was still personal: hidden from Bob once it is shared.
     await updateEntryContent(env, "h1", "personal v2", DEFAULTS, undefined, undefined, { workspaceId: owner.personalWorkspaceId, actorId: owner.userId }, change(), owner.personalWorkspaceId);
     const preShareSeq = (await versions("h1"))[0].seq;
-    sqlite.db.prepare(`UPDATE entries SET workspace_id = ? WHERE id = 'h1'`).bind(roots.companyWorkspaceId).run();
+    sqlite.db.prepare(`UPDATE entries SET write_marker = '${sqlite.fixtureMarker()}', workspace_id = ? WHERE id = 'h1'`).bind(roots.companyWorkspaceId).run();
     // A version made AFTER the share: visible to Bob, so the chain is not simply empty.
     await updateEntryContent(env, "h1", "company v3", DEFAULTS, undefined, undefined, { workspaceId: roots.companyWorkspaceId, actorId: owner.userId }, change(), roots.companyWorkspaceId);
     const r = await revertEntry(env, bob, "h1", change(bob), DEFAULTS, preShareSeq, roots.companyWorkspaceId);
@@ -325,9 +327,9 @@ describe("undo mechanics", () => {
   it("a merge whose incoming was truncated reverts the target and says the incoming cannot be re-created", async () => {
     const decision = JSON.stringify({ action: "merge", target_id: "big1", merged_content: "combined" });
     const bigEnv = makeTestEnv(undefined, {
-      DB: sqlite.db as any, OAUTH_KV: makeMemoryKV(), VECTORIZE: statefulVectorize(decision, "big1"), AI: decisionAI(decision),
+      DB: env.DB, WRITE_ADMISSION_TOKEN: env.WRITE_ADMISSION_TOKEN, OAUTH_KV: makeMemoryKV(), VECTORIZE: statefulVectorize(decision, "big1"), AI: decisionAI(decision),
     }) as Env;
-    await seed("big1", { content: "Old text", tags: ["work"] });
+    await seed("big1", { content: "Old text", tags: ["rocket-project"] });
     const incoming = "x".repeat(5000);
     const captured = await captureEntry(incoming, [], "api", bigEnv, ctx, undefined, { workspaceId: owner.personalWorkspaceId, actorId: owner.userId }, undefined, { channel: "rest", versionRowBudgetBytes: 100 });
     expect(captured.status).toBe("merged");
@@ -342,7 +344,7 @@ describe("undo mechanics", () => {
     await seed("f1", { content: "before" });
     await updateEntryContent(env, "f1", "after", DEFAULTS, undefined, undefined, { workspaceId: owner.personalWorkspaceId, actorId: owner.userId }, change(), owner.personalWorkspaceId);
     const before = await versions("f1");
-    const failingEnv = { ...env, AI: { run: vi.fn(async () => { throw new Error("AI down"); }) } } as unknown as Env;
+    const failingEnv = { ...env, WRITE_ADMISSION_TOKEN: env.WRITE_ADMISSION_TOKEN, AI: { run: vi.fn(async () => { throw new Error("AI down"); }) } } as unknown as Env;
     const r = await revertEntry(failingEnv, owner, "f1", change(), DEFAULTS, undefined, owner.personalWorkspaceId);
     expect(r.status).toBe("reembed_failed");
     expect(row("f1").content).toBe("after");

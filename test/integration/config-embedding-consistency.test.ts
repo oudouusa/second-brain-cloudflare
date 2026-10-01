@@ -8,13 +8,16 @@
  * models and every similarity score becomes meaningless. Nothing would throw —
  * recall would just quietly return wrong answers.
  *
- * So this asserts the property directly: with an override in KV, every embed
- * call made by any path uses the same configured model.
+ * The thin fork fixes model, dimensions and prompt version as one profile.
+ * A stale or hand-edited model-only override must therefore fall back to the
+ * fixed profile before any AI call, instead of taking the service down or
+ * producing vectors that look valid but are incomparable.
  */
 import { describe, it, expect, vi } from "vitest";
 import { recallEntries } from "../../src/recall/search";
 import { captureEntry } from "../../src/capture/entry";
-import { CONFIG_KEY, DEFAULTS } from "../../src/config";
+import { CONFIG_KEY, DEFAULTS, resolveConfig } from "../../src/config";
+import { createDefaultHandler } from "../../src/routes/index";
 import { makeTestEnv, makeTestDb, makeVectorizeMock, makeMemoryKV } from "../helpers/make-env";
 
 const OVERRIDE_MODEL = "@cf/baai/bge-base-en-v1.5";
@@ -30,7 +33,7 @@ function envRecordingModels() {
         models.push(model);
         // Embedding models return data[]; text models return a stream. Only the
         // embedding shape is needed here.
-        return { data: [[0.1, 0.2, 0.3]] };
+        return { data: [new Array(768).fill(0.1)] };
       }),
     } as never,
     VECTORIZE: makeVectorizeMock({
@@ -44,39 +47,52 @@ function envRecordingModels() {
 const ctx = { waitUntil: () => {} } as unknown as ExecutionContext;
 
 describe("embedding model consistency (#245)", () => {
-  it("recall embeds with the configured model", async () => {
+  it("recall ignores a stale model-only override and uses the fixed profile", async () => {
     const { env, kv, models } = envRecordingModels();
     await kv.put(CONFIG_KEY, JSON.stringify({ EMBEDDING_MODEL: OVERRIDE_MODEL }));
 
     await recallEntries({ query: "anything", topK: 5 }, env, ctx);
 
-    expect(models.length).toBeGreaterThan(0);
-    expect(models).not.toContain(DEFAULTS.EMBEDDING_MODEL);
+    expect(models).toContain(DEFAULTS.EMBEDDING_MODEL);
+    expect(models).not.toContain(OVERRIDE_MODEL);
   });
 
-  it("capture embeds with the configured model", async () => {
+  it("capture ignores a stale model-only override and uses the fixed profile", async () => {
     const { env, kv, models } = envRecordingModels();
     await kv.put(CONFIG_KEY, JSON.stringify({ EMBEDDING_MODEL: OVERRIDE_MODEL }));
 
     await captureEntry("a memory worth storing", ["test"], "api", env, ctx);
 
-    const embeddingCalls = models.filter(m => m.includes("bge"));
-    expect(embeddingCalls.length).toBeGreaterThan(0);
-    expect(embeddingCalls).not.toContain(DEFAULTS.EMBEDDING_MODEL);
+    expect(models).toContain(DEFAULTS.EMBEDDING_MODEL);
+    expect(models).not.toContain(OVERRIDE_MODEL);
   });
 
-  it("both paths agree on the model, so vectors stay comparable", async () => {
+  it("both paths use the same fixed model when no override exists", async () => {
     const capture = envRecordingModels();
-    await capture.kv.put(CONFIG_KEY, JSON.stringify({ EMBEDDING_MODEL: OVERRIDE_MODEL }));
     await captureEntry("a memory worth storing", [], "api", capture.env, ctx);
 
     const recall = envRecordingModels();
-    await recall.kv.put(CONFIG_KEY, JSON.stringify({ EMBEDDING_MODEL: OVERRIDE_MODEL }));
     await recallEntries({ query: "anything", topK: 5 }, recall.env, ctx);
 
-    const captureModels = new Set(capture.models.filter(m => m.includes("bge")));
-    const recallModels = new Set(recall.models.filter(m => m.includes("bge")));
+    const captureModels = new Set(capture.models.filter(m => m.includes("embeddinggemma")));
+    const recallModels = new Set(recall.models.filter(m => m.includes("embeddinggemma")));
 
     expect([...captureModels]).toEqual([...recallModels]);
+    expect([...captureModels]).toEqual([DEFAULTS.EMBEDDING_MODEL]);
+  });
+
+  it("rejects changing the fixed embedding profile model through PATCH /config", async () => {
+    const { env } = envRecordingModels();
+    const res = await createDefaultHandler().fetch(new Request("http://localhost/config", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json", Authorization: "Bearer test-token" },
+      body: JSON.stringify({ EMBEDDING_MODEL: OVERRIDE_MODEL }),
+    }), env, ctx);
+    const body = await res.json() as { ok: boolean; error: string };
+
+    expect(res.status).toBe(400);
+    expect(body.ok).toBe(false);
+    expect(body.error).toMatch(/EMBEDDING_MODEL.*fixed/i);
+    expect((await resolveConfig(env)).EMBEDDING_MODEL).toBe(DEFAULTS.EMBEDDING_MODEL);
   });
 });

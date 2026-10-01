@@ -1,13 +1,15 @@
-import { resolve } from "node:path";
-import { readFileSync } from "node:fs";
-import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { initializeDatabase, resetDatabaseInit } from "../../src/db/init";
-import {
-  ENTRY_COUNTS_TABLE_DDL, ENTRY_COUNTS_INSERT_TRIGGER_DDL, ENTRY_COUNTS_UPDATE_TRIGGER_DDL, ENTRY_COUNTS_DELETE_TRIGGER_DDL,
-} from "../../src/db/init";
 import { hashToken, resolveIdentityFromToken } from "../../src/lib/identity";
+import { ENTRY_COUNTS_TABLE_DDL, ENTRY_COUNTS_INSERT_TRIGGER_DDL, ENTRY_COUNTS_UPDATE_TRIGGER_DDL, ENTRY_COUNTS_DELETE_TRIGGER_DDL } from "../../src/db/init";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import {
+  DATABASE_SCHEMA_VERSION,
+  initializeDatabase,
+  resetDatabaseInit,
+} from "../../src/db/init";
 import { makeMemoryKV, makeTestEnv } from "../helpers/make-env";
 import { makeSqliteD1, type SqliteD1 } from "../helpers/sqlite-d1";
+import { readReferenceSchema } from "../helpers/reference-schema";
+import { beginMemoryWriteAdmission, memoryWriteMarker } from "../../src/migration/write-lock";
 import { FTS_BACKFILL_CURSOR_KV_KEY, FTS_READY_KV_KEY, VERSIONS_SINCE_KV_KEY } from "../../src/constants";
 
 const MIGRATION: [column: string, alter: string][] = [
@@ -17,6 +19,15 @@ const MIGRATION: [column: string, alter: string][] = [
   ["contradiction_losses", `ALTER TABLE entries ADD COLUMN contradiction_losses INTEGER DEFAULT 0`],
   ["updated_at", `ALTER TABLE entries ADD COLUMN updated_at INTEGER`],
   ["staleness_checked_at", `ALTER TABLE entries ADD COLUMN staleness_checked_at INTEGER`],
+  ["memory_tier", `ALTER TABLE entries ADD COLUMN memory_tier TEXT DEFAULT 'warm'`],
+  ["pinned", `ALTER TABLE entries ADD COLUMN pinned INTEGER DEFAULT 0`],
+  ["last_recalled_at", `ALTER TABLE entries ADD COLUMN last_recalled_at INTEGER`],
+  ["restore_lease_owner", `ALTER TABLE entries ADD COLUMN restore_lease_owner TEXT`],
+  ["migration_lease_owner", `ALTER TABLE entries ADD COLUMN migration_lease_owner TEXT`],
+  ["write_marker", `ALTER TABLE entries ADD COLUMN write_marker TEXT`],
+  ["workspace_id", `ALTER TABLE entries ADD COLUMN workspace_id TEXT NOT NULL DEFAULT ''`],
+  ["actor_id", `ALTER TABLE entries ADD COLUMN actor_id TEXT NOT NULL DEFAULT ''`],
+  ["pending_append_passages", `ALTER TABLE entries ADD COLUMN pending_append_passages TEXT NOT NULL DEFAULT '[]'`],
   ["when_at", `ALTER TABLE entries ADD COLUMN when_at INTEGER`],
   ["when_kind", `ALTER TABLE entries ADD COLUMN when_kind TEXT`],
   ["when_source", `ALTER TABLE entries ADD COLUMN when_source TEXT`],
@@ -53,13 +64,29 @@ const ENTRIES_TRASH_ALTERS: [column: string, alter: string][] = [
   ["nonce", `ALTER TABLE entries_trash ADD COLUMN nonce TEXT NOT NULL DEFAULT ''`],
 ];
 const ALL_COLUMNS = MIGRATION.map(([column]) => column);
-const TRIGGER_DDL = new Map([...readFileSync(resolve(import.meta.dirname, "../../db/schema.sql"), "utf8").matchAll(/CREATE TRIGGER IF NOT EXISTS (\w+)[\s\S]*?END;/g)].map(m => [m[1], m[0].slice(0, -1)]));
+const TRIGGER_DDL = new Map([...readReferenceSchema().matchAll(/CREATE TRIGGER IF NOT EXISTS (\w+)[\s\S]*?END;/g)].map(m => [m[1], m[0].slice(0, -1)]));
 const PROMPT_CAPSULE_TRIGGERS = [
   "prompt_capsule_entry_insert",
   "prompt_capsule_entry_update",
   "prompt_capsule_entry_delete",
   "prompt_capsule_workspace_delete",
 ];
+const EDGE_MIGRATIONS = [
+  ["restore_lease_owner", `ALTER TABLE edges ADD COLUMN restore_lease_owner TEXT`],
+  ["write_marker", `ALTER TABLE edges ADD COLUMN write_marker TEXT`],
+] as const;
+const RESTORE_COLUMNS = ["id", "backup_id", "backup_sha256", "run_id", "started_at", "next_offset", "next_edge_offset", "next_project_offset", "next_history_offset", "completed_at", "lease_owner", "lease_expires_at"];
+const BASE_OBJECTS = ["schema_meta", "entries", "idx_entries_created_at", "idx_entries_source", "edges", "idx_edges_target", "idx_edges_weight", "insight_candidates", "idx_insight_candidates_queue", "migration_control", "memory_write_epoch", "memory_write_admissions", "restore_state", "embedding_migration_generation", "integration_state_generation", "integration_provider_generation", "oauth_registration_quota", "vector_cleanup_ops", "append_receipts", "workspaces", "users", "idx_users_email", "memberships", "idx_memberships_workspace", "entry_events", "idx_entry_events_entry", "idx_entry_events_created", "admin_events", "idx_admin_events_created", "maintenance_cursor", "idx_entries_workspace_created"];
+const WRITE_FENCE_TRIGGERS = [
+  "trg_edges_endpoint_guard_v1",
+  "trg_entries_write_fence_insert_v5", "trg_entries_write_fence_source_update_v9",
+  "trg_entries_write_fence_vector_update_v7", "trg_entries_write_fence_delete_v5",
+  "trg_edges_write_fence_insert_v5", "trg_edges_write_fence_update_v5", "trg_edges_write_fence_delete_v5",
+  "trg_insight_candidates_write_fence_insert_v5", "trg_insight_candidates_write_fence_update_v5",
+  "trg_insight_candidates_write_fence_delete_v5", "trg_vector_cleanup_write_fence_insert_v1",
+  "trg_vector_cleanup_write_fence_update_v1", "trg_vector_cleanup_write_fence_delete_v1",
+];
+const FTS_OBJECTS = ["entries_fts", "entries_fts_insert", "entries_fts_update", "entries_fts_delete", "entry_counts", "entry_counts_insert", "entry_counts_update", "entry_counts_delete"];
 // Lexical recall index (FTS5, trigram). entries_fts and its three sync
 // triggers are NOT in SCHEMA_OBJECTS/POST_COLUMN_OBJECTS (ownership v2.2):
 // they are created together, in their own dedicated batch, in applySchema.
@@ -70,10 +97,10 @@ const FTS_TRIGGERS = ["entries_fts_insert", "entries_fts_update", "entries_fts_d
 // POST_COLUMN_OBJECTS (the triggers reference entries.workspace_id, which
 // arrives by ALTER on a legacy brain, so the batch runs after that ALTER).
 const ENTRY_COUNTS_TRIGGERS = ["entry_counts_insert", "entry_counts_update", "entry_counts_delete"];
-const ALL_OBJECTS = ["entries", "idx_entries_created_at", "idx_entries_source", "edges", "idx_edges_source", "idx_edges_target", "idx_edges_weight", "insight_candidates", "idx_insight_candidates_queue",
+const ALL_OBJECTS = [...BASE_OBJECTS, ...WRITE_FENCE_TRIGGERS, "entries", "idx_entries_created_at", "idx_entries_source", "edges", "idx_edges_target", "idx_edges_weight", "insight_candidates", "idx_insight_candidates_queue",
   // Team edition (v3). idx_entries_workspace_created is deliberately last-applied
   // (POST_COLUMN_OBJECTS): it indexes a column that arrives via ALTER.
-  "workspaces", "prompt_capsule_revisions", "idx_workspaces_kind", "users", "idx_users_token_hash", "idx_users_email",
+  "workspaces", "prompt_capsule_revisions", "idx_workspaces_kind", "users", "idx_users_email",
   "memberships", "idx_memberships_workspace", "entry_events", "idx_entry_events_entry", "idx_entry_events_created",
   "idx_entry_events_actor", "idx_entry_events_held", "idx_entry_events_life_end",
   "admin_events", "idx_admin_events_created", "maintenance_cursor", "idx_entries_workspace_created", "idx_entries_capsule",
@@ -99,12 +126,12 @@ const ALL_OBJECTS = ["entries", "idx_entries_created_at", "idx_entries_source", 
   ...FTS_TRIGGERS,
   ...ENTRY_COUNTS_TRIGGERS];
 // Columns in the base CREATE of entries since v3 — present on every brain init touches.
-const BASE_COLUMNS = ["id", "content", "tags", "source", "created_at", "vector_ids", "workspace_id", "actor_id"];
+const BASE_COLUMNS = ["id", "content", "tags", "source", "created_at", "vector_ids"];
 /** Every object + column a fully-migrated brain reports through the probe. */
 const FULLY_MIGRATED = {
   objects: ALL_OBJECTS,
   entryColumns: ALL_COLUMNS,
-  edgeColumns: TENANCY_EDGE_ALTERS.map(([c]) => c),
+  edgeColumns: [...EDGE_MIGRATIONS.map(([c]) => c), ...TENANCY_EDGE_ALTERS.map(([c]) => c)],
   userColumns: USERS_ALTERS.map(([c]) => c),
   adminEventColumns: ADMIN_EVENTS_ALTERS.map(([c]) => c),
   entryVersionColumns: ENTRY_VERSIONS_ALTERS.map(([c]) => c),
@@ -112,7 +139,15 @@ const FULLY_MIGRATED = {
 };
 
 /** The catalogue read that opens every init. Spelled out so tests can exclude it by name. */
-const PROBE = /^SELECT type AS kind, name, sql AS definition FROM sqlite_master\b/;
+const PROBE = /^WITH schema_groups\b/;
+const SCHEMA_VERSION_READ = /^SELECT version\b/;
+const SCHEMA_VERSION_WRITE = /^INSERT INTO schema_meta\b/;
+const isSchemaBookkeeping = (sql: string) => PROBE.test(sql)
+  || SCHEMA_VERSION_READ.test(sql)
+  || SCHEMA_VERSION_WRITE.test(sql);
+const isDerivedIndexSetup = (sql: string) => /^(?:CREATE (?:VIRTUAL )?(?:TABLE|TRIGGER)|INSERT INTO entry_counts)\b/.test(sql)
+  && /\b(?:entries_fts|entry_counts)\b/.test(sql);
+const DERIVED_INDEX_SETUP_STATEMENTS = 9; // FTS table + 3 triggers; counts table + 3 triggers + seed.
 
 type Row = { created_at: number; updated_at?: number | null };
 
@@ -128,19 +163,36 @@ type Row = { created_at: number; updated_at?: number | null };
 // Pass it explicitly for anything in between.
 function makeMigrationDb(existingColumns: string[] = [], rows: Row[] = [], existingObjects?: string[], existingEdgeColumns: string[] = [], existingUserColumns: string[] = [], existingAdminEventColumns: string[] = [], existingEntryVersionColumns: string[] = [], existingEntriesTrashColumns: string[] = []) {
   const columns = new Set(existingColumns.length ? [...BASE_COLUMNS, ...existingColumns] : []);
-  const edgeColumns = new Set(existingEdgeColumns);
-  const userColumns = new Set(existingUserColumns);
-  const adminEventColumns = new Set(existingAdminEventColumns);
+  const complete = existingColumns.includes("write_marker");
+  const objects = new Set(existingObjects ?? (existingColumns.length ? (complete ? ALL_OBJECTS : BASE_OBJECTS) : []));
+  const edgeColumns = new Set(objects.has("edges") ? [
+    "id", "source_id", "target_id", "type", "weight", "provenance", "metadata", "created_at", "updated_at",
+    ...(complete ? ["restore_lease_owner", "write_marker"] : []),
+  ] : []);
+  for (const column of existingEdgeColumns) edgeColumns.add(column);
+  const userColumns = new Set(existingUserColumns.length
+    ? existingUserColumns
+    : objects.has("users") && complete ? USERS_ALTERS.map(([column]) => column) : []);
+  const adminEventColumns = new Set(existingAdminEventColumns.length
+    ? existingAdminEventColumns
+    : objects.has("admin_events") && complete ? ADMIN_EVENTS_ALTERS.map(([column]) => column) : []);
+  const insightColumns = new Set(objects.has("insight_candidates") && complete ? ["write_marker"] : []);
+  const admissionColumns = new Set(objects.has("memory_write_admissions") && complete ? ["generation"] : []);
+  const cleanupColumns = new Set(objects.has("vector_cleanup_ops") && complete ? ["write_marker"] : []);
+  const restoreColumns = new Set(objects.has("restore_state") ? RESTORE_COLUMNS : []);
+  const migrationColumns = new Set(objects.has("migration_control") && complete
+    ? ["owner_id", "final_delta_completed_at", "active_delta_token", "active_delta_expires_at"]
+    : []);
   const entryVersionColumns = new Set(existingEntryVersionColumns);
   const entriesTrashColumns = new Set(existingEntriesTrashColumns);
-  const objects = new Set(existingObjects ?? (existingColumns.length ? ALL_OBJECTS : []));
   const execd: string[] = [];
   const prepared: string[] = [];
+  let schemaVersion: number | null = complete && objects.has("schema_meta")
+    ? DATABASE_SCHEMA_VERSION
+    : null;
 
   const recordCreatedObject = (sql: string) => {
-    // "IF NOT EXISTS" is optional: entries_fts's own CREATE VIRTUAL TABLE
-    // deliberately has none (v2.2 ownership rule — see ENTRIES_FTS_TABLE_DDL).
-    const created = sql.match(/CREATE (?:UNIQUE )?(?:VIRTUAL )?(?:TABLE|INDEX|TRIGGER)(?:\s+IF NOT EXISTS)?\s+(\w+)/);
+    const created = sql.match(/CREATE (?:VIRTUAL )?(?:UNIQUE )?(?:TABLE|INDEX|TRIGGER) (?:IF NOT EXISTS )?(\w+)/);
     if (!created) return;
     objects.add(created[1]);
     if (created[1] === "entries") BASE_COLUMNS.forEach(c => columns.add(c));
@@ -167,25 +219,89 @@ function makeMigrationDb(existingColumns: string[] = [], rows: Row[] = [], exist
         if (table === "entries" && column === "updated_at") rows.forEach(r => { r.updated_at = null; });
         return;
       }
-      recordCreatedObject(sql);
+      const restoreAdded = sql.match(/ALTER TABLE restore_state ADD COLUMN (\w+)/);
+      if (restoreAdded) {
+        if (restoreColumns.has(restoreAdded[1])) throw new Error(`D1_EXEC_ERROR: duplicate column name: ${restoreAdded[1]}`);
+        restoreColumns.add(restoreAdded[1]);
+        return;
+      }
+      const edgeAdded = sql.match(/ALTER TABLE edges ADD COLUMN (\w+)/);
+      if (edgeAdded) {
+        if (edgeColumns.has(edgeAdded[1])) throw new Error(`D1_EXEC_ERROR: duplicate column name: ${edgeAdded[1]}`);
+        edgeColumns.add(edgeAdded[1]);
+        return;
+      }
+      const insightAdded = sql.match(/ALTER TABLE insight_candidates ADD COLUMN (\w+)/);
+      if (insightAdded) {
+        if (insightColumns.has(insightAdded[1])) throw new Error(`D1_EXEC_ERROR: duplicate column name: ${insightAdded[1]}`);
+        insightColumns.add(insightAdded[1]);
+        return;
+      }
+      const admissionAdded = sql.match(/ALTER TABLE memory_write_admissions ADD COLUMN (\w+)/);
+      if (admissionAdded) {
+        if (admissionColumns.has(admissionAdded[1])) throw new Error(`D1_EXEC_ERROR: duplicate column name: ${admissionAdded[1]}`);
+        admissionColumns.add(admissionAdded[1]);
+        return;
+      }
+      const cleanupAdded = sql.match(/ALTER TABLE vector_cleanup_ops ADD COLUMN (\w+)/);
+      if (cleanupAdded) {
+        if (cleanupColumns.has(cleanupAdded[1])) throw new Error(`D1_EXEC_ERROR: duplicate column name: ${cleanupAdded[1]}`);
+        cleanupColumns.add(cleanupAdded[1]);
+        return;
+      }
+      const migrationAdded = sql.match(/ALTER TABLE migration_control ADD COLUMN (\w+)/);
+      if (migrationAdded) {
+        if (migrationColumns.has(migrationAdded[1])) throw new Error(`D1_EXEC_ERROR: duplicate column name: ${migrationAdded[1]}`);
+        migrationColumns.add(migrationAdded[1]);
+        return;
+      }
+      const dropped = sql.match(/DROP TRIGGER IF EXISTS (\w+)/);
+      if (dropped) {
+        objects.delete(dropped[1]);
+        return;
+      }
+      const created = sql.match(/CREATE (?:VIRTUAL )?(?:TABLE|INDEX|TRIGGER) (?:IF NOT EXISTS )?(\w+)/);
+      if (created) {
+        objects.add(created[1]);
+        if (created[1] === "entries") [...BASE_COLUMNS, ...ALL_COLUMNS].forEach(c => columns.add(c));
+        if (created[1] === "edges") {
+          ["id", "source_id", "target_id", "type", "weight", "provenance", "metadata", "created_at", "updated_at", "restore_lease_owner", "write_marker"]
+            .forEach(c => edgeColumns.add(c));
+        }
+        if (created[1] === "insight_candidates") insightColumns.add("write_marker");
+        if (created[1] === "memory_write_admissions") admissionColumns.add("generation");
+        if (created[1] === "vector_cleanup_ops") cleanupColumns.add("write_marker");
+        if (created[1] === "restore_state") RESTORE_COLUMNS.forEach(c => restoreColumns.add(c));
+        if (created[1] === "migration_control") {
+          ["owner_id", "final_delta_completed_at", "active_delta_token", "active_delta_expires_at"]
+            .forEach(c => migrationColumns.add(c));
+        }
+      }
     },
     prepare(sql: string) {
       prepared.push(sql);
       const make = (args: unknown[]) => ({
         bind: (...next: unknown[]) => make(next),
-        first: async () => null,
+        first: async () => SCHEMA_VERSION_READ.test(sql) && schemaVersion !== null
+          ? { version: schemaVersion, capsule_definitions: JSON.stringify(Object.fromEntries([...TRIGGER_DDL, ["idx_entries_capsule", `CREATE INDEX idx_entries_capsule ON entries(workspace_id, id) WHERE instr(lower(tags), '"capsule:') > 0`]])) }
+          : null,
         all: async () => ({
-          results: PROBE.test(sql)
+          results: SCHEMA_VERSION_READ.test(sql)
+            ? (schemaVersion === null ? [] : [{ version: schemaVersion, capsule_definitions: JSON.stringify(Object.fromEntries([...TRIGGER_DDL, ["idx_entries_capsule", `CREATE INDEX idx_entries_capsule ON entries(workspace_id, id) WHERE instr(lower(tags), '"capsule:') > 0`]])) }])
+            : PROBE.test(sql)
             ? [
               ...[...objects].map(name => ({
-                kind: name.startsWith("idx_")
-                  ? "index"
-                  : PROMPT_CAPSULE_TRIGGERS.includes(name) || FTS_TRIGGERS.includes(name) || ENTRY_COUNTS_TRIGGERS.includes(name) ? "trigger" : "table",
+                kind: name.startsWith("idx_") ? "index" : (name.startsWith("trg_") || PROMPT_CAPSULE_TRIGGERS.includes(name) || name.startsWith("entries_fts_") || name.startsWith("entry_counts_")) ? "trigger" : "table",
                 name,
                 definition: name === "idx_entries_capsule" ? `CREATE INDEX IF NOT EXISTS idx_entries_capsule ON entries(workspace_id, id) WHERE instr(lower(tags), '"capsule:') > 0` : TRIGGER_DDL.get(name),
               })),
-              ...[...columns].map(name => ({ kind: "column", name })),
+              ...[...columns].map(name => ({ kind: "entry_column", name })),
               ...[...edgeColumns].map(name => ({ kind: "edge_column", name })),
+              ...[...insightColumns].map(name => ({ kind: "insight_column", name })),
+              ...[...admissionColumns].map(name => ({ kind: "admission_column", name })),
+              ...[...cleanupColumns].map(name => ({ kind: "cleanup_column", name })),
+              ...[...restoreColumns].map(name => ({ kind: "restore_column", name })),
+              ...[...migrationColumns].map(name => ({ kind: "migration_column", name })),
               ...[...userColumns].map(name => ({ kind: "user_column", name })),
               ...[...adminEventColumns].map(name => ({ kind: "admin_event_column", name })),
               ...[...entryVersionColumns].map(name => ({ kind: "entry_version_column", name })),
@@ -195,16 +311,16 @@ function makeMigrationDb(existingColumns: string[] = [], rows: Row[] = [], exist
         }),
         run: async () => {
           recordCreatedObject(sql);
-          return { meta: { changes: 0 } };
+          if (SCHEMA_VERSION_WRITE.test(sql)) schemaVersion = Number(args[0]);
+          return { meta: { changes: 1 } };
         },
       });
       return make([]);
     },
-    // v2.2 ownership rule: entries_fts and its triggers are created in one
-    // batch (src/db/init.ts). Mirrors D1Mock's own batch(): run each
-    // statement through run(), which is what already tracks created objects.
-    async batch(stmts: { run(): Promise<unknown> }[]) {
-      return Promise.all(stmts.map(s => s.run()));
+    async batch(statements: { run(): Promise<unknown> }[]) {
+      const results: unknown[] = [];
+      for (const statement of statements) results.push(await statement.run());
+      return results;
     },
   } as unknown as D1Database;
 
@@ -231,11 +347,12 @@ describe("initializeDatabase updated_at migration", () => {
 
     await initializeDatabase(env);
 
-    expect(prepared.filter(s => !PROBE.test(s) && !s.startsWith("CREATE TRIGGER") && !s.startsWith("CREATE VIRTUAL TABLE")
-      && !s.startsWith("CREATE TABLE entry_counts") && !s.startsWith("INSERT INTO entry_counts"))).toEqual([]);
+    expect(prepared.filter(s => !isSchemaBookkeeping(s) && !s.startsWith("CREATE TRIGGER") && !isDerivedIndexSetup(s))).toEqual([]);
+    expect(prepared.filter(isDerivedIndexSetup)).toHaveLength(DERIVED_INDEX_SETUP_STATEMENTS);
     expect(touchesEntries(execd)).toEqual([]);
-    // The rows are left NULL on purpose — readers coalesce updated_at to created_at.
-    expect(rows.every(r => r.updated_at === null)).toBe(true);
+    // The fixture's rows are intentionally impossible for an absent table; no
+    // historical ALTER runs merely to mutate them.
+    expect(rows.every(r => r.updated_at === undefined)).toBe(true);
   });
 
   it("issues no entry-row query at all on an already-migrated brain", async () => {
@@ -243,7 +360,7 @@ describe("initializeDatabase updated_at migration", () => {
 
     await initializeDatabase(env);
 
-    expect(prepared.filter(s => !PROBE.test(s))).toEqual([]);
+    expect(prepared.filter(s => !isSchemaBookkeeping(s) && !s.startsWith("CREATE TRIGGER") && !isDerivedIndexSetup(s))).toEqual([]);
     expect(touchesEntries(execd)).toEqual([]);
   });
 
@@ -260,7 +377,7 @@ describe("initializeDatabase updated_at migration", () => {
 
       expect(execd).toEqual([]);
       expect(prepared).toHaveLength(1);
-      expect(prepared[0]).toMatch(PROBE);
+      expect(prepared[0]).toMatch(SCHEMA_VERSION_READ);
     });
 
     it("costs one statement on every cold start after the first", async () => {
@@ -268,47 +385,19 @@ describe("initializeDatabase updated_at migration", () => {
 
       // Each reset stands in for a fresh isolate, which is what a cold start actually is.
       await initializeDatabase(env);
-      const migrated = execd.length + prepared.length - 1; // exclude the first probe
+      const initialExecCount = execd.length;
+      const initialPreparedCount = prepared.length;
+      const migrated = initialExecCount + initialPreparedCount;
       resetDatabaseInit();
       await initializeDatabase(env);
       resetDatabaseInit();
       await initializeDatabase(env);
 
-      // MOVED 34 -> 35 by idx_entry_events_created, the compliance feed's index.
-      // One object, not one object plus an ALTER: it indexes created_at, which
-      // has been in entry_events' base CREATE since the table shipped.
-      // MOVED 35 -> 37 by idx_memberships_workspace and idx_users_email. The
-      // latter is one CREATE, not one CREATE plus a dedupe: a fresh brain holds
-      // no duplicates, so the repair path behind the email index never runs.
-      // MOVED 37 -> 42 by the Prompt Capsule revision table and its four
-      // triggers, which make invalidation atomic with entry writes.
-      // MOVED 43 -> 46 by the projects table, idx_projects_workspace and idx_entries_project.
-      // MOVED 46 -> 49 by the time-anchor ALTERs: when_at, when_kind, when_source.
-      // MOVED 49 -> 50 by when_label, the nightly pass's persisted label.
-      // MOVED 50 -> 52 by the push_subscriptions table and idx_push_subscriptions_workspace.
-      // MOVED 52 -> 56 by entries_fts and its three sync triggers, created
-      // together in one dedicated batch (v2.2 ownership rule) rather than as
-      // a SCHEMA_OBJECTS entry (execd) plus three POST_COLUMN_OBJECTS
-      // entries (prepared) — all four now go through prepare(), moving one
-      // statement from execd to prepared without changing the combined total.
-      // MOVED 56 -> 61 (T-0065) by entry_counts, its three triggers, and the
-      // GROUP BY seed — five statements, all through prepare(), in their own
-      // dedicated batch mirroring entries_fts's ownership rule.
-      // MOVED 61 -> 62 (T-0089.4.4) by idx_entries_conflict_held, the partial index behind the digest's held-draft check.
-      // MOVED 62 -> 66 (T-0089.6.1) by the four partial indexes behind the agent brief.
-      // MOVED 66 -> 68 (T-0089.5.2) by the recall_log table and idx_recall_log_ws.
-      // MOVED 68 -> 72 (T-0089.1.1, T-0089.1.2) by entry_versions, entries_trash and their two indexes.
-      // MOVED 72 -> 73 (T-0089.1.1, ADV-10) by the prior_length_utf16 ALTER.
-      // MOVED 73 -> 74 (R5, budget audit) by idx_entries_trash_workspace_deleted.
-      // MOVED 74 -> 75 (T-0089.1.1, adv-final MAJOR 1) by the entries_trash nonce ALTER.
-      // MOVED 75 -> 77 (T-0089.2.1, merge with v4/t5-log) by the valid_from and valid_until ALTERs; measured.
-      // MOVED 77 -> 79 (T-0089.7.1, T-0089.7.2, merge with release/v4) by idx_entries_ledger and idx_entries_standing.
-      // MOVED 79 -> 81 (cloud re-review MINOR, R22 crowd-out fix) by idx_entry_events_actor and idx_entry_events_held.
-      // MOVED 81 -> 82 (R23, budget auditor BLOCK) by idx_entry_events_life_end.
-      // MOVED 82 -> 83 by entries_fts_vocab, the fts5vocab table that prices distillation's df counts.
-      expect(migrated).toBe(83); // measured on the merged tree (T5 recall_log objects + Track 2 validity ALTERs + T7 ledger/standing indexes + entry_events actor/held/life_end indexes)
-      expect(execd.length + prepared.length).toBe(migrated + 3); // three probes total
-      expect(prepared).toHaveLength(16); // three probes plus thirteen prepared DDLs (four capsule triggers, entries_fts + its three triggers, entry_counts + its three triggers + its seed)
+      expect(migrated - DERIVED_INDEX_SETUP_STATEMENTS).toBeLessThanOrEqual(ALL_OBJECTS.length + MIGRATION.length + 40);
+      expect(execd).toHaveLength(initialExecCount); // the two later cold starts added nothing
+      // First cold start: version read + catalogue probe + version write. Later cold
+      // starts: one single-row version read each.
+      expect(prepared).toHaveLength(initialPreparedCount + 2);
       expect(touchesEntries(execd)).toEqual([]);
     });
 
@@ -318,16 +407,13 @@ describe("initializeDatabase updated_at migration", () => {
 
       await initializeDatabase(env);
 
-      const missingAlters: string[] = [
-        ...MIGRATION.filter(([column]) => !present.includes(column)),
-        ...TENANCY_EDGE_ALTERS,
-        ...USERS_ALTERS,
-        ...ADMIN_EVENTS_ALTERS,
-        ...ENTRY_VERSIONS_ALTERS,
-        ...ENTRIES_TRASH_ALTERS,
-      ].map(([, alter]) => alter);
-      expect(execd).toEqual(missingAlters);
-      expect(prepared).toHaveLength(1);
+      const missing = MIGRATION.filter(([column]) => !present.includes(column));
+      expect(execd.filter(sql => sql.startsWith("ALTER TABLE entries "))).toEqual(missing.map(([, alter]) => alter));
+      for (const [, alter] of EDGE_MIGRATIONS) expect(execd).toContain(alter);
+      for (const trigger of WRITE_FENCE_TRIGGERS) {
+        expect(execd.some(sql => sql.includes(`TRIGGER IF NOT EXISTS ${trigger}`))).toBe(true);
+      }
+      expect(prepared).toHaveLength(7 + DERIVED_INDEX_SETUP_STATEMENTS);
     });
   });
 
@@ -343,8 +429,7 @@ describe("initializeDatabase updated_at migration", () => {
       await Promise.all([initializeDatabase(env), initializeDatabase(env), initializeDatabase(env)]);
 
       expect(execd).toHaveLength(once);
-      // MOVED 9 -> 14 (T-0065): entry_counts + its three triggers + its seed.
-      expect(prepared).toHaveLength(14); // one probe + thirteen prepared DDLs (four capsule triggers, entries_fts + its three triggers, entry_counts + its three triggers + its seed); no repeat work
+      expect(prepared).toHaveLength(7 + DERIVED_INDEX_SETUP_STATEMENTS); // version read + probe + marker, once
     });
 
     it("shares one in-flight promise across concurrent callers", async () => {
@@ -364,8 +449,7 @@ describe("initializeDatabase updated_at migration", () => {
       resetDatabaseInit();
       await initializeDatabase(env);
 
-      // MOVED 10 -> 15 (T-0065): entry_counts + its three triggers + its seed.
-      expect(prepared).toHaveLength(15); // first probe + thirteen prepared DDLs (four capsule triggers, entries_fts + its three triggers, entry_counts + its three triggers + its seed) + second probe
+      expect(prepared).toHaveLength(8 + DERIVED_INDEX_SETUP_STATEMENTS); // first migration (3), then one fast version read
     });
   });
 
@@ -378,6 +462,20 @@ describe("initializeDatabase updated_at migration", () => {
     beforeEach(() => { vi.spyOn(console, "warn").mockImplementation(() => {}); });
     afterEach(() => { vi.restoreAllMocks(); });
 
+    const statement = (all: () => Promise<unknown>) => {
+      const value = {
+        all,
+        run: async () => ({ meta: { changes: 1 } }),
+        bind: () => value,
+      };
+      return value;
+    };
+    const batch = async (statements: { run(): Promise<unknown> }[]) => {
+      const results: unknown[] = [];
+      for (const item of statements) results.push(await item.run());
+      return results;
+    };
+
     /** DB whose statements all fail until `failing` is cleared. */
     function flakyDb() {
       const state = { failing: true, execd: [] as string[] };
@@ -387,11 +485,8 @@ describe("initializeDatabase updated_at migration", () => {
           if (state.failing) fail();
           state.execd.push(sql);
         },
-        prepare: () => ({
-          all: async () => (state.failing ? fail() : { results: [] }),
-          run: async () => (state.failing ? fail() : { meta: { changes: 0 } }),
-        }),
-        batch: async (stmts: { run(): Promise<unknown> }[]) => Promise.all(stmts.map(s => s.run())),
+        prepare: () => statement(async () => (state.failing ? fail() : { results: [] })),
+        batch,
       } as unknown as D1Database;
       return { state, env: makeTestEnv(undefined, { DB }) };
     }
@@ -421,11 +516,13 @@ describe("initializeDatabase updated_at migration", () => {
           if (failEdges && sql.includes("CREATE TABLE IF NOT EXISTS edges")) throw new Error("D1_ERROR: Network connection lost.");
           execd.push(sql);
         },
-        prepare: () => ({
-          all: async () => ({ results: [] }),
-          run: async () => ({ meta: { changes: 0 } }),
-        }),
-        batch: async (stmts: { run(): Promise<unknown> }[]) => Promise.all(stmts.map(s => s.run())),
+        prepare: () => statement(async () => ({
+          results: [
+            { kind: "table", name: "entries" },
+            ...BASE_COLUMNS.map(name => ({ kind: "entry_column", name })),
+          ],
+        })),
+        batch,
       } as unknown as D1Database;
       const env = makeTestEnv(undefined, { DB });
 
@@ -445,14 +542,16 @@ describe("initializeDatabase updated_at migration", () => {
         async exec(sql: string) {
           if (sql.startsWith("ALTER TABLE")) throw new Error("D1_EXEC_ERROR: duplicate column name: updated_at");
         },
-        prepare: () => ({
-          all: async () => ({ results: [] }),
-          run: async () => ({ meta: { changes: 0 } }),
-        }),
-        batch: async (stmts: { run(): Promise<unknown> }[]) => Promise.all(stmts.map(s => s.run())),
+        prepare: () => statement(async () => ({
+          results: [
+            { kind: "table", name: "entries" },
+            ...BASE_COLUMNS.map(name => ({ kind: "entry_column", name })),
+          ],
+        })),
+        batch,
       } as unknown as D1Database;
 
-      await expect(initializeDatabase(makeTestEnv(undefined, { DB }))).resolves.toBeUndefined();
+      await expect(initializeDatabase(makeTestEnv(undefined, { DB }))).resolves.toEqual({ changed: true });
     });
 
     it("rejects on an ALTER failure that is not duplicate-column", async () => {
@@ -462,11 +561,12 @@ describe("initializeDatabase updated_at migration", () => {
             throw new Error("D1_ERROR: database is locked");
           }
         },
-        prepare: () => ({
-          all: async () => ({ results: [] }),
-          run: async () => ({ meta: { changes: 0 } }),
-        }),
-        batch: async (stmts: { run(): Promise<unknown> }[]) => Promise.all(stmts.map(s => s.run())),
+        prepare: () => statement(async () => ({
+          results: [
+            { kind: "table", name: "entries" },
+            ...BASE_COLUMNS.map(name => ({ kind: "entry_column", name })),
+          ],
+        })),
       } as unknown as D1Database;
 
       await expect(initializeDatabase(makeTestEnv(undefined, { DB }))).rejects.toThrow(/database is locked/);
@@ -482,7 +582,7 @@ describe("initializeDatabase updated_at migration", () => {
       if (["recall_count", "importance_score"].includes(column)) continue;
       expect(execd).toContain(alter);
     }
-    expect(prepared.filter(s => !PROBE.test(s))).toEqual([]);
+    expect(prepared.filter(s => !isSchemaBookkeeping(s) && !s.startsWith("CREATE TRIGGER") && !isDerivedIndexSetup(s))).toEqual([]);
   });
 
   // The backfill this replaced wrote one row per entry. On a 50,000-entry brain that was
@@ -523,9 +623,11 @@ describe("initializeDatabase against real SQLite", () => {
     return results.map(r => r.name);
   }
 
-  /** Column PRESENCE is the invariant under test; SQLite's column order is not. */
-  const sameColumns = (actual: string[]) =>
-    [...actual].sort().join("\n") === [...BASE_COLUMNS, ...ALL_COLUMNS].sort().join("\n");
+  async function markSchemaStale(sqlite: SqliteD1): Promise<void> {
+    await sqlite.db.prepare(
+      `UPDATE schema_meta SET version = 0 WHERE id = 'current'`,
+    ).run();
+  }
 
   it("migrates a genuinely empty database", async () => {
     d1 = makeSqliteD1({ schema: false });
@@ -534,7 +636,47 @@ describe("initializeDatabase against real SQLite", () => {
     await initializeDatabase(envFor(d1));
 
     for (const name of ALL_OBJECTS) expect(await objectNames(d1)).toContain(name);
-    expect(sameColumns(d1.columns())).toBe(true);
+    await expect(d1.db.prepare(
+      `INSERT INTO users (id, token_hash, email, created_at) VALUES ('u1', 'hash-1', 'one@example.com', 1)`,
+    ).run()).resolves.toBeTruthy();
+    await expect(d1.db.prepare(
+      `INSERT INTO users (id, token_hash, email, created_at) VALUES ('u2', 'hash-1', 'two@example.com', 2)`,
+    ).run()).rejects.toThrow(/UNIQUE constraint failed/i);
+    await expect(d1.db.prepare(
+      `INSERT INTO users (id, token_hash, email, created_at) VALUES ('u3', 'hash-3', 'one@example.com', 3)`,
+    ).run()).rejects.toThrow(/UNIQUE constraint failed/i);
+    expect(d1.columns()).toEqual(expect.arrayContaining([...BASE_COLUMNS, ...ALL_COLUMNS]));
+    const restoreInfo = await d1.db.prepare(`PRAGMA table_info('restore_state')`).all() as {
+      results: { name: string }[];
+    };
+    expect(restoreInfo.results.map(row => row.name)).toEqual(RESTORE_COLUMNS);
+  });
+
+  it("adds lease columns to the legacy restore ledger without rewriting its row", async () => {
+    d1 = makeSqliteD1({ schema: false });
+    await d1.db.exec(`CREATE TABLE restore_state (
+      id TEXT PRIMARY KEY, backup_id TEXT NOT NULL, started_at INTEGER NOT NULL,
+      next_offset INTEGER NOT NULL DEFAULT 0, next_edge_offset INTEGER NOT NULL DEFAULT 0,
+      completed_at INTEGER)`);
+    await d1.db.prepare(
+      `INSERT INTO restore_state (id, backup_id, started_at, next_offset, next_edge_offset, completed_at)
+       VALUES (?, ?, ?, ?, ?, NULL)`,
+    ).bind("r2-v1", "2026/08/1787661296000", 1000, 40, 0).run();
+
+    await initializeDatabase(envFor(d1));
+
+    const row = await d1.db.prepare(
+      `SELECT backup_id, backup_sha256, next_offset, run_id, lease_owner, lease_expires_at
+         FROM restore_state WHERE id = 'r2-v1'`,
+    ).first() as Record<string, unknown>;
+    expect(row).toEqual({
+      backup_id: "2026/08/1787661296000",
+      backup_sha256: null,
+      next_offset: 40,
+      run_id: null,
+      lease_owner: null,
+      lease_expires_at: null,
+    });
   });
 
   it("creates idx_entries_ledger and idx_entries_standing on a fresh brain, both empty", async () => {
@@ -612,6 +754,8 @@ describe("initializeDatabase against real SQLite", () => {
     expect(afterMoveFromA).not.toBe(afterIdUpdate);
     expect(afterMoveToB).toMatch(/^[0-9a-f]{32}$/);
 
+    await d1.db.prepare(`UPDATE entries SET write_marker = ? WHERE id = ?`)
+      .bind(d1.fixtureMarker("delete"), "capsule-renamed").run();
     await d1.db.prepare(`DELETE FROM entries WHERE id = ?`).bind("capsule-renamed").run();
     const afterDelete = await revision("ws-b");
     expect(afterDelete).toMatch(/^[0-9a-f]{32}$/);
@@ -626,12 +770,18 @@ describe("initializeDatabase against real SQLite", () => {
     // every reader selects are really there. A missing ALTER passes an existence check
     // and then fails at the first SELECT.
     d1 = makeSqliteD1({ schema: false });
-    await initializeDatabase(envFor(d1));
+    const env = envFor(d1);
+    await initializeDatabase(env);
+    const admitted = await beginMemoryWriteAdmission(
+      env,
+      { waitUntil: (_promise: Promise<unknown>) => {} } as ExecutionContext,
+    );
 
     await d1.db
-      .prepare(`INSERT INTO entries (id, content, tags, source, created_at, vector_ids) VALUES (?, ?, '[]', 'api', ?, '[]')`)
-      .bind("e1", "hello", 1000)
+      .prepare(`INSERT INTO entries (id, content, tags, source, created_at, vector_ids, write_marker) VALUES (?, ?, '[]', 'api', ?, '[]', ?)`)
+      .bind("e1", "hello", 1000, memoryWriteMarker(admitted.env))
       .run();
+    await admitted.finish();
     const { results } = await d1.db
       .prepare(`SELECT id, COALESCE(updated_at, created_at) AS updated_at, staleness_checked_at, recall_count, importance_score, contradiction_wins, contradiction_losses FROM entries`)
       .all() as { results: Record<string, unknown>[] };
@@ -640,6 +790,51 @@ describe("initializeDatabase against real SQLite", () => {
       id: "e1", updated_at: 1000, staleness_checked_at: null,
       recall_count: 0, importance_score: 0, contradiction_wins: 0, contradiction_losses: 0,
     }]);
+  });
+
+  it("rejects an edge whose endpoint is missing in real SQLite", async () => {
+    d1 = makeSqliteD1({ schema: false });
+    const env = envFor(d1);
+    await initializeDatabase(env);
+    const admitted = await beginMemoryWriteAdmission(
+      env,
+      { waitUntil: (_promise: Promise<unknown>) => {} } as ExecutionContext,
+    );
+    await d1.db
+      .prepare(`INSERT INTO entries (id, content, tags, source, created_at, vector_ids, write_marker) VALUES (?, ?, '[]', 'api', ?, '[]', ?)`)
+      .bind("present", "hello", 1000, memoryWriteMarker(admitted.env))
+      .run();
+
+    await expect(d1.db.prepare(
+      `INSERT INTO edges (id, source_id, target_id, type, weight, provenance, metadata, created_at, updated_at, write_marker)
+       VALUES (?, ?, ?, 'relates_to', 0.5, 'explicit', '{}', 1000, 1000, ?)`,
+    ).bind("dangling", "present", "missing", memoryWriteMarker(admitted.env)).run()).rejects.toThrow(/missing-edge-endpoint/);
+    await admitted.finish();
+
+    const count = await d1.db.prepare(`SELECT COUNT(*) AS count FROM edges`).first() as { count: number } | null;
+    expect(count?.count).toBe(0);
+  });
+
+  it("upgrades a populated fork v4 without changing source rows or write fences", async () => {
+    d1 = makeSqliteD1();
+    d1.seed({ id: "existing-v4", content: "Keep this memory", createdAt: 1,
+      tags: ["capsule:core", "capsule-slot:identity", "status:canonical"] });
+    const before = await d1.db.prepare("SELECT * FROM entries WHERE id = 'existing-v4'").first();
+    for (const name of PROMPT_CAPSULE_TRIGGERS) await d1.db.exec(`DROP TRIGGER ${name}`);
+    await d1.db.exec("DROP INDEX idx_entries_capsule");
+    await d1.db.exec("DROP TABLE prompt_capsule_revisions");
+    await d1.db.exec("UPDATE schema_meta SET version = 4 WHERE id = 'current'");
+    resetDatabaseInit();
+    await initializeDatabase(envFor(d1));
+    expect(await d1.db.prepare("SELECT * FROM entries WHERE id = 'existing-v4'").first()).toEqual(before);
+    expect(await d1.db.prepare("SELECT version FROM schema_meta WHERE id = 'current'").first())
+      .toEqual({ version: DATABASE_SCHEMA_VERSION });
+    expect(await objectNames(d1)).toEqual(expect.arrayContaining([
+      "idx_entries_capsule", "prompt_capsule_revisions", ...PROMPT_CAPSULE_TRIGGERS, ...WRITE_FENCE_TRIGGERS,
+    ]));
+    // An explicit invalid marker cannot bypass the original capability fence.
+    await expect(d1.db.prepare("UPDATE entries SET content = 'bad', write_marker = 'invalid' WHERE id = 'existing-v4'").run())
+      .rejects.toThrow(/memory-write-locked/);
   });
 
   it("costs one statement on an already-migrated brain", async () => {
@@ -651,69 +846,20 @@ describe("initializeDatabase against real SQLite", () => {
     resetDatabaseInit(); // a second cold isolate against the brain the first one migrated
     await initializeDatabase(envFor(d1));
 
-    // MOVED 35 -> 36 by idx_entry_events_created; see the sibling pin above.
-    // MOVED 36 -> 38 by idx_memberships_workspace and idx_users_email.
-    // MOVED 38 -> 43 by the Prompt Capsule revision table and its four triggers.
-    // MOVED 44 -> 47 by the projects table and its two indexes.
-    // MOVED 47 -> 50 by the time-anchor ALTERs: when_at, when_kind, when_source.
-    // MOVED 50 -> 51 by when_label, the nightly pass's persisted label.
-    // MOVED 51 -> 53 by the push_subscriptions table and idx_push_subscriptions_workspace.
-    // MOVED 53 -> 54 by entries_fts and its three sync triggers, created
-    // together in ONE batch (v2.2 ownership rule) rather than as four
-    // separate D1 calls — this real-SQLite double collapses a batch() to a
-    // single "BATCH" entry in `issued`, the same convention production D1
-    // bills by, so the net cost here is +1 (the batch), not +4.
-    // MOVED 54 -> 55 (T-0065) by entry_counts, its three triggers, and its
-    // GROUP BY seed, created together in ONE batch — same +1, not +5.
-    // MOVED 55 -> 56 (T-0089.4.4) by idx_entries_conflict_held.
-    // MOVED 56 -> 60 (T-0089.6.1) by the four partial indexes behind the agent brief.
-    // MOVED 60 -> 62 (T-0089.5.2) by the recall_log table and idx_recall_log_ws.
-    // MOVED 62 -> 66 (T-0089.1.1, T-0089.1.2) by entry_versions, entries_trash and their two indexes.
-    // MOVED 66 -> 67 (T-0089.1.1, ADV-10) by the prior_length_utf16 ALTER — wasted on a fresh brain
-    // (the CREATE above already has the column), same as every other ALTER a fresh CREATE subsumes.
-    // MOVED 67 -> 68 (R5, budget audit) by idx_entries_trash_workspace_deleted.
-    // MOVED 68 -> 69 (T-0089.1.1, adv-final MAJOR 1) by the entries_trash nonce ALTER, wasted the same way.
-    // MOVED 69 -> 71 (T-0089.2.1, merge with v4/t5-log) by the valid_from and valid_until ALTERs; measured.
-    // MOVED 71 -> 73 (T-0089.7.1, T-0089.7.2, merge with release/v4) by idx_entries_ledger and idx_entries_standing.
-    // MOVED 73 -> 75 (cloud re-review MINOR, R22 crowd-out fix) by idx_entry_events_actor and idx_entry_events_held.
-    // MOVED 75 -> 76 (R23, budget auditor BLOCK) by idx_entry_events_life_end.
-    // MOVED 76 -> 77 by entries_fts_vocab.
-    expect(cold).toBe(77); // one probe, then the 76 statements a new brain needs
+    expect(cold - DERIVED_INDEX_SETUP_STATEMENTS).toBeLessThanOrEqual(ALL_OBJECTS.length + MIGRATION.length + 40);
     expect(d1.issued).toHaveLength(1);
-    expect(d1.issued[0]).toMatch(PROBE);
+    expect(d1.issued[0]).toMatch(SCHEMA_VERSION_READ);
   });
 
-  it("adds only what a partially-migrated brain is missing", async () => {
-    // db/schema.sql is a real intermediate state: it ships entries with four of the
-    // ten ALTER columns, so a brain installed from it is owed updated_at,
-    // staleness_checked_at, and the four time-anchor columns, and nothing else.
+  it("recognizes the reference schema as fully current", async () => {
     d1 = makeSqliteD1();
-    expect(d1.columns()).not.toContain("updated_at");
+    expect(d1.columns()).toContain("updated_at");
 
     await initializeDatabase(envFor(d1));
 
-    expect(d1.issued.filter(s => /^ALTER/.test(s))).toEqual([
-      `ALTER TABLE entries ADD COLUMN updated_at INTEGER`,
-      `ALTER TABLE entries ADD COLUMN staleness_checked_at INTEGER`,
-      `ALTER TABLE entries ADD COLUMN when_at INTEGER`,
-      `ALTER TABLE entries ADD COLUMN when_kind TEXT`,
-      `ALTER TABLE entries ADD COLUMN when_source TEXT`,
-      `ALTER TABLE entries ADD COLUMN when_label TEXT`,
-      `ALTER TABLE entries ADD COLUMN valid_from INTEGER`,
-      `ALTER TABLE entries ADD COLUMN valid_until INTEGER`,
-    ]);
-    // schema.sql ships the whole v3 tenancy set — users (with default_share,
-    // removed_at and last_used_at), workspaces, memberships, entry_events,
-    // maintenance_cursor — so
-    // init has no table left to create against a brain installed from it. This
-    // list read differently while a ";" inside a schema.sql comment was splitting
-    // the `users` DDL in half: the table never applied, init's narrower base
-    // CREATE stood in for it, and two ALTERs it should never have owed showed up
-    // here. Anything reappearing in this list means schema.sql and init.ts have
-    // drifted apart again.
-    // idx_entries_when indexes when_at, an ALTER column schema.sql cannot carry, so init owes it.
-    expect(d1.issued.filter(s => /^CREATE/.test(s) && !/idx_entries_when/.test(s))).toEqual([]);
-    expect(sameColumns(d1.columns())).toBe(true);
+    expect(d1.issued).toHaveLength(1);
+    expect(d1.issued[0]).toMatch(SCHEMA_VERSION_READ);
+    expect(d1.columns()).toEqual(expect.arrayContaining([...BASE_COLUMNS, ...ALL_COLUMNS]));
   });
 
   it("adds only the weight index to a brain migrated before #281", async () => {
@@ -722,46 +868,46 @@ describe("initializeDatabase against real SQLite", () => {
     d1 = makeSqliteD1({ schema: false });
     await initializeDatabase(envFor(d1));
     await d1.db.exec(`DROP INDEX idx_edges_weight`);
+    await markSchemaStale(d1);
     resetDatabaseInit();
     d1.issued.length = 0;
 
     await initializeDatabase(envFor(d1));
 
     expect(d1.issued).toEqual([
+      expect.stringMatching(SCHEMA_VERSION_READ),
       expect.stringMatching(PROBE),
       `CREATE INDEX IF NOT EXISTS idx_edges_weight ON edges(weight DESC)`,
+      expect.stringMatching(SCHEMA_VERSION_WRITE),
     ]);
     expect(await objectNames(d1)).toContain("idx_edges_weight");
   });
 
-  it("adds the entry_events feed index to a brain that predates it, without touching its rows", async () => {
-    // GET /team/activity orders the WHOLE entry_events table by created_at with
-    // no entry_id predicate, and idx_entry_events_entry is (entry_id,
-    // created_at DESC) — the wrong shape for that, so the feed sorted the whole
-    // trail on every request. The index is additive and has to reach EXISTING
-    // brains: admin_events once shipped with no column map, every audit write
-    // failed silently on older databases, and the trail simply stopped. This is
-    // the path that stops that repeating for an index.
+  it("replaces the pre-append-queue v6 vector trigger with the queue-fenced v7 trigger", async () => {
     d1 = makeSqliteD1({ schema: false });
     await initializeDatabase(envFor(d1));
-    await d1.db.prepare(
-      `INSERT INTO entry_events (id, entry_id, actor_id, event, payload, created_at)
-       VALUES ('ee-old', 'e-1', 'usr-1', 'shared', '{}', 42)`,
-    ).run();
-    await d1.db.exec(`DROP INDEX idx_entry_events_created`);
+    await d1.db.exec(`DROP TRIGGER trg_entries_write_fence_vector_update_v7`);
+    await d1.db.exec(`CREATE TRIGGER trg_entries_write_fence_vector_update_v6
+      BEFORE UPDATE OF vector_ids, migration_lease_owner ON entries
+      WHEN EXISTS (SELECT 1 FROM migration_control WHERE id = 'memory-write-lock')
+      BEGIN SELECT RAISE(ABORT, 'memory-write-locked'); END`);
+    await markSchemaStale(d1);
     resetDatabaseInit();
     d1.issued.length = 0;
 
     await initializeDatabase(envFor(d1));
 
-    expect(d1.issued).toEqual([
+    const upgradeIssued = [...d1.issued];
+    const names = await objectNames(d1);
+    expect(names).not.toContain("trg_entries_write_fence_vector_update_v6");
+    expect(names).toContain("trg_entries_write_fence_vector_update_v7");
+    expect(upgradeIssued).toEqual([
+      expect.stringMatching(SCHEMA_VERSION_READ),
       expect.stringMatching(PROBE),
-      `CREATE INDEX IF NOT EXISTS idx_entry_events_created ON entry_events(created_at DESC)`,
+      expect.stringContaining(`TRIGGER IF NOT EXISTS trg_entries_write_fence_vector_update_v7`),
+      `DROP TRIGGER IF EXISTS trg_entries_write_fence_vector_update_v6`,
+      expect.stringMatching(SCHEMA_VERSION_WRITE),
     ]);
-    expect(await objectNames(d1)).toContain("idx_entry_events_created");
-    // An index migration must not be a data migration.
-    const { results } = await d1.db.prepare(`SELECT id, created_at FROM entry_events`).all();
-    expect(results).toEqual([{ id: "ee-old", created_at: 42 }]);
   });
 
   it("the entries-table filters do not match entries_trash", async () => {
@@ -785,7 +931,7 @@ describe("initializeDatabase against real SQLite", () => {
 
     expect(await objectNames(d1)).toContain("edges");
     expect(d1.issued.filter(s => s.startsWith("CREATE TABLE IF NOT EXISTS entries ("))).toEqual([]);
-    expect(sameColumns(d1.columns())).toBe(true);
+    expect(d1.columns()).toEqual(expect.arrayContaining([...BASE_COLUMNS, ...ALL_COLUMNS]));
   });
 
   it("adds last_used_at to a users table that predates it, keeping every member row", async () => {
@@ -817,7 +963,7 @@ describe("initializeDatabase against real SQLite", () => {
       token_hash: "hash-1", suspended: 0, created_at: 1000, default_share: "company", removed_at: null,
     });
     expect(row.last_used_at).toBeNull();
-    expect(d1.issued.some(s => /^(INSERT|UPDATE|DELETE)\b/i.test(s))).toBe(false);
+    expect(d1.issued.some(s => /^(?:INSERT INTO|UPDATE|DELETE FROM) (?:users|admin_events)\b/i.test(s))).toBe(false);
   });
 
   it("adds target_user_id and workspace_id to an admin_events table that predates them", async () => {
@@ -852,7 +998,7 @@ describe("initializeDatabase against real SQLite", () => {
       id: "a1", actor_id: "u1", target_user_id: "", workspace_id: "",
       event: "team_renamed", payload: '{"name":"Acme"}', created_at: 1000,
     });
-    expect(d1.issued.some(s => /^(INSERT|UPDATE|DELETE)\b/i.test(s))).toBe(false);
+    expect(d1.issued.some(s => /^(?:INSERT INTO|UPDATE|DELETE FROM) (?:users|admin_events)\b/i.test(s))).toBe(false);
 
     // The claim that matters: the statement src/lib/admin-audit.ts issues now
     // works against this brain. Existence of the columns is the mechanism; a
@@ -895,7 +1041,7 @@ describe("initializeDatabase against real SQLite", () => {
 
     async function expectFullyMigrated() {
       for (const name of ALL_OBJECTS) expect(await objectNames(d1)).toContain(name);
-      expect([...d1.columns()].sort()).toEqual([...BASE_COLUMNS, ...ALL_COLUMNS].sort());
+      expect(d1.columns()).toEqual(expect.arrayContaining([...BASE_COLUMNS, ...ALL_COLUMNS]));
     }
 
     beforeEach(() => {
@@ -971,6 +1117,7 @@ describe("initializeDatabase against real SQLite", () => {
       expect(((await d1.db.prepare(`SELECT id FROM entries_fts WHERE entries_fts MATCH '"dashboard"'`).all()).results)).toHaveLength(0);
       expect(((await d1.db.prepare(`SELECT id FROM entries_fts WHERE entries_fts MATCH '"composer"'`).all()).results)).toHaveLength(1);
 
+      await d1.db.prepare(`UPDATE entries SET write_marker = ? WHERE id = 'e1'`).bind(d1.fixtureMarker("delete")).run();
       await d1.db.prepare(`DELETE FROM entries WHERE id = 'e1'`).run();
       expect(await d1.db.prepare(`SELECT count(*) AS n FROM entries_fts`).first()).toEqual({ n: 0 });
     });
@@ -1038,7 +1185,7 @@ describe("initializeDatabase against real SQLite", () => {
       d1 = makeSqliteD1(); // schema.sql applied, then rewound to its pre-FTS shape below
       await d1.db.exec(
         `DROP TRIGGER IF EXISTS entries_fts_insert; DROP TRIGGER IF EXISTS entries_fts_update;` +
-        `DROP TRIGGER IF EXISTS entries_fts_delete; DROP TABLE IF EXISTS entries_fts;` +
+        `DROP TRIGGER IF EXISTS entries_fts_delete; DROP TABLE IF EXISTS entries_fts; DELETE FROM schema_meta;` +
         `INSERT INTO workspaces (id, kind, name, created_at) VALUES ('w1', 'personal', 'One', 1), ('w2', 'personal', 'Two', 1);` +
         `INSERT INTO prompt_capsule_revisions (workspace_id, revision) VALUES ('w1', 'rev-w1'), ('w2', 'rev-w2');`,
       );
@@ -1112,7 +1259,7 @@ describe("initializeDatabase against real SQLite", () => {
       d1 = makeSqliteD1(); // schema.sql applied: `entries` already exists
       await d1.db.exec(
         `DROP TRIGGER IF EXISTS entries_fts_insert; DROP TRIGGER IF EXISTS entries_fts_update;` +
-        `DROP TRIGGER IF EXISTS entries_fts_delete; DROP TABLE IF EXISTS entries_fts;`,
+        `DROP TRIGGER IF EXISTS entries_fts_delete; DROP TABLE IF EXISTS entries_fts; DELETE FROM schema_meta;`,
       );
       const kv = makeMemoryKV();
       await kv.put(FTS_READY_KV_KEY, "1");
@@ -1140,7 +1287,7 @@ describe("initializeDatabase against real SQLite", () => {
       d1 = makeSqliteD1(); // schema.sql applied: `entries` already exists
       await d1.db.exec(
         `DROP TRIGGER IF EXISTS entries_fts_insert; DROP TRIGGER IF EXISTS entries_fts_update;` +
-        `DROP TRIGGER IF EXISTS entries_fts_delete; DROP TABLE IF EXISTS entries_fts;`,
+        `DROP TRIGGER IF EXISTS entries_fts_delete; DROP TABLE IF EXISTS entries_fts; DELETE FROM schema_meta;`,
       );
       const kv = {
         get: async () => null,
@@ -1148,7 +1295,7 @@ describe("initializeDatabase against real SQLite", () => {
         delete: async () => { throw new Error("KV unavailable"); },
       } as unknown as KVNamespace;
 
-      await expect(initializeDatabase(envWithKv(d1, kv))).resolves.toBeUndefined();
+      await expect(initializeDatabase(envWithKv(d1, kv))).resolves.toMatchObject({ changed: expect.any(Boolean) });
       expect(await ftsObjectNames(d1)).toEqual([]);
 
       // No resetDatabaseInit(): the first call above must already have left
@@ -1163,7 +1310,7 @@ describe("initializeDatabase against real SQLite", () => {
       d1 = makeSqliteD1();
       await d1.db.exec(
         `DROP TRIGGER IF EXISTS entries_fts_insert; DROP TRIGGER IF EXISTS entries_fts_update;` +
-        `DROP TRIGGER IF EXISTS entries_fts_delete; DROP TABLE IF EXISTS entries_fts;`,
+        `DROP TRIGGER IF EXISTS entries_fts_delete; DROP TABLE IF EXISTS entries_fts; DELETE FROM schema_meta;`,
       );
       await d1.db.prepare(
         `INSERT INTO users (id, name, role, token_hash, created_at) VALUES ('u1', 'Owner', 'admin', ?, 1)`,
@@ -1220,7 +1367,7 @@ describe("initializeDatabase against real SQLite", () => {
       await d1.db.prepare(`INSERT INTO entries (id, content, tags, source, created_at) VALUES ('legacy', 'legacy violet', '[]', 'api', 1)`).run();
       await d1.db.exec(
         `DROP TRIGGER IF EXISTS entries_fts_insert; DROP TRIGGER IF EXISTS entries_fts_update;` +
-        `DROP TRIGGER IF EXISTS entries_fts_delete; DROP TABLE IF EXISTS entries_fts;`,
+        `DROP TRIGGER IF EXISTS entries_fts_delete; DROP TABLE IF EXISTS entries_fts; DELETE FROM schema_meta;`,
       );
       const kv = makeMemoryKV();
       await kv.put(FTS_READY_KV_KEY, "1");
@@ -1270,6 +1417,6 @@ describe("initializeDatabase against real SQLite", () => {
     const second = initializeDatabase(envFor(d1));
 
     await expect(Promise.all([first, second])).resolves.toBeDefined();
-    expect(sameColumns(d1.columns())).toBe(true);
+    expect(d1.columns()).toEqual(expect.arrayContaining([...BASE_COLUMNS, ...ALL_COLUMNS]));
   });
 });

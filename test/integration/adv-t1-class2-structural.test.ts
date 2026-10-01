@@ -26,7 +26,7 @@ let ws = "";
 beforeEach(async () => {
   resetDatabaseInit();
   sqlite = makeSqliteD1();
-  const bootEnv = makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV() });
+  const bootEnv = sqlite.admitEnv(makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV() }));
   await initializeDatabase(bootEnv);
   const roots = await ensureTenantBootstrap(bootEnv);
   ws = roots.ownerPersonalWorkspaceId;
@@ -81,15 +81,15 @@ describe("CLASS 2 structural: a compare-and-set loss re-embeds, never deletes, t
     const { updateEntryContent } = await import("../../src/capture/store");
     const { DEFAULTS } = await import("../../src/config");
     const { store, vec, deleteByIds } = makeVectorStore();
-    const env = makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV(), VECTORIZE: vec,
-      AI: { run: vi.fn(async (_model: string, opts: any) => ({ data: (Array.isArray(opts?.text) ? opts.text : [opts?.text]).map(() => new Array(384).fill(0.1)) })) } as any }) as Env;
+    const env = sqlite.admitEnv(makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV(), VECTORIZE: vec,
+      AI: { run: vi.fn(async (_model: string, opts: any) => ({ data: (Array.isArray(opts?.text) ? opts.text : [opts?.text]).map(() => new Array(768).fill(0.1)) })) } as any })) as Env;
     await seed("u1", "Original content");
     store.set("u1", { content: "Original content" });
     const raw = env.DB as any;
     let raced = false;
-    const racing = { ...env, DB: { ...raw, prepare(sql: string) {
+    const racing = { ...env, WRITE_ADMISSION_TOKEN: env.WRITE_ADMISSION_TOKEN, DB: { ...raw, prepare(sql: string) {
       const st = raw.prepare(sql);
-      if (raced || !sql.startsWith("SELECT content, tags, source, vector_ids, workspace_id FROM entries")) return st;
+      if (raced || !sql.startsWith("SELECT content, tags, source, ")) return st;
       return { bind: (...a: unknown[]) => ({ first: async () => {
         const r = await st.bind(...a).first();
         // A tags-only race never abandons this attempt's own re-embed at all: updateEntryContent
@@ -115,16 +115,16 @@ describe("CLASS 2 structural: a compare-and-set loss re-embeds, never deletes, t
     const { appendToEntry } = await import("../../src/capture/store");
     const { DEFAULTS } = await import("../../src/config");
     const { store, vec, deleteByIds } = makeVectorStore();
-    const env = makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV(), VECTORIZE: vec,
-      AI: { run: vi.fn(async (_model: string, opts: any) => ({ data: (Array.isArray(opts?.text) ? opts.text : [opts?.text]).map(() => new Array(384).fill(0.1)) })) } as any }) as Env;
+    const env = sqlite.admitEnv(makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV(), VECTORIZE: vec,
+      AI: { run: vi.fn(async (_model: string, opts: any) => ({ data: (Array.isArray(opts?.text) ? opts.text : [opts?.text]).map(() => new Array(768).fill(0.1)) })) } as any })) as Env;
     const longBody = "x".repeat(1700);
     await seed("u2", longBody);
     store.set("u2", { content: longBody });
     const raw = env.DB as any;
     let raced = false;
-    const racing = { ...env, DB: { ...raw, prepare(sql: string) {
+    const racing = { ...env, WRITE_ADMISSION_TOKEN: env.WRITE_ADMISSION_TOKEN, DB: { ...raw, prepare(sql: string) {
       const st = raw.prepare(sql);
-      if (raced || !sql.startsWith("SELECT content, tags, source, vector_ids, workspace_id FROM entries")) return st;
+      if (raced || !sql.startsWith("SELECT content, tags, source, ")) return st;
       return { bind: (...a: unknown[]) => ({ first: async () => {
         const r = await st.bind(...a).first();
         if (!raced) { raced = true; await raw.prepare(`UPDATE entries SET tags = '["concurrent"]' WHERE id = 'u2'`).run(); }
@@ -150,12 +150,12 @@ describe("CLASS 2 structural: a thrown commit batch re-embeds the row as it stan
     const { updateEntryContent } = await import("../../src/capture/store");
     const { DEFAULTS } = await import("../../src/config");
     const { store, vec } = makeVectorStore();
-    const env = makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV(), VECTORIZE: vec,
-      AI: { run: vi.fn(async (_model: string, opts: any) => ({ data: (Array.isArray(opts?.text) ? opts.text : [opts?.text]).map(() => new Array(384).fill(0.1)) })) } as any }) as Env;
+    const env = sqlite.admitEnv(makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV(), VECTORIZE: vec,
+      AI: { run: vi.fn(async (_model: string, opts: any) => ({ data: (Array.isArray(opts?.text) ? opts.text : [opts?.text]).map(() => new Array(768).fill(0.1)) })) } as any })) as Env;
     await seed("t1", "Original content");
     store.set("t1", { content: "Original content" });
     const raw = env.DB as any;
-    const throwing = { ...env, DB: { ...raw, batch: async (stmts: unknown[]) => { throw new Error("simulated D1 outage"); } } } as unknown as Env;
+    const throwing = { ...env, WRITE_ADMISSION_TOKEN: env.WRITE_ADMISSION_TOKEN, DB: { ...raw, batch: async (stmts: unknown[]) => { throw new Error("simulated D1 outage"); } } } as unknown as Env;
     const wctx = { workspaceId: ws, actorId: owner.userId };
     const change = { actorId: owner.userId, channel: "rest" as const };
     await expect(updateEntryContent(throwing, "t1", "Updated content", DEFAULTS, undefined, undefined, wctx, change, ws)).rejects.toThrow();
@@ -170,12 +170,12 @@ describe("CLASS 2 structural: a thrown commit batch re-embeds the row as it stan
     const { appendToEntry } = await import("../../src/capture/store");
     const { DEFAULTS } = await import("../../src/config");
     const { store, vec, deleteByIds } = makeVectorStore();
-    const env = makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV(), VECTORIZE: vec,
-      AI: { run: vi.fn(async (_model: string, opts: any) => ({ data: (Array.isArray(opts?.text) ? opts.text : [opts?.text]).map(() => new Array(384).fill(0.1)) })) } as any }) as Env;
+    const env = sqlite.admitEnv(makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV(), VECTORIZE: vec,
+      AI: { run: vi.fn(async (_model: string, opts: any) => ({ data: (Array.isArray(opts?.text) ? opts.text : [opts?.text]).map(() => new Array(768).fill(0.1)) })) } as any })) as Env;
     await seed("t2", "Original content");
     store.set("t2", { content: "Original content" });
     const raw = env.DB as any;
-    const throwing = { ...env, DB: { ...raw, batch: async (stmts: unknown[]) => { throw new Error("simulated D1 outage"); } } } as unknown as Env;
+    const throwing = { ...env, WRITE_ADMISSION_TOKEN: env.WRITE_ADMISSION_TOKEN, DB: { ...raw, batch: async (stmts: unknown[]) => { throw new Error("simulated D1 outage"); } } } as unknown as Env;
     const wctx = { workspaceId: ws, actorId: owner.userId };
     const change = { actorId: owner.userId, channel: "rest" as const };
     await expect(appendToEntry(throwing, "t2", "", "an addition", [], "api", DEFAULTS, undefined, wctx, change, undefined, ws)).rejects.toThrow();
@@ -188,7 +188,7 @@ describe("CLASS 2 structural: a thrown commit batch re-embeds the row as it stan
     // controls and must not leave dangling: never added to any row's vector_ids (the batch never
     // committed), so nothing else will ever ask Vectorize to delete it.
     const chunkId = (vec.insert as any).mock.calls[0][0][0].id as string;
-    expect(chunkId).toMatch(/^t2:[0-9a-f]{8}:0$/);
+    expect(chunkId).toMatch(/^v-[0-9a-f-]{36}-0$/);
     expect(store.has(chunkId), `${chunkId}: orphaned in Vectorize, retireChunk did not run on the thrown batch`).toBe(false);
     expect(deleteByIds.mock.calls.flatMap((c: any) => c[0])).toContain(chunkId);
     await assertLiveVectorsMatchContent("t2", store);

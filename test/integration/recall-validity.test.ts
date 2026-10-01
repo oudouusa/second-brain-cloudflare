@@ -10,8 +10,8 @@
  * as test/integration/deprecated-stays-unindexed.test.ts).
  */
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { Client } from "@modelcontextprotocol/client";
+import { InMemoryTransport } from "@modelcontextprotocol/client";
 import { recallEntries } from "../../src/recall/search";
 import { getConnections, buildGraph, expandGraph } from "../../src/graph/traverse";
 import worker from "../../src/index";
@@ -52,7 +52,7 @@ async function migrated(): Promise<SqliteD1> {
 }
 
 function envOf(s: SqliteD1, overrides: Record<string, unknown> = {}): Env {
-  return makeTestEnv(undefined, { DB: s.db as unknown as Env["DB"], ...overrides });
+  return s.admitEnv(makeTestEnv(undefined, { DB: s.db as unknown as Env["DB"], ...overrides }));
 }
 
 const DAY = 86400000;
@@ -200,7 +200,7 @@ describe("GET /graph and connections still show replaced rows, with valid_until 
 });
 
 describe("REST validity fields (5.9)", () => {
-  it("GET /recall carries the six validity fields; superseded_by names the live replacement", async () => {
+  it("POST /recall carries the six validity fields; superseded_by names the live replacement", async () => {
     sqlite = await migrated();
     sqlite.seed({ id: "closer", content: "closer note", createdAt: NOW - 5 * DAY, validFrom: NOW - 5 * DAY });
     sqlite.seed({ id: "closed", content: "closed note", createdAt: NOW - 20 * DAY, validUntil: NOW - 5 * DAY });
@@ -212,7 +212,7 @@ describe("REST validity fields (5.9)", () => {
       VECTORIZE: makeVectorizeMock({ query: vi.fn().mockResolvedValue({ matches: [{ id: "closer", score: 0.9, metadata: { parentId: "closer" } }] }) }),
     });
 
-    const res = await worker.fetch(req("GET", "/recall?query=closer+note"), env, ctx);
+    const res = await worker.fetch(req("POST", "/recall?query=closer+note"), env, ctx);
     const data = await res.json() as any;
     const result = data.results.find((r: any) => r.id === "closer");
     expect(result).toMatchObject({
@@ -225,7 +225,7 @@ describe("REST validity fields (5.9)", () => {
     expect(typeof result.valid_from).toBe("number");
   });
 
-  it("GET /entry names the live replacement in superseded_by for a replaced row", async () => {
+  it("POST /entry names the live replacement in superseded_by for a replaced row", async () => {
     sqlite = await migrated();
     sqlite.seed({ id: "closer", content: "closer note", createdAt: NOW - 5 * DAY, validFrom: NOW - 5 * DAY });
     sqlite.seed({ id: "closed", content: "closed note", createdAt: NOW - 20 * DAY, validUntil: NOW - 5 * DAY });
@@ -234,7 +234,7 @@ describe("REST validity fields (5.9)", () => {
        VALUES ('e1', 'closer', 'closed', 'supersedes', 1.0, 'system', '{}', 1, 1)`,
     ).run();
 
-    const res = await worker.fetch(req("GET", "/entry?id=closed"), envOf(sqlite), ctx);
+    const res = await worker.fetch(req("POST", "/entry?id=closed"), envOf(sqlite), ctx);
     const data = await res.json() as any;
     expect(data.entry).toMatchObject({
       validity_state: "replaced",

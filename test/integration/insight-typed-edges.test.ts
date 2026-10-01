@@ -1,3 +1,4 @@
+import { pricingInsight, PRICING_INSIGHTS } from "../helpers/insight-fixture";
 /**
  * C — turning the weekly insight call's spare verdict into typed edges.
  *
@@ -28,8 +29,7 @@ const NOW = 400 * DAY;
 const ctx = { waitUntil: () => {} } as unknown as ExecutionContext;
 
 /** Long enough and specific enough to clear the insight quality floor. */
-const GOOD_TEXT =
-  "You priced that tier at nine dollars flat, then reversed course to usage-based billing once the margin review landed.";
+const GOOD_TEXT = PRICING_INSIGHTS["0"];
 
 function makeAI(insightPayload: string) {
   const sse = (text: string) => new ReadableStream({
@@ -41,7 +41,7 @@ function makeAI(insightPayload: string) {
   });
   return {
     run: vi.fn().mockImplementation(async (model: string, opts: any) => {
-      if (model === "@cf/baai/bge-small-en-v1.5") return { data: [new Array(384).fill(0.1)] };
+      if (model === "@cf/google/embeddinggemma-300m") return { data: [new Array(768).fill(0.1)] };
       const prompt = String(opts?.messages?.[0]?.content ?? "");
       return sse(prompt.includes("Memory A:") ? insightPayload : "3");
     }),
@@ -80,9 +80,9 @@ describe("typed edges from the insight pass", () => {
   }
 
   function envWith(payload: string): Env {
-    return makeTestEnv(undefined, {
+    return sqlite.admitEnv(makeTestEnv(undefined, {
       DB: sqlite.db as any, AI: makeAI(payload), OAUTH_KV: makeMemoryKV(),
-    });
+    }));
   }
 
   async function typedEdges(): Promise<{ source_id: string; target_id: string; type: string; provenance: string; weight: number; metadata: string }[]> {
@@ -105,7 +105,7 @@ describe("typed edges from the insight pass", () => {
   it("types the pair when the model also wrote an insight", async () => {
     seedPair();
     await runWeeklyInsights(
-      envWith(`{"insight": true, "shape": "contradiction", "text": ${JSON.stringify(GOOD_TEXT)}, "relationship": "caused_by", "source": "A", "target": "B"}`),
+      envWith(JSON.stringify({ ...JSON.parse(pricingInsight(GOOD_TEXT)), relationship: "caused_by", source: "A", target: "B" })),
       ctx,
     );
 

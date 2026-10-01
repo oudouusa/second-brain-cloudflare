@@ -6,8 +6,8 @@
  * Opt in with EVAL_WORKERD=1; it prints a JSON table and only asserts sanity.
  */
 import { describe, it, expect, afterAll } from "vitest";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { Client } from "@modelcontextprotocol/client";
+import { InMemoryTransport } from "@modelcontextprotocol/client";
 import { openD1 } from "../eval/d1";
 import { cleanTemp } from "../helpers/tmp";
 import { makeTestEnv, makeMemoryKV } from "../helpers/make-env";

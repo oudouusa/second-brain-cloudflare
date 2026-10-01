@@ -39,13 +39,14 @@ function statefulVectorize(matchId?: string) {
   return makeVectorizeMock(overrides as any);
 }
 const decisionAI = (decision: string) =>
-  ({ run: vi.fn(async (model: string) => model.startsWith("@cf/baai/bge") ? { data: [new Array(384).fill(0.1)] } : stream(decision)) }) as any;
+  ({ run: vi.fn(async (model: string) => model === "@cf/google/embeddinggemma-300m" ? { data: [new Array(768).fill(0.1)] } : stream(decision)) }) as any;
 
 beforeEach(async () => {
   resetDatabaseInit();
   sqlite = makeSqliteD1();
-  env = makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV(), VECTORIZE: statefulVectorize(), AI: makeAIMock() });
+  env = sqlite.admitEnv(makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV(), VECTORIZE: statefulVectorize(), AI: makeAIMock() }));
   await initializeDatabase(env);
+  env = sqlite.admitEnv(env);
   const roots = await ensureTenantBootstrap(env);
   owner = (await resolveIdentityByUserId(env, roots.ownerUserId))!;
 });
@@ -77,14 +78,14 @@ function beforeRevertBatch(base: Env, race: () => Promise<void>): Env {
       return raw.batch(stmts);
     },
   };
-  return { ...base, DB: db } as unknown as Env;
+  return { ...base, WRITE_ADMISSION_TOKEN: base.WRITE_ADMISSION_TOKEN, DB: db } as unknown as Env;
 }
 
 
 const decision = (target: string) => JSON.stringify({ action: "merge", target_id: target, merged_content: "Old text. Incoming fact." });
-const mergeEnv = (target: string) => makeTestEnv(undefined, {
+const mergeEnv = (target: string) => sqlite.admitEnv(makeTestEnv(undefined, {
   DB: sqlite.db as any, OAUTH_KV: makeMemoryKV(), VECTORIZE: statefulVectorize(target), AI: decisionAI(decision(target)),
-}) as Env;
+})) as Env;
 const trashed = async (id: string) => env.DB.prepare(`SELECT id FROM entries_trash WHERE id = ?`).bind(id).first();
 
 // T-0089.1.3 round 3 (Director decision): redo of a merge undo no longer removes the row that undo
@@ -191,7 +192,7 @@ describe("ADV-U11 (MINOR): vector_ids is still rebound from the undo's stale rea
     await applyStatus("vi1", "canonical", env, change(), DEFAULTS, owner.personalWorkspaceId);
     const racing = beforeRevertBatch(env, async () => {
       // the pending re-index (storeEntry's unversioned vector_ids write) lands while the undo is in flight
-      await env.DB.prepare(`UPDATE entries SET vector_ids = ? WHERE id = ?`).bind(JSON.stringify(["vi1"]), "vi1").run();
+      await env.DB.prepare(`UPDATE entries SET write_marker = '${sqlite.fixtureMarker()}', vector_ids = ? WHERE id = ?`).bind(JSON.stringify(["vi1"]), "vi1").run();
     });
     expect((await revertEntry(racing, owner, "vi1", change(), DEFAULTS, undefined, owner.personalWorkspaceId)).status).toBe("reverted");
     expect(JSON.parse(row("vi1").tags)).not.toContain("status:canonical");

@@ -49,7 +49,7 @@ async function migrated(): Promise<SqliteD1> {
 
 /** A stateful KV so same-day stability and dismissal can be tested across calls. */
 function envWithKv(s: SqliteD1): Env {
-  return makeTestEnv(dbOf(s) as any, { OAUTH_KV: makeMemoryKV() });
+  return s.admitEnv(makeTestEnv(dbOf(s) as any, { OAUTH_KV: makeMemoryKV() }));
 }
 
 /** Default (stateless) KV — every call reads as a first-ever request. */
@@ -154,7 +154,7 @@ describe("GET /brief — same-day stability and rotation", () => {
     sq.seed({ id: "proj1", content: "a project memory", createdAt: now - OLD, importanceScore: 5, tags: ["project:site"] });
     const env = envWithKv(sq);
     const { ownerPersonalWorkspaceId } = await ensureTenantBootstrap(env);
-    await createProject(env.DB, ownerPersonalWorkspaceId, { id: "site", name: "Site", aliases: [] });
+    await createProject(env.DB, ownerPersonalWorkspaceId, { id: "site", name: "Site", aliases: [] }, env);
 
     const scoped1 = await (await worker.fetch(req("GET", "/brief?project=site"), env, ctx)).json() as any;
     expect(scoped1.resurface?.id).toBe("proj1");

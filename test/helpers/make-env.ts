@@ -1,18 +1,41 @@
 import { vi } from "vitest";
 import { D1Mock } from "./d1-mock";
 import type { Env } from "../../src/env";
+import { embeddingMetadata } from "../../src/embedding/profile";
 
-export function makeVectorizeMock(overrides: Partial<VectorizeIndex> = {}): VectorizeIndex {
-  const index: any = {
-    query: vi.fn().mockResolvedValue({ matches: [] }),
+export function makeVectorizeMock(overrides: Partial<Vectorize> = {}): Vectorize {
+  const queryImpl = overrides.query ?? vi.fn().mockResolvedValue({ matches: [] });
+  let getByIdsImpl: Vectorize["getByIds"];
+  const index = {
+    query: vi.fn(async (...args: Parameters<Vectorize["query"]>) => {
+      const result = await queryImpl(...args as [never, never]);
+      return {
+        ...result,
+        matches: result.matches.map((match: VectorizeMatch) => ({
+          ...match,
+          metadata: { ...embeddingMetadata(), ...((match.metadata as object | undefined) ?? {}) },
+        })),
+      };
+    }),
     insert: vi.fn().mockResolvedValue({ mutationId: "m" }),
     deleteByIds: vi.fn().mockResolvedValue({ mutationId: "m" }),
     upsert: vi.fn().mockResolvedValue({ mutationId: "m" }),
-    describe: vi.fn().mockResolvedValue({}),
-    ...overrides,
-  };
-  if (!overrides.getByIds) index.getByIds = indexedGetByIds(index);
-  return index as VectorizeIndex;
+    getByIds: vi.fn(async (...args: Parameters<Vectorize["getByIds"]>) => {
+      const vectors = await getByIdsImpl(...args);
+      return vectors.map((vector: VectorizeVector) => ({
+        ...vector,
+        metadata: { ...embeddingMetadata(), ...((vector.metadata as object | undefined) ?? {}) },
+      }));
+    }),
+    describe: vi.fn().mockResolvedValue({
+      vectorCount: 0,
+      processedUpToMutation: "m",
+      processedUpToDatetime: "9999-12-31T23:59:59.999Z",
+    }),
+    ...Object.fromEntries(Object.entries(overrides).filter(([key]) => key !== "query" && key !== "getByIds")),
+  } as unknown as Vectorize;
+  getByIdsImpl = overrides.getByIds ?? indexedGetByIds(index);
+  return index;
 }
 
 const callArgs = (fn: any): any[] => (fn?.mock?.calls ?? []).map((c: any[]) => c[0]);
@@ -49,8 +72,8 @@ export function makeAIMock(): Ai {
       // shipped default; bge-base/large/m3 are config-selectable) — anything
       // else is assumed to be an LLM chat completion, below.
       // One vector per input text, as the real binding returns for a batch.
-      if (model.startsWith("@cf/baai/bge"))
-        return { data: (Array.isArray(input?.text) ? input.text : [input?.text]).map(() => new Array(384).fill(0.1)) };
+      if (model === "@cf/google/embeddinggemma-300m")
+        return { data: (Array.isArray(input?.text) ? input.text : [input?.text]).map(() => new Array(768).fill(0.1)) };
       return new ReadableStream({
         start(c) {
           c.enqueue(new TextEncoder().encode('data: {"response":"3"}\n\n'));

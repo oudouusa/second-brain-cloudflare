@@ -29,7 +29,7 @@ const stubStore = {
   deleteEntry: vi.fn().mockResolvedValue(undefined),
 };
 
-const json = (body: unknown) => ({ ok: true, status: 200, json: async () => body });
+const json = (body: unknown) => new Response(JSON.stringify(body), { status: 200 });
 
 // Rewrites the KV record's layer to "company" — what POST /layer does — then
 // hands back whatever the upstream call would have.
@@ -79,7 +79,7 @@ describe("Notion sync vs a concurrent layer change", () => {
     vi.stubGlobal("fetch", vi.fn().mockImplementation(async (url: string) => {
       if (url.endsWith("/search")) {
         await flipLayerToCompany(kv);
-        return { ok: false, status: 500, json: async () => ({ message: "boom" }) };
+        return new Response(JSON.stringify({ message: "boom" }), { status: 500 });
       }
       return json({ has_more: false, results: [] });
     }));

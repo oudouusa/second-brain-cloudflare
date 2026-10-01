@@ -72,9 +72,10 @@ describe("the throttled write", () => {
     await resolveIdentityFromToken(dana.token, env);
     await flush();
 
-    // Byte-identical: not merely "close enough", but never written at all.
+    // Byte-identical: the fixed-cost batch still executes the guarded UPDATE,
+    // but its WHERE clause matches no row inside the throttle window.
     expect((await storedLastUsed(dana.userId))!.last_used_at).toBe(first);
-    expect(updates()).toEqual([]);
+    expect(updates()).toHaveLength(1);
   });
 
   it("writes again once the throttle window has passed", async () => {
@@ -113,6 +114,12 @@ describe("the throttled write", () => {
   // moved the write back out into its own statement — it is the request that
   // actually performs the write. The warm case is what the throttle buys.
   it("costs no extra subrequest on the cold path, where it does write", async () => {
+    const originalBatch = env.DB.batch.bind(env.DB);
+    let batchCalls = 0;
+    env.DB.batch = (async (statements) => {
+      batchCalls++;
+      return originalBatch(statements);
+    }) as Env["DB"]["batch"];
     sqlite.issued.length = 0;
 
     const identity = await resolveIdentityFromToken(dana.token, env);
@@ -120,7 +127,10 @@ describe("the throttled write", () => {
 
     expect(identity).not.toBeNull();
     // Exactly one round trip: the batch carrying the read and the stamp.
-    expect(sqlite.issued).toEqual(["BATCH"]);
+    expect(batchCalls).toBe(1);
+    expect(sqlite.issued).toHaveLength(2);
+    expect(sqlite.issued.some((sql) => /^\s*SELECT/i.test(sql))).toBe(true);
+    expect(updates()).toHaveLength(1);
     // And the write genuinely happened — this is not "cheap because it did
     // nothing".
     expect((await storedLastUsed(dana.userId))!.last_used_at).toBe(Date.now());
@@ -130,13 +140,22 @@ describe("the throttled write", () => {
     await resolveIdentityFromToken(dana.token, env);
     await flush();
     vi.advanceTimersByTime(1000);
+    const originalBatch = env.DB.batch.bind(env.DB);
+    let batchCalls = 0;
+    env.DB.batch = (async (statements) => {
+      batchCalls++;
+      return originalBatch(statements);
+    }) as Env["DB"]["batch"];
     sqlite.issued.length = 0;
 
     const identity = await resolveIdentityFromToken(dana.token, env);
     await flush();
 
     expect(identity).not.toBeNull();
-    expect(sqlite.issued).toEqual(["BATCH"]);
+    expect(batchCalls).toBe(1);
+    expect(sqlite.issued).toHaveLength(2);
+    expect(sqlite.issued.some((sql) => /^\s*SELECT/i.test(sql))).toBe(true);
+    expect(updates()).toHaveLength(1);
   });
 
   // Batching put the stamp in the same transaction as the read, so without a

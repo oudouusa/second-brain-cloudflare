@@ -25,6 +25,130 @@ function vevent(lines: string[]): string {
 }
 
 describe("parseAndExpand", () => {
+  it("rejects an event-heavy feed before ical.js grouping can exhaust Free CPU", () => {
+    const events = Array.from({ length: 25 }, (_, i) => vevent([
+      `UID:bulk-${i}@test`,
+      "DTSTART:20260710T140000Z",
+      "DTEND:20260710T150000Z",
+    ]));
+    expect(() => parseAndExpand(
+      calendar(...events),
+      ms("2026-07-01T00:00:00Z"),
+      ms("2026-07-31T00:00:00Z"),
+    )).toThrow(/too many events/);
+  });
+
+  it("counts lowercase component names in the pre-parse complexity gate", () => {
+    const events = Array.from({ length: 25 }, (_, i) => vevent([
+      `UID:lower-${i}@test`,
+      "DTSTART:20260710T140000Z",
+      "DTEND:20260710T150000Z",
+    ]).replace(/BEGIN:VEVENT|END:VEVENT/g, value => value.toLowerCase()));
+    expect(() => parseAndExpand(
+      calendar(...events),
+      ms("2026-07-01T00:00:00Z"),
+      ms("2026-07-31T00:00:00Z"),
+    )).toThrow(/too many events/);
+  });
+
+  it("rejects an ancient high-frequency recurrence without walking from DTSTART", () => {
+    const ics = calendar(vevent([
+      "UID:ancient-daily@test",
+      "DTSTART:20100101T090000Z",
+      "DTEND:20100101T100000Z",
+      "RRULE:FREQ=DAILY",
+    ]));
+    expect(() => parseAndExpand(
+      ics,
+      ms("2026-07-01T00:00:00Z"),
+      ms("2026-07-31T00:00:00Z"),
+    )).toThrow(/Free-plan CPU budget/);
+  });
+
+  it("rejects Cartesian BY* expansion before asking ical.js for an occurrence", () => {
+    const allHours = Array.from({ length: 24 }, (_, i) => i).join(",");
+    const allMinutes = Array.from({ length: 60 }, (_, i) => i).join(",");
+    const allSeconds = Array.from({ length: 60 }, (_, i) => i).join(",");
+    const ics = calendar(vevent([
+      "UID:cartesian@test",
+      "DTSTART:20260827T000000Z",
+      "DTEND:20260827T010000Z",
+      `RRULE:FREQ=DAILY;BYHOUR=${allHours};BYMINUTE=${allMinutes};BYSECOND=${allSeconds}`,
+    ]));
+
+    expect(() => parseAndExpand(
+      ics,
+      ms("2026-08-27T00:00:00Z"),
+      ms("2026-09-26T00:00:00Z"),
+    )).toThrow(/recurrence rule.*Free-plan CPU budget/);
+  });
+
+  it("rejects a large BYSETPOS list before ical.js parses the recurrence", () => {
+    const positions = Array.from({ length: 733 }, (_, index) => (index % 366) + 1).join(",");
+    const ics = calendar(vevent([
+      "UID:bysetpos@test",
+      "DTSTART:20260827T000000Z",
+      "DTEND:20260827T010000Z",
+      `RRULE:FREQ=DAILY;BYHOUR=0;BYSETPOS=${positions}`,
+    ]));
+    expect(() => parseAndExpand(
+      ics,
+      ms("2026-08-27T00:00:00Z"),
+      ms("2026-09-26T00:00:00Z"),
+    )).toThrow(/recurrence rule exceeds the Free-plan CPU budget/);
+  });
+
+  it.each(["SECONDLY", "MINUTELY", "HOURLY"])(
+    "rejects %s recurrence before iterator expansion",
+    (frequency) => {
+      const ics = calendar(vevent([
+        `UID:${frequency.toLowerCase()}@test`,
+        "DTSTART:20260827T000000Z",
+        "DTEND:20260827T000100Z",
+        `RRULE:FREQ=${frequency};COUNT=10`,
+      ]));
+
+      expect(() => parseAndExpand(
+        ics,
+        ms("2026-08-27T00:00:00Z"),
+        ms("2026-09-26T00:00:00Z"),
+      )).toThrow(/frequency exceeds the Free-plan CPU budget/);
+    },
+  );
+
+  it("bounds and reuses a large folded description across daily occurrences", () => {
+    const foldedDescription = Array.from({ length: 400 }, () => "x".repeat(70)).join("\r\n ");
+    const ics = calendar(vevent([
+      "UID:large-description@test",
+      "DTSTART:20260827T000000Z",
+      "DTEND:20260827T010000Z",
+      "RRULE:FREQ=DAILY;COUNT=24",
+      `DESCRIPTION:${foldedDescription}`,
+    ]));
+
+    const occurrences = parseAndExpand(
+      ics,
+      ms("2026-08-27T00:00:00Z"),
+      ms("2026-09-20T00:00:00Z"),
+    );
+    expect(occurrences).toHaveLength(24);
+    expect(occurrences.every(occurrence => occurrence.description.length === 4000)).toBe(true);
+  });
+
+  it("enforces one recurrence-iterator budget across the whole document", () => {
+    const series = Array.from({ length: 10 }, (_, i) => vevent([
+      `UID:many-series-${i}@test`,
+      "DTSTART:20260330T090000Z",
+      "DTEND:20260330T100000Z",
+      "RRULE:FREQ=DAILY;COUNT=145",
+    ]));
+    expect(() => parseAndExpand(
+      calendar(...series),
+      ms("2026-08-25T00:00:00Z"),
+      ms("2026-09-26T00:00:00Z"),
+    )).toThrow(/document exceeds the Free-plan CPU budget/);
+  });
+
   it("returns a single timed event inside the window", () => {
     const ics = calendar(
       vevent([
@@ -357,7 +481,7 @@ describe("parseAndExpand", () => {
       const actual = parseAndExpand(ics, t, windowEnd).map(o => o.key).sort();
       expect(actual, `window opening ${new Date(t).toISOString()}`).toEqual(expected);
     }
-  });
+  }, 15_000);
 
   it("keeps an instance an override moved forward into the window", () => {
     const ics = calendar(

@@ -9,7 +9,7 @@
  * an aggregate that projects chunk counts with integer division.
  *
  * D1 is SQLite, and `node:sqlite` ships with Node, so those queries can be run
- * for real against the project's own `db/schema.sql`. A wrong comparison then
+ * for real against the project's two-file reference schema. A wrong comparison then
  * fails the test instead of passing a string match.
  *
  * The schema migration in `src/db/init.ts` is the other case, and the sharper
@@ -25,50 +25,7 @@
  */
 import { DatabaseSync } from "node:sqlite";
 import { AsyncLocalStorage } from "node:async_hooks";
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
-
-// SB_EVAL_ROOT lets the bundled eval CLI (whose import.meta.dirname is the bundle's) find the schema.
-const SCHEMA = resolve(process.env.SB_EVAL_ROOT ?? resolve(import.meta.dirname, "../.."), "db/schema.sql");
-
-// One FIFO queue per connection, shared by every standalone statement AND
-// every batch on that connection. A batch opens a SAVEPOINT for its whole
-// body; without this, a standalone statement issued while that SAVEPOINT is
-// open runs inside it on the same connection and gets rolled back with it if
-// the batch later fails, even though it has nothing to do with the batch.
-const connectionQueues = new WeakMap<DatabaseSync, Promise<unknown>>();
-
-// Marks "this async call chain is executing as part of a batch already
-// holding connection X's queue slot" — set only around db.batch()'s own
-// body (see below). AsyncLocalStorage, not a plain flag, because a flag
-// cannot tell a batch's OWN nested statement.run() calls (which must run
-// inline, or they would queue behind their own still-running batch and
-// deadlock) apart from a genuinely unrelated call that merely happens to
-// execute during the same window (which must still queue and wait its turn).
-//
-// The store is a token, not just the DatabaseSync, because a batch's own
-// statement.run() can spawn async work it does not await (a fire-and-forget
-// `.then()`). That work still closes over this ALS context, so it can resume
-// AFTER the batch has closed — by then the context is stale, and comparing
-// only the connection would let it run inline as if still part of that
-// batch, even inside a DIFFERENT, later batch's open SAVEPOINT. Comparing
-// the token catches that: it changes every time a batch starts, so a stale
-// context's token no longer matches whatever batch (if any) is active now.
-const activeBatchConnection = new AsyncLocalStorage<{ db: DatabaseSync; token: object }>();
-
-function enqueue<T>(db: DatabaseSync, fn: () => T | Promise<T>): Promise<T> {
-  const store = activeBatchConnection.getStore();
-  if (store && store.db === db && store.token === currentBatchToken.get(db)) {
-    return Promise.resolve().then(fn);
-  }
-  const prior = connectionQueues.get(db) ?? Promise.resolve();
-  const settled = prior.then(fn, fn);
-  connectionQueues.set(db, settled.then(() => undefined, () => undefined));
-  return settled;
-}
-
-/** The token of the batch CURRENTLY holding connection X's queue slot, if any. */
-const currentBatchToken = new WeakMap<DatabaseSync, object>();
+import { readReferenceSchema } from "./reference-schema";
 
 /**
  * D1 accepts numbered placeholders (`?3`, referenced more than once); some `node:sqlite` builds reject them ("column index out of
@@ -94,10 +51,17 @@ class SqliteStatement {
     private readonly db: DatabaseSync,
     private readonly sql: string,
     private readonly args: unknown[] = [],
+    private readonly fixtureMarker?: () => string,
+    private readonly enqueue?: <T>(work: () => Promise<T>) => Promise<T>,
+    private readonly executed?: (sql: string) => void,
   ) {}
 
   bind(...args: unknown[]): SqliteStatement {
-    return new SqliteStatement(this.db, this.sql, args);
+    return new SqliteStatement(this.db, this.sql, args, this.fixtureMarker, this.enqueue, this.executed);
+  }
+
+  isRead(): boolean {
+    return /^\s*(SELECT|WITH|PRAGMA)\b/i.test(this.sql);
   }
 
   /** SQL text retained so batch-aware assertions can inspect its members. */
@@ -105,7 +69,12 @@ class SqliteStatement {
     return this.sql;
   }
 
-  private allOnce(): { results: unknown[]; success: true; meta: { rows_written: 0 } } {
+  async all(): Promise<{ results: unknown[]; success: true; meta: { rows_written: 0 } }> {
+    this.executed?.(this.sql);
+    return this.enqueue ? this.enqueue(() => this.allDirect()) : this.allDirect();
+  }
+
+  private async allDirect(): Promise<{ results: unknown[]; success: true; meta: { rows_written: 0 } }> {
     const q = positionalParams(this.sql, this.args);
     const rows = this.db.prepare(q.sql).all(...(q.args as never[]));
     // SQLite can prove that this SELECT wrote no rows, but it cannot reproduce
@@ -114,43 +83,88 @@ class SqliteStatement {
     return { results: rows, success: true, meta: { rows_written: 0 } };
   }
 
-  private firstOnce(): unknown | null {
+  async first(): Promise<unknown | null> {
+    this.executed?.(this.sql);
     const q = positionalParams(this.sql, this.args);
-    const row = this.db.prepare(q.sql).get(...(q.args as never[]));
-    return row ?? null;
+    const direct = async () => {
+      try { return this.db.prepare(q.sql).get(...(q.args as never[])) ?? null; }
+      catch (error) { if (error instanceof Error) error.message += ` SQL: ${q.sql}`; throw error; }
+    };
+    return this.enqueue ? this.enqueue(direct) : direct();
   }
 
-  /**
-   * D1 returns each batched statement's ROWS as well as its meta, and a batch
-   * carries reads as well as writes — identity resolution pairs its SELECT with
-   * the throttled last_used_at write so the pair costs one subrequest. batch()
-   * below executes statements through run(), and several tests wrap batch() with
-   * their own `st.run()` loop, so a SELECT has to answer with its rows here or
-   * the identity read comes back empty through every one of them.
-   *
-   * Additive for writes: `meta.rows_written` is unchanged, and `results` is
-   * simply absent where there are no rows to report.
-   */
-  private runOnce(): { results?: unknown[]; success: true; meta: { rows_written: number } } {
-    const q = positionalParams(this.sql, this.args);
-    const statement = this.db.prepare(q.sql);
-    if (/^\s*(SELECT|WITH)\b/i.test(this.sql)) {
-      return { results: statement.all(...(q.args as never[])), success: true, meta: { rows_written: 0 } };
-    }
-    // A write with a RETURNING clause: node:sqlite's own .run() silently drops whatever it would
-    // have returned, so this goes through .all() instead (which both performs the write and hands
-    // back its rows) — same as D1, which reports the RETURNING rows through a batched write too.
-    if (/\bRETURNING\b/i.test(this.sql)) {
-      const rows = statement.all(...(q.args as never[]));
-      return { results: rows, success: true, meta: { rows_written: rows.length } };
-    }
-    const result = statement.run(...(q.args as never[]));
-    return { success: true, meta: { rows_written: Number(result.changes) } };
+  async run(): Promise<{ results?: unknown[]; success: true; meta: { rows_written: number; changes: number } }> {
+    this.executed?.(this.sql);
+    return this.enqueue ? this.enqueue(() => this.runDirect()) : this.runDirect();
   }
 
-  async all() { return enqueue(this.db, () => this.allOnce()); }
-  async first() { return enqueue(this.db, () => this.firstOnce()); }
-  async run() { return enqueue(this.db, () => this.runOnce()); }
+  private async runDirect(): Promise<{ results?: unknown[]; success: true; meta: { rows_written: number; changes: number } }> {
+    // D1PreparedStatement.run() returns result rows for SELECT statements too.
+    // Several budget-focused wrappers deliberately execute every member of a
+    // mixed read/write batch through run(); modelling SELECT as a SQLite write
+    // discards the identity row and turns every authenticated request into 401.
+    if (this.isRead()) {
+      const result = await this.allDirect();
+      return result as unknown as { success: true; meta: { rows_written: number; changes: number } };
+    }
+    let { sql, args } = positionalParams(this.sql, [...this.args]);
+    const fencedTable = sql.match(/\b(?:INTO|UPDATE)\s+(entries|edges|insight_candidates|vector_cleanup_ops|projects|entry_versions|entries_trash|recall_log)\b/i)?.[1];
+    const hasWriteMarker = fencedTable
+      ? Boolean(this.db.prepare(`SELECT 1 FROM pragma_table_info('${fencedTable}') WHERE name = 'write_marker'`).get())
+      : false;
+    if (this.fixtureMarker && hasWriteMarker
+      && !/\b(?:write_marker|migration_lease_owner|restore_lease_owner)\b/i.test(sql)) {
+      const insert = sql.match(
+        /^(\s*INSERT(?:\s+OR\s+\w+)?\s+INTO\s+(?:entries|edges|insight_candidates|vector_cleanup_ops|projects|entry_versions|entries_trash|recall_log)\s*\()([^)]*)(\)\s*VALUES\s*\()([\s\S]*)(\)\s*)$/i,
+      );
+      if (insert) {
+        // 複数VALUES行にも個別のmarkerを発行し、元のbind順を維持する。
+        const tuples = `(${insert[4]})`;
+        const rewritten: string[] = [];
+        const nextArgs: unknown[] = [];
+        let depth = 0, quoted = false, start = 0, argOffset = 0, tupleArgs = 0;
+        for (let i = 0; i < tuples.length; i++) {
+          const c = tuples[i];
+          if (c === "'") {
+            if (quoted && tuples[i + 1] === "'") { i++; continue; }
+            quoted = !quoted;
+          }
+          if (quoted) continue;
+          if (c === "?") tupleArgs++;
+          if (c === "(") { if (depth === 0) start = i; depth++; }
+          if (c === ")" && --depth === 0) {
+            rewritten.push(`${tuples.slice(start, i)}, ?)`);
+            nextArgs.push(...args.slice(argOffset, argOffset + tupleArgs), this.fixtureMarker());
+            argOffset += tupleArgs;
+            tupleArgs = 0;
+          }
+        }
+        sql = `${insert[1]}${insert[2]}, write_marker) VALUES ${rewritten.join(", ")}`;
+        args = nextArgs;
+      } else {
+        const update = sql.match(
+          /^(\s*UPDATE\s+(?:entries|edges|insight_candidates|vector_cleanup_ops|projects|entry_versions|entries_trash|recall_log)\s+SET\s+)([\s\S]*?)(\s+WHERE\s+[\s\S]*)?$/i,
+        );
+        if (update) {
+          const setArgCount = (update[2].match(/\?/g) ?? []).length;
+          sql = `${update[1]}${update[2]}, write_marker = ?${update[3] ?? ""}`;
+          args.splice(setArgCount, 0, this.fixtureMarker());
+        }
+      }
+    }
+    // workerd's meta.changes includes trigger and FTS shadow-table writes.
+    // SQLite's StatementResult.changes counts only the directly changed rows;
+    // total_changes() also counts the indirect writes on this connection.
+    const before = (this.db.prepare("SELECT total_changes() AS n").get() as { n: number }).n;
+    if (/\bRETURNING\b/i.test(sql)) {
+      const rows = this.db.prepare(sql).all(...(args as never[]));
+      const after = (this.db.prepare("SELECT total_changes() AS n").get() as { n: number }).n;
+      return { results: rows, success: true, meta: { rows_written: rows.length, changes: after - before } };
+    }
+    const result = this.db.prepare(sql).run(...(args as never[]));
+    const after = (this.db.prepare("SELECT total_changes() AS n").get() as { n: number }).n;
+    return { success: true, meta: { rows_written: Number(result.changes), changes: after - before } };
+  }
 }
 
 export interface SqliteD1 {
@@ -158,15 +172,22 @@ export interface SqliteD1 {
   db: {
     prepare(sql: string): SqliteStatement;
     exec(sql: string): Promise<void>;
-    batch(statements: SqliteStatement[]): Promise<{ results?: unknown[]; success: true; meta: { rows_written: number } }[]>;
+    batch(statements: SqliteStatement[]): Promise<{ results?: unknown[]; success: true; meta: { rows_written: number; changes?: number } }[]>;
     /** Vector id -> the row that listed it, remembered across statements (never counted). */
     __vectorOwners(): Map<string, string>;
   };
   /**
-   * One entry per D1 call made through `db` — which is one entry per subrequest,
-   * since `prepare()` here is only ever followed by a single execution.
+   * prepareしたSQLの台帳。未実行statementやbatch内部のSQLも含み、D1呼び出し回数ではない。
    */
   issued: string[];
+  /** D1実行回数の別台帳。batchは1実行、issuedは従来のSQL文台帳を維持する。 */
+  executions: string[];
+  /** Attach a non-expiring test-only write capability after fixture seeding completes. */
+  admitEnv<T extends object>(env: T): T & { WRITE_ADMISSION_TOKEN: string };
+  /** Fresh row marker backed by a persistent test-only admission for direct fixture SQL. */
+  fixtureMarker(purpose?: "write" | "delete"): string;
+  /** 競合を起こす別writerなどのfixture専用削除。runtime SQLの許可検査は迂回しない。 */
+  deleteFixtureRows(sql: string, ...args: unknown[]): Promise<void>;
   /** SQL members of each collapsed batch, without changing its one-subrequest count. */
   batches: string[][];
   /** Column names currently on `entries`, straight from SQLite. */
@@ -178,6 +199,7 @@ export interface SqliteD1 {
     createdAt: number;
     tags?: string[];
     source?: string;
+    workspaceId?: string;
     vectorIds?: string[];
     /** Drives the compression and resurfacing rules; defaults to 0. */
     importanceScore?: number;
@@ -193,7 +215,7 @@ export interface SqliteD1 {
 /**
  * A fresh in-memory database with the project's real schema applied.
  *
- * Using the shipped schema rather than a hand-written CREATE TABLE means a
+ * Using the reference schema rather than a hand-written CREATE TABLE means a
  * column rename breaks these tests, which is the point — the migration's SQL
  * names columns.
  */
@@ -245,36 +267,66 @@ export function splitSchemaStatements(sql: string): string[] {
   return statements;
 }
 
-export function makeSqliteD1({ schema: applySchema = true }: { schema?: boolean } = {}): SqliteD1 {
+export function makeSqliteD1(
+  { schema: applySchema = true, autoAdmitFixtureWrites = true }:
+  { schema?: boolean; autoAdmitFixtureWrites?: boolean } = {},
+): SqliteD1 {
   const raw = new DatabaseSync(":memory:");
-  // The schema uses D1-flavoured DDL; execute it statement by statement so one
-  // unsupported pragma cannot take the whole file down silently.
-  const schema = applySchema ? readFileSync(SCHEMA, "utf8") : "";
-  // Strip comments BEFORE splitting, not after. Splitting the raw file on ";"
-  // and filtering comment lines out of each chunk looks equivalent but is not:
-  // a ";" inside a trailing `-- comment` cuts the statement it is attached to
-  // in half, and the two halves then fail to parse. Wrangler's own splitter is
-  // comment-aware, so such a file migrates fine in production while silently
-  // losing tables here — which is exactly how the whole `users` table (and with
-  // it every tenancy test) went missing without a single red test.
-  for (const statement of splitSchemaStatements(stripSqlComments(schema))) {
-    const sql = statement.trim();
-    if (!sql) continue;
-    try {
-      raw.exec(sql);
-    } catch (e) {
-      // A CREATE TABLE that does not apply leaves tests asserting against a
-      // database that is missing the thing under test, so no table creation is
-      // ever allowed to fail quietly. Indexes are the tolerated case: some use
-      // D1-only syntax this facade does not need.
-      if (/^\s*CREATE\s+TABLE\b/i.test(sql) || /\bentries\b/i.test(sql)) {
-        throw new Error(`schema.sql statement failed:\n${sql}\n${String(e)}`);
-      }
-    }
-  }
+  const schema = applySchema ? readReferenceSchema(process.env.SB_EVAL_ROOT) : "";
+  // Execute as one SQLite script. Splitting on semicolons is not correct once the schema
+  // contains CREATE TRIGGER ... BEGIN ...; END blocks: the inner semicolon is part of the
+  // statement, not a script boundary.
+  if (schema) raw.exec(schema);
 
   const issued: string[] = [];
+  const executions: string[] = [];
   const batches: string[][] = [];
+  // One SQLite connection: standalone work waits behind an open batch, while
+  // statements the batch itself awaits may run inline. A finished batch's
+  // async descendants lose that privilege and rejoin the FIFO queue.
+  let tail: Promise<void> = Promise.resolve();
+  const activeBatch = new AsyncLocalStorage<{ active: boolean }>();
+  const enqueue = <T>(work: () => Promise<T>): Promise<T> => {
+    if (activeBatch.getStore()?.active) return work();
+    const result = tail.then(work);
+    tail = result.then(() => undefined, () => undefined);
+    return result;
+  };
+  let fixtureToken: string | null = null;
+  const ensureFixtureToken = () => {
+    if (fixtureToken && raw.prepare("SELECT 1 FROM memory_write_admissions WHERE token = ?").get(fixtureToken)) return fixtureToken;
+    const generation = (raw.prepare(
+      `SELECT generation FROM memory_write_epoch WHERE id = 'current'`,
+    ).get() as { generation?: string } | undefined)?.generation ?? "sqlite-fixture-generation";
+    raw.prepare(
+      `INSERT INTO memory_write_epoch (id, generation) VALUES ('current', ?)
+       ON CONFLICT(id) DO NOTHING`,
+    ).run(generation);
+    fixtureToken = `sqlite-fixture-${crypto.randomUUID()}`;
+    raw.prepare(
+      `INSERT INTO memory_write_admissions (token, started_at, expires_at, generation)
+       VALUES (?, ?, ?, ?)`,
+    ).run(fixtureToken, Date.now(), Number.MAX_SAFE_INTEGER, generation);
+    return fixtureToken;
+  };
+  const runBatch = async (statements: SqliteStatement[]) => {
+    const out: ({ results: unknown[]; success: true; meta: { rows_written: 0 } }
+      | { success: true; meta: { rows_written: number; changes: number } })[] = [];
+    raw.exec("BEGIN");
+    const token = { active: true };
+    try {
+      await activeBatch.run(token, async () => {
+        for (const statement of statements) out.push(await statement.run());
+      });
+      raw.exec("COMMIT");
+      return out;
+    } catch (error) {
+      raw.exec("ROLLBACK");
+      throw error;
+    } finally {
+      token.active = false;
+    }
+  };
   // Test-infrastructure reads straight from SQLite, never counted in `issued` (T-0089.1.1).
   const listedVectors = new Map<string, string>();
   const rememberListed = () => {
@@ -292,12 +344,20 @@ export function makeSqliteD1({ schema: applySchema = true }: { schema?: boolean 
 
   return {
     issued,
+    executions,
     batches,
     db: {
       prepare: (sql: string) => {
         if (/^\s*(UPDATE entries|DELETE FROM entries|INSERT INTO entries_trash)/i.test(sql)) rememberListed();
         issued.push(sql);
-        return new SqliteStatement(raw, sql);
+        return new SqliteStatement(
+          raw,
+          sql,
+          [],
+          autoAdmitFixtureWrites ? () => `${ensureFixtureToken()}:write:${crypto.randomUUID()}` : undefined,
+          enqueue,
+          sql => { if (!activeBatch.getStore()?.active) executions.push(sql); },
+        );
       },
       /** Vector id -> the row that listed it, remembered across statements; uncounted (see D1Mock.__vectorOwners). */
       __vectorOwners: () => { rememberListed(); return listedVectors; },
@@ -307,105 +367,92 @@ export function makeSqliteD1({ schema: applySchema = true }: { schema?: boolean 
       // raise the same "duplicate column name" D1 does, which init.ts expects.
       exec: async (sql: string) => {
         issued.push(sql);
-        raw.exec(sql);
+        executions.push(sql);
+        return enqueue(async () => { raw.exec(sql); });
       },
-      // A batch is ONE subrequest whatever it carries, which is the whole reason
-      // production uses it — so it must count as one entry in `issued`, or the
-      // budget tests measure something the platform does not charge for.
-      //
-      // Callers build the statements with env.DB.prepare(), and `prepare` above
-      // has already pushed one entry per statement by the time this runs. The
-      // last `statements.length` entries are therefore exactly this batch's, so
-      // they are replaced by the single entry the platform actually charges for.
-      batch: async (statements: SqliteStatement[]) => {
-        issued.splice(Math.max(0, issued.length - statements.length), statements.length, "BATCH");
-        // Some tests wrap a prepared statement to instrument run(). Preserve
-        // compatibility with those D1-shaped wrappers while retaining SQL when
-        // either the wrapper or its conventional __inner statement exposes it.
-        batches.push(statements.map((statement) => {
-          const wrapped = statement as SqliteStatement & { __inner?: SqliteStatement };
-          if (typeof wrapped.sourceSql === "function") return wrapped.sourceSql();
-          if (typeof wrapped.__inner?.sourceSql === "function") return wrapped.__inner.sourceSql();
-          return "[wrapped D1 statement]";
-        }));
-        // Real D1 documents batch() as one transaction: a failure partway through
-        // leaves no statement's effect behind. Without an explicit transaction here,
-        // node:sqlite commits each statement.run() as it goes, so a caller that
-        // retries a whole failed batch (the entries_fts write-path repair) would
-        // re-apply statements that already landed and hit spurious constraint
-        // errors that could never happen against real D1.
-        //
-        // A SAVEPOINT rather than BEGIN/COMMIT: this facade is one shared
-        // synchronous connection, and some callers run two logical requests
-        // concurrently (Promise.all of two handlers, each batching); BEGIN
-        // would fail the second with "cannot start a transaction within a
-        // transaction". Queued through enqueue() (shared with every
-        // standalone statement on this connection, see above) so two
-        // SAVEPOINTs never nest out of LIFO order, and no unrelated
-        // standalone statement can run while this one is open.
-        return enqueue(raw, () => {
-          const token = {};
-          currentBatchToken.set(raw, token);
-          return activeBatchConnection.run({ db: raw, token }, async () => {
-            const sp = `sqlite_d1_batch_${savepointCounter++}`;
-            raw.exec(`SAVEPOINT ${sp}`);
-            try {
-              const out: { results?: unknown[]; success: true; meta: { rows_written: number } }[] = [];
-              // Every statement.run() here — a real SqliteStatement directly,
-              // or one reached indirectly through a test double's own run() —
-              // is still inside the activeBatchConnection context this batch
-              // just entered, so enqueue() runs it inline instead of queuing
-              // it behind this same still-running batch.
-              for (const statement of statements as unknown as { run(): unknown }[]) {
-                out.push(await statement.run() as { results?: unknown[]; success: true; meta: { rows_written: number } });
-              }
-              raw.exec(`RELEASE ${sp}`);
-              return out;
-            } catch (e) {
-              raw.exec(`ROLLBACK TO ${sp}`);
-              raw.exec(`RELEASE ${sp}`);
-              throw e;
-            } finally {
-              // Ends this batch's queue slot. Any async work spawned inside
-              // it that resumes after this point no longer matches the
-              // token, so enqueue() routes it back through the FIFO queue
-              // instead of letting it run inline against whatever batch (if
-              // any) is active on this connection by the time it resumes.
-              if (currentBatchToken.get(raw) === token) currentBatchToken.delete(raw);
-            }
-          });
-        });
+      // D1 executes a batch transactionally in one round trip, but Free's query limit
+      // counts every statement. `prepare` has already recorded each statement, so keep
+      // those entries intact for budget assertions.
+      batch: (statements: SqliteStatement[]) => {
+        executions.push("BATCH");
+        batches.push(statements.map(s => typeof s.sourceSql === "function" ? s.sourceSql() : (s as unknown as { __inner?: SqliteStatement }).__inner?.sourceSql() ?? "[wrapped D1 statement]"));
+        return enqueue(() => runBatch(statements));
       },
     },
     columns() {
       return (raw.prepare(`SELECT name FROM pragma_table_info('entries')`).all() as { name: string }[])
         .map(r => r.name);
     },
-    seed({ id, content, createdAt, tags = [], source = "api", vectorIds = [], importanceScore = 0, validFrom = null, validUntil = null }) {
-      // Some callers use makeSqliteD1() straight off db/schema.sql's CREATE, with
-      // no initializeDatabase() migration run — validity, like every other
-      // runtime-ALTERed column (e.g. when_label), exists only after that runs.
-      const hasValidity = raw.prepare(`SELECT 1 FROM pragma_table_info('entries') WHERE name = 'valid_from'`).get() !== undefined;
-      if (hasValidity) {
-        raw
-          .prepare(
-            `INSERT INTO entries (id, content, tags, source, created_at, vector_ids, recall_count, importance_score, valid_from, valid_until)
-             VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?)`,
-          )
-          .run(id, content, JSON.stringify(tags), source, createdAt, JSON.stringify(vectorIds), importanceScore, validFrom, validUntil);
-        return;
+    seed({ id, content, createdAt, tags = [], source = "api", workspaceId = "", vectorIds = [], importanceScore = 0, validFrom = null, validUntil = null }) {
+      const generation = (raw.prepare(
+        `SELECT generation FROM memory_write_epoch WHERE id = 'current'`,
+      ).get() as { generation?: string } | undefined)?.generation ?? "sqlite-seed-generation";
+      const token = `sqlite-seed-${crypto.randomUUID()}`;
+      const now = Date.now();
+      raw.prepare(
+        `INSERT INTO memory_write_epoch (id, generation) VALUES ('current', ?)
+         ON CONFLICT(id) DO NOTHING`,
+      ).run(generation);
+      raw.prepare(
+        `INSERT INTO memory_write_admissions (token, started_at, expires_at, generation)
+         VALUES (?, ?, ?, ?)`,
+      ).run(token, now, Number.MAX_SAFE_INTEGER, generation);
+      try {
+        const present = new Set((raw.prepare("SELECT name FROM pragma_table_info('entries')").all() as { name: string }[]).map(r => r.name));
+        const fields = ["id", "content", "tags", "source", "created_at", "vector_ids", "recall_count", "importance_score", "write_marker"];
+        const values: (string | number | null)[] = [id, content, JSON.stringify(tags), source, createdAt, JSON.stringify(vectorIds), 0, importanceScore, `${token}:write:${crypto.randomUUID()}`];
+        for (const [field, value] of [["valid_from", validFrom], ["valid_until", validUntil], ["workspace_id", workspaceId]] as const) {
+          if (present.has(field)) { fields.push(field); values.push(value); }
+        }
+        raw.prepare(`INSERT INTO entries (${fields.join(",")}) VALUES (${fields.map(() => "?").join(",")})`).run(...values);
+      } finally {
+        raw.prepare(`DELETE FROM memory_write_admissions WHERE token = ?`).run(token);
       }
-      raw
-        .prepare(
-          `INSERT INTO entries (id, content, tags, source, created_at, vector_ids, recall_count, importance_score)
-           VALUES (?, ?, ?, ?, ?, ?, 0, ?)`,
-        )
-        .run(id, content, JSON.stringify(tags), source, createdAt, JSON.stringify(vectorIds), importanceScore);
     },
     rows() {
       return raw
         .prepare(`SELECT * FROM entries ORDER BY created_at ASC, id ASC`)
         .all() as Record<string, unknown>[];
+    },
+    deleteFixtureRows(sql: string, ...args: unknown[]): Promise<void> {
+      return enqueue(async () => {
+        const q = positionalParams(sql, args);
+        const match = q.sql.match(/^\s*DELETE\s+FROM\s+(entries|edges|insight_candidates|vector_cleanup_ops|projects|entry_versions|entries_trash|recall_log)\b([\s\S]*)$/i);
+        if (!match) throw new Error("fixture削除には保護対象テーブルのDELETEを指定する");
+        const token = ensureFixtureToken();
+        const ownTransaction = !activeBatch.getStore()?.active;
+        if (ownTransaction) raw.exec("BEGIN");
+        try {
+          raw.prepare(`UPDATE ${match[1]} SET write_marker = ? ${match[2]}`)
+            .run(`${token}:delete:${crypto.randomUUID()}`, ...(q.args as never[]));
+          raw.prepare(q.sql).run(...(q.args as never[]));
+          if (ownTransaction) raw.exec("COMMIT");
+        } catch (error) {
+          if (ownTransaction) raw.exec("ROLLBACK");
+          throw error;
+        }
+      });
+    },
+    admitEnv<T extends object>(env: T): T & { WRITE_ADMISSION_TOKEN: string } {
+      const generation = (raw.prepare(
+        `SELECT generation FROM memory_write_epoch WHERE id = 'current'`,
+      ).get() as { generation?: string } | undefined)?.generation ?? "sqlite-admission-generation";
+      raw.prepare(
+        `INSERT INTO memory_write_epoch (id, generation) VALUES ('current', ?)
+         ON CONFLICT(id) DO NOTHING`,
+      ).run(generation);
+      const token = `sqlite-admission-${crypto.randomUUID()}`;
+      raw.prepare(
+        `INSERT INTO memory_write_admissions (token, started_at, expires_at, generation)
+         VALUES (?, ?, ?, ?)`,
+      ).run(token, Date.now(), Number.MAX_SAFE_INTEGER, generation);
+      // fixtureのenvは従来どおりspread可能にする。runtimeのadmission envは
+      // prototypeにbindingを保持するため、そこで取得したcapabilityとは区別する。
+      const admitted = { ...env, WRITE_ADMISSION_TOKEN: token } as T & { WRITE_ADMISSION_TOKEN: string };
+      return admitted;
+    },
+    fixtureMarker(purpose = "write") {
+      return `${ensureFixtureToken()}:${purpose}:${crypto.randomUUID()}`;
     },
     close() {
       raw.close();

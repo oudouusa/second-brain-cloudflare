@@ -2,7 +2,7 @@ import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { makeTrashEnv, type TrashEnv } from "../helpers/trash-env";
-import { importExportPayload } from "../../src/entries/import";
+import { importAllPages as importExportPayload } from "../helpers/import-pages";
 import { forgetEntry } from "../../src/capture/lifecycle";
 import { deleteEntryVectors, drainPendingVectorDeletes, persistPendingVectorDeletes } from "../../src/vectorize/batch";
 import { MAX_ENTRY_ID_BYTES, newVectorIds } from "../../src/vectorize/ids";
@@ -134,7 +134,8 @@ describe("a vector is deleted only by the entry its parentId names", () => {
     const result = await deleteEntryVectors(t.env, [{ entryId: "m", vectorIds: ids }], { maxIds: VECTORIZE_DELETE_MAX_IDS_PER_CALL });
 
     const expectedCalls = Math.ceil(VECTORIZE_DELETE_MAX_IDS_PER_CALL / VECTORIZE_GET_BY_IDS_BATCH);
-    expect(getByIdsCalls).toBe(expectedCalls);
+    // 所有者確認と、台帳から削除する直前の再確認を両方数える。
+    expect(getByIdsCalls).toBe(expectedCalls * 2);
     expect(getByIdsCalls + 1).toBeLessThan(100); // +1 for the single deleteByIds call; nowhere near the 1,000 ceiling
     expect(result.done).toBe(false);
     expect(store.size).toBe(20_000 - VECTORIZE_DELETE_MAX_IDS_PER_CALL);
@@ -184,7 +185,7 @@ describe("a vector is deleted only by the entry its parentId names", () => {
 });
 
 describe("structural", () => {
-  const SRC = join(__dirname, "../../src");
+  const SRC = join(import.meta.dirname, "../../src");
   const files = (dir: string): string[] => readdirSync(dir).flatMap((f) => {
     const p = join(dir, f);
     return statSync(p).isDirectory() ? files(p) : p.endsWith(".ts") ? [p] : [];
@@ -194,11 +195,21 @@ describe("structural", () => {
   it("every Vectorize delete goes through the parentId-checked helper", () => {
     for (const f of all) {
       if (f.file === "vectorize/batch.ts") continue;
+      if (f.file === "vectorize/cleanup.ts") {
+        expect(f.src.match(/\.deleteByIds\([^)]*\)/g)).toEqual([".deleteByIds(vectorIds)"]);
+        expect(f.src).toContain("await excludeForeignVectors");
+        expect(f.src).toContain("async function deleteVectorsWithRetry");
+        expect(f.src).not.toContain("export async function deleteVectorsWithRetry");
+        expect(f.src).toContain("await authorizeVectorMutation");
+        continue;
+      }
       expect(f.src, f.file).not.toMatch(/\.deleteByIds\(/);
       expect(f.src, f.file).not.toMatch(/\bdeleteVectorIds\b/);
     }
     const batch = all.find((f) => f.file === "vectorize/batch.ts")!.src;
-    expect(batch).not.toMatch(/export async function deleteVectorIds/);
+    // 低水準の送信はcleanupだけが使う。一般の呼出元は所有者確認付きAPIを使う。
+    expect(all.filter(f => f.file !== "vectorize/batch.ts" && /\bdeleteVectorIds\b/.test(f.src)).map(f => f.file))
+      .toEqual(["vectorize/cleanup.ts"]);
     expect(batch).toMatch(/export async function deleteEntryVectors/);
   });
 

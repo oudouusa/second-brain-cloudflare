@@ -1,3 +1,4 @@
+import { edgeInsertRow, edgeInsertManyStatements, inferredEdgeStatements } from "../../src/graph/edges";
 /**
  * B3 — the two writes that changed an entry's meaning and drew nothing.
  *
@@ -22,7 +23,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { updateEntryContent } from "../../src/capture/store";
 import { captureEntry } from "../../src/capture/entry";
 import { makeSqliteD1, type SqliteD1 } from "../helpers/sqlite-d1";
-import { makeTestEnv, makeMemoryKV } from "../helpers/make-env";
+import { makeTestEnv, makeVectorizeMock, makeMemoryKV } from "../helpers/make-env";
 import { resetDatabaseInit, initializeDatabase } from "../../src/db/init";
 import type { Env } from "../../src/env";
 
@@ -38,7 +39,7 @@ describe("edges from the update and merge paths", () => {
     sqlite = makeSqliteD1();
     embeds = 0;
     queries = 0;
-    await initializeDatabase(makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"] }));
+    await initializeDatabase(sqlite.admitEnv(makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"] })));
   });
 
   afterEach(() => sqlite.close());
@@ -47,9 +48,9 @@ describe("edges from the update and merge paths", () => {
   function ai(verdict: string) {
     return {
       run: vi.fn().mockImplementation(async (model: string) => {
-        if (model.startsWith("@cf/baai/bge")) {
+        if (model === "@cf/google/embeddinggemma-300m") {
           embeds++;
-          return { data: [new Array(384).fill(0.1)] };
+          return { data: [new Array(768).fill(0.1)] };
         }
         return new ReadableStream({
           start(c) {
@@ -73,18 +74,45 @@ describe("edges from the update and merge paths", () => {
   }
 
   function envWith(matches: { id: string; score: number }[], verdict: string): Env {
-    return makeTestEnv(undefined, {
+    return sqlite.admitEnv(makeTestEnv(undefined, {
       DB: sqlite.db as unknown as Env["DB"],
       OAUTH_KV: makeMemoryKV(),
       AI: ai(verdict),
-      VECTORIZE: vectorize(matches),
-    });
+      VECTORIZE: makeVectorizeMock(vectorize(matches)),
+    }));
   }
 
   async function edges(): Promise<{ source_id: string; target_id: string; type: string }[]> {
     const r = await sqlite.db.prepare(`SELECT source_id, target_id, type FROM edges`).all() as any;
     return r.results;
   }
+
+  it("11列の一括書込は10行を分割し、推論から明示関係を保護する", async () => {
+    const env = envWith([], "3");
+    sqlite.seed({ id: "a", content: "synthetic source", createdAt: 1000 });
+    const rows = Array.from({ length: 10 }, (_, i) => {
+      const target = `b-${i}`;
+      sqlite.seed({ id: target, content: "synthetic target", createdAt: 1000 });
+      return edgeInsertRow("a", target, "relates_to", {
+        provenance: "explicit", weight: 0.5, metadata: { ordinal: i }, created_at: 123,
+      })!;
+    });
+    const statements = edgeInsertManyStatements(rows, env);
+    expect(statements).toHaveLength(2);
+    await env.DB.batch(statements);
+    const before = await sqlite.db.prepare("SELECT * FROM edges ORDER BY target_id").all();
+    expect(before.results).toHaveLength(10);
+    for (let i = 0; i < 10; i++) {
+      expect(before.results[i]).toMatchObject({
+        id: rows[i].id, source_id: "a", target_id: `b-${i}`, weight: 0.5,
+        metadata: JSON.stringify({ ordinal: i }), created_at: 123,
+        updated_at: rows[i].updatedAt, workspace_id: "", write_marker: expect.any(String),
+      });
+    }
+    await env.DB.batch(inferredEdgeStatements("a", [{ id: "b-0", score: 0.99 }], env));
+    const after = await sqlite.db.prepare("SELECT * FROM edges ORDER BY target_id").all();
+    expect(after.results).toEqual(before.results);
+  });
 
   describe("editing an entry's content", () => {
     it("links the rewritten entry to its new neighbours", async () => {
@@ -136,13 +164,13 @@ describe("edges from the update and merge paths", () => {
       expect((await edges()).flatMap(e => [e.source_id, e.target_id])).toContain("friend");
     });
 
-    it("asks Vectorize nothing it did not already ask during duplicate detection", async () => {
+    it("reuses committed embeddings while bounding the merged-content neighbor refresh", async () => {
       const env = envWith(MATCHES, MERGE);
 
       await captureEntry("the memory being merged in", [], "api", env, mergeCtx);
       await Promise.all(pending);
 
-      // One: the duplicate check. Its neighbours are reused for inference.
+      // capture時の候補を再利用し、mergeだけの追加Vectorize問い合わせを発行しない。
       expect(queries).toBe(1);
     });
 

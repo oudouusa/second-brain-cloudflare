@@ -338,25 +338,25 @@ describe("GET /graph subrequest budget", () => {
    * chained by same-layer edges, inserted by two recursive CTEs — a per-row
    * INSERT from JS is what makes a 1600-row fixture slow, not SQLite.
    */
-  function seedTwoLayerGraph(n: number) {
-    sqlite.db.prepare(
+  async function seedTwoLayerGraph(n: number) {
+    await sqlite.db.prepare(
       `WITH RECURSIVE seq(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM seq WHERE i + 1 < ${n})
-       INSERT INTO entries (id, content, tags, source, created_at, updated_at, vector_ids, workspace_id, actor_id)
+       INSERT INTO entries (id, content, tags, source, created_at, updated_at, vector_ids, workspace_id, actor_id, write_marker)
        SELECT 'n' || i, 'Memory ' || i, '[]', 'test', ${SEEDED_AT}, ${SEEDED_AT}, '[]',
               CASE i % 2 WHEN 0 THEN '${aliceWorkspaceId}' ELSE '${companyWorkspaceId}' END,
-              CASE i % 2 WHEN 0 THEN '${aliceUserId}' ELSE '${bobUserId}' END
+              CASE i % 2 WHEN 0 THEN '${aliceUserId}' ELSE '${bobUserId}' END, ?
        FROM seq`,
-    ).run();
+    ).bind(sqlite.fixtureMarker()).run();
     // Every edge joins two nodes of the same layer and is stamped with it, the
     // shape moveEntry leaves behind.
     for (const [prefix, offset, workspace] of [["pe", 0, aliceWorkspaceId], ["ce", 1, companyWorkspaceId]] as const) {
-      sqlite.db.prepare(
+      await sqlite.db.prepare(
         `WITH RECURSIVE seq(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM seq WHERE i + 1 < ${Math.floor(n / 2) - 1})
-         INSERT INTO edges (id, source_id, target_id, type, weight, provenance, metadata, created_at, updated_at, workspace_id)
+         INSERT INTO edges (id, source_id, target_id, type, weight, provenance, metadata, created_at, updated_at, workspace_id, write_marker)
          SELECT '${prefix}' || i, 'n' || (i * 2 + ${offset}), 'n' || (i * 2 + 2 + ${offset}),
-                'relates_to', 1.0 - (i / 100000.0), 'explicit', '{}', 1, 1, '${workspace}'
+                'relates_to', 1.0 - (i / 100000.0), 'explicit', '{}', 1, 1, '${workspace}', ?
          FROM seq`,
-      ).run();
+      ).bind(sqlite.fixtureMarker()).run();
     }
   }
 
@@ -374,17 +374,17 @@ describe("GET /graph subrequest budget", () => {
     //   1   identity read + last_used_at stamp — ONE batch, therefore one subrequest
     //   1   strongest-edges scan
     //  16   node hydration, ceil(1500 / (100 - 2)) — authors included, via the join
-    //  31   edge hydration, ceil(1500 / floor((100 - 2) / 2))
+    //   0   edge hydration — the bounded strongest-edge scan is reused
     //   1   KV read for the config
     //  ---
-    //  50   total, which is the whole self-imposed budget with nothing spare
+    //  19   D1 + one KV config read = 20 total
     //
     // An admin costs one more of each hydration kind (three scope bindings, because
     // readableWorkspaces adds the legacy '' layer). Read a change to this number as
-    // a decision to make, not a test to update: at 50 there is no headroom left in
-    // this codebase's self-imposed budget, and a cold isolate pays
-    // initializeDatabase's DDL on top (see #282).
-    seedTwoLayerGraph(GRAPH_VIEW_MAX_NODES + 100);
+    // a decision to make, not a test to update: the strongest-edge reuse is what
+    // keeps substantial headroom, and
+    // a cold isolate pays initializeDatabase's DDL on top (see #282).
+    await seedTwoLayerGraph(GRAPH_VIEW_MAX_NODES + 100);
     // Warm: the schema probe and the tenancy bootstrap are one-offs, and this is a
     // claim about a served request, not a cold isolate.
     await call("/graph?limit=1", aliceToken);
@@ -396,8 +396,8 @@ describe("GET /graph subrequest budget", () => {
     expect(data.nodes).toHaveLength(GRAPH_VIEW_MAX_NODES);
     // Both layers really are in the view, so the join is doing work.
     expect(new Set((data.nodes as any[]).map(n => n.workspace))).toEqual(new Set(["personal", "company"]));
-    expect(sqlite.issued.length).toBe(49);
+    expect(sqlite.issued.length).toBe(19);
     expect(kvReads).toHaveLength(1);
-    expect(sqlite.issued.length + kvReads.length).toBe(50);
+    expect(sqlite.issued.length + kvReads.length).toBe(20);
   });
 });

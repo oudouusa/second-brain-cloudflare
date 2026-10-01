@@ -20,10 +20,10 @@ beforeEach(async () => {
   resetDatabaseInit();
   sqlite = makeSqliteD1();
   upsertMock = vi.fn().mockResolvedValue({ mutationId: "m" });
-  env = makeTestEnv(undefined, {
+  env = sqlite.admitEnv(makeTestEnv(undefined, {
     DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV(),
     VECTORIZE: makeVectorizeMock({ upsert: upsertMock }),
-  });
+  }));
   await initializeDatabase(env);
   await sqlite.db.prepare(
     `INSERT INTO entries (id, content, tags, source, created_at, updated_at, vector_ids, workspace_id, actor_id) VALUES (?, ?, ?, 'api', ?, ?, ?, '', 'u1')`,
@@ -59,7 +59,7 @@ describe("applyStatus() leaving deprecated", () => {
   });
 
   it("keyword-only when Vectorize is missing, indexed false", async () => {
-    env = makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV(), VECTORIZE: undefined as any });
+    env = sqlite.admitEnv(makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV(), VECTORIZE: undefined as any }));
     const result = await applyStatus("entry-1", "draft", env, { actorId: "u1", channel: "rest" }, DEFAULTS, "");
     expect(result).toEqual({ status: "ok", indexed: false, validity: expect.any(Object), eventId: expect.any(String) });
 

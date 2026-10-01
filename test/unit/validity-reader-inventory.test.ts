@@ -110,12 +110,12 @@ const SHARED_FILE_EXEMPT_LINES: Record<string, number[]> = {
   // MOVED (merge of release/v4 1cbc817b into v4/gate-fx2): this lane's own round 3 NOT_HELD_SQL
   // swap and FX1's own finding-8 comment block are independently-tracked deltas from the same
   // base; recomputed against the real scanner output on the merged tree, not hand-combined.
-  "src/brief/compute.ts": [125, 133, 142, 157, 483, 486],
+  "src/brief/compute.ts": [],
   // MOVED (merge of release/v4 c870e5ac into v4/t34-w, T-0089.4.2): v4/t34-w's own class E
   // held-row exclusions and release/v4's own Track 2 lane B deltas shifted these; recomputed
   // against the real scanner output on the merged tree.
-  "src/compression/digest.ts": [146, 184, 258, 287, 297],
-  "src/insight/weekly.ts": [360],
+  "src/compression/digest.ts": [],
+  "src/insight/weekly.ts": [],
   // REMOVED mcp/server.ts:489 (T-0089.2.1 fix round, release/v4 d3b5b25c): the digest tool's read
   // now carries its own `validity: current` marker and predicate.
   "src/mcp/server.ts": [],
@@ -130,9 +130,9 @@ const SHARED_FILE_EXEMPT_LINES: Record<string, number[]> = {
   // filter and FX3's own member-removal vector-delete cap are independently-tracked deltas from
   // the same base; recomputed against the real scanner output on the merged tree, not hand-combined.
   // MOVED -1 (7b69dde6 comment trim): a comment above admin.ts's own life filter shrank by 1 line.
-  "src/routes/admin.ts": [636, 649, 661, 686, 759, 784, 833, 882, 887, 1026, 1033, 1150, 1156, 1485, 1576, 1606, 1722],
+  "src/routes/admin.ts": [],
   // MOVED +1 (R16): entries.ts imports supersededBySql.
-  "src/routes/entries.ts": [42, 64, 95],
+  "src/routes/entries.ts": [],
 };
 
 /**

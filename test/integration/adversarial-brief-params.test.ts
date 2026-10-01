@@ -15,7 +15,7 @@ const ctx = { waitUntil: (_: Promise<unknown>) => {} };
 it("keeps a 40-pattern project brief within D1's parameter ceiling for a member in 58 teams", async () => {
   sqlite = makeSqliteD1();
   resetDatabaseInit();
-  await initializeDatabase(makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"] }));
+  await initializeDatabase(sqlite.admitEnv(makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"] })));
   const counts: number[] = [];
   const db = {
     ...sqlite.db,

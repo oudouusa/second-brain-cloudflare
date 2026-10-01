@@ -17,7 +17,7 @@ const ctx = { waitUntil: (_: Promise<unknown>) => {} } as unknown as ExecutionCo
 beforeEach(async () => {
   resetDatabaseInit();
   sqlite = makeSqliteD1();
-  env = makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV() });
+  env = sqlite.admitEnv(makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV() }));
   await initializeDatabase(env);
   const roots = await ensureTenantBootstrap(env);
   companyWs = roots.companyWorkspaceId;
@@ -51,9 +51,9 @@ describe("R2-1: short append does not stamp prior_length_utf16 from a stale read
     const change = { actorId: owner.userId, channel: "rest" as const };
     let raced = false;
     const raw = env.DB as any;
-    const racing = { ...env, DB: { ...raw, prepare(sql: string) {
+    const racing = { ...env, WRITE_ADMISSION_TOKEN: env.WRITE_ADMISSION_TOKEN, DB: { ...raw, prepare(sql: string) {
       const st = raw.prepare(sql);
-      if (!sql.startsWith("SELECT content, tags, source, vector_ids, workspace_id FROM entries")) return st;
+      if (!sql.startsWith("SELECT content, tags, source, created_at, vector_ids, workspace_id, pending_append_passages FROM entries")) return st;
       return { bind: (...a: unknown[]) => ({ first: async () => {
         const r = await st.bind(...a).first();
         if (!raced) { raced = true; await appendToEntry(env, "p1", "", "B 🎉 addition", [], "api", DEFAULTS, undefined, wctx, change, undefined, owner.personalWorkspaceId); }
@@ -61,6 +61,7 @@ describe("R2-1: short append does not stamp prior_length_utf16 from a stale read
       } }) };
     } } } as unknown as Env;
     await appendToEntry(racing, "p1", "", "A addition", [], "api", DEFAULTS, undefined, wctx, change, undefined, owner.personalWorkspaceId);
+    expect(raced).toBe(true);
 
     const row = await live("p1");
     const vs = await versions("p1");
@@ -80,9 +81,9 @@ describe("R2-1: short append does not stamp prior_length_utf16 from a stale read
     const change = { actorId: owner.userId, channel: "rest" as const };
     let raced = false;
     const raw = env.DB as any;
-    const racing = { ...env, DB: { ...raw, prepare(sql: string) {
+    const racing = { ...env, WRITE_ADMISSION_TOKEN: env.WRITE_ADMISSION_TOKEN, DB: { ...raw, prepare(sql: string) {
       const st = raw.prepare(sql);
-      if (!sql.startsWith("SELECT content, tags, source, vector_ids, workspace_id FROM entries")) return st;
+      if (!sql.startsWith("SELECT content, tags, source, created_at, vector_ids, workspace_id, pending_append_passages FROM entries")) return st;
       return { bind: (...a: unknown[]) => ({ first: async () => {
         const r = await st.bind(...a).first();
         if (!raced) { raced = true; await appendToEntry(env, "p2", "", "B 🎉 addition", [], "api", DEFAULTS, undefined, wctx, change, undefined, owner.personalWorkspaceId); }
@@ -90,6 +91,7 @@ describe("R2-1: short append does not stamp prior_length_utf16 from a stale read
       } }) };
     } } } as unknown as Env;
     await appendToEntry(racing, "p2", "", "A addition", [], "api", DEFAULTS, undefined, wctx, change, undefined, owner.personalWorkspaceId);
+    expect(raced).toBe(true);
     const undo = await revertEntry(env, owner, "p2", change, DEFAULTS, undefined, owner.personalWorkspaceId);
     expect(undo.status).toBe("reverted");
     const after = (await live("p2")).content as string;
@@ -110,8 +112,8 @@ describe("R2-2: a lost update does not delete the row's own live vector", () => 
       insert: vi.fn(async (vs: any[]) => { for (const v of vs) store.set(v.id, v); return { mutationId: "m" } as any; }),
       deleteByIds: vi.fn(async (ids: string[]) => { for (const i of ids) store.delete(i); return { mutationId: "m" } as any; }),
     });
-    const e = makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV(), VECTORIZE: vec,
-      AI: { run: vi.fn(async () => ({ data: [new Array(384).fill(0.1)] })) } as any }) as Env;
+    const e = sqlite.admitEnv(makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV(), VECTORIZE: vec,
+      AI: { run: vi.fn(async () => ({ data: [new Array(768).fill(0.1)] })) } as any })) as Env;
     await seed("v1", { content: "Bob's company note", workspaceId: companyWs, actorId: author.userId, vectorIds: ["v1"] });
     store.set("v1", { id: "v1", values: [0.1], metadata: { content: "Bob's company note", parentId: "v1" } });
     const raw = e.DB as any;
@@ -138,7 +140,7 @@ describe("R2-3: the writer's guard pins to the caller's authorization, not its o
   async function racingRouteRead(moveTo: string, id: string): Promise<Env> {
     const raw = env.DB as any;
     let moved = false;
-    return { ...env, DB: { ...raw, prepare(sql: string) {
+    return { ...env, WRITE_ADMISSION_TOKEN: env.WRITE_ADMISSION_TOKEN, DB: { ...raw, prepare(sql: string) {
       const st = raw.prepare(sql);
       if (moved || !/^SELECT id, workspace_id, actor_id, (content, tags, )?source FROM entries WHERE id = \? AND/.test(sql)) return st;
       return { bind: (...a: unknown[]) => ({ first: async () => {
@@ -181,7 +183,7 @@ describe("R2-3: the writer's guard pins to the caller's authorization, not its o
     await seed("w3", { content: "Bob's company note", workspaceId: companyWs, actorId: author.userId });
     const raw = env.DB as any;
     let moved = false;
-    const racing = { ...env, DB: { ...raw, prepare(sql: string) {
+    const racing = { ...env, WRITE_ADMISSION_TOKEN: env.WRITE_ADMISSION_TOKEN, DB: { ...raw, prepare(sql: string) {
       const st = raw.prepare(sql);
       if (moved || !/^SELECT id, workspace_id, actor_id FROM entries WHERE id = \? AND/.test(sql)) return st;
       return { bind: (...a: unknown[]) => ({ first: async () => {
@@ -213,7 +215,7 @@ describe("R2-4: legacy authorship belongs only to the tenant owner", () => {
     const moved = await moveEntry("L2", "personal", env, admin, { actorId: admin.userId, channel: "rest" });
     expect(moved.status).toBe("unshared");
     expect((await live("L2")).workspace_id).toBe(admin.personalWorkspaceId);
-    const res = await worker.fetch(req("GET", "/entry?id=L2", { token: adminTok }), env, ctx);
+    const res = await worker.fetch(req("POST", "/entry?id=L2", { token: adminTok }), env, ctx);
     const body = await res.json() as any;
     expect((body.entry ?? body).timeline.map((e: any) => e.event)).not.toContain("status_changed");
   });
@@ -226,7 +228,7 @@ describe("R2-5: a legitimate share mid-edit answers 409, not 404", () => {
     await seed("m1", { content: "my note" });
     const raw = env.DB as any;
     let moved = false;
-    const racing = { ...env, DB: { ...raw, prepare(sql: string) {
+    const racing = { ...env, WRITE_ADMISSION_TOKEN: env.WRITE_ADMISSION_TOKEN, DB: { ...raw, prepare(sql: string) {
       if (!moved && sql.startsWith("INSERT INTO entry_versions")) {
         moved = true;
         raw.prepare(`UPDATE entries SET workspace_id = ? WHERE id = 'm1'`).bind(companyWs).run();
@@ -247,7 +249,7 @@ describe("R2-6: version created_at is monotonic in seq", () => {
     const change = { actorId: owner.userId, channel: "rest" as const };
     const raw = env.DB as any;
     let raced = false;
-    const slowBatch = { ...env, DB: { ...raw, prepare: raw.prepare.bind(raw), batch: async (stmts: unknown[]) => {
+    const slowBatch = { ...env, WRITE_ADMISSION_TOKEN: env.WRITE_ADMISSION_TOKEN, DB: { ...raw, prepare: raw.prepare.bind(raw), batch: async (stmts: unknown[]) => {
       if (!raced) { raced = true; await new Promise(r => setTimeout(r, 5)); await appendToEntry(env, "n1", "", "other isolate", [], "api", DEFAULTS, undefined, wctx, change, undefined, owner.personalWorkspaceId); }
       return raw.batch(stmts);
     } } } as unknown as Env;
@@ -271,7 +273,7 @@ describe("R2-7: revertEntry writes into the author's personal memory after an un
     expect(r.status).toBe("updated");
     const raw = env.DB as any;
     let moved = false;
-    const racing = { ...env, DB: { ...raw, prepare(sql: string) {
+    const racing = { ...env, WRITE_ADMISSION_TOKEN: env.WRITE_ADMISSION_TOKEN, DB: { ...raw, prepare(sql: string) {
       if (!moved && sql.startsWith("INSERT INTO entry_versions")) {
         moved = true;
         raw.prepare(`UPDATE entries SET workspace_id = ? WHERE id = 'u9'`).bind(author.personalWorkspaceId).run();
@@ -295,7 +297,7 @@ describe("R3-2: an admin's unshare can take a member's already-private memory", 
     await seed("x2", { content: "Bob's note", workspaceId: companyWs, actorId: author.userId });
     const raw = env.DB as any;
     let fired = false;
-    const racing = { ...env, DB: { ...raw, prepare(sql: string) {
+    const racing = { ...env, WRITE_ADMISSION_TOKEN: env.WRITE_ADMISSION_TOKEN, DB: { ...raw, prepare(sql: string) {
       const st = raw.prepare(sql);
       if (fired || !/^SELECT id, workspace_id, actor_id, vector_ids, tags FROM entries WHERE id = \? AND/.test(sql)) return st;
       return { bind: (...a: unknown[]) => ({ first: async () => {
@@ -328,7 +330,7 @@ describe("R3-4: the owner does not inherit a member's private history of a syste
     const back = await moveEntry("dg1", "personal", env, owner, { actorId: owner.userId, channel: "rest" });
     expect(back.status).toBe("unshared");
     expect((await live("dg1")).workspace_id).toBe(owner.personalWorkspaceId);
-    const res = await worker.fetch(req("GET", "/entry?id=dg1"), env, ctx); // default token = the owner
+    const res = await worker.fetch(req("POST", "/entry?id=dg1"), env, ctx); // default token = the owner
     const body = await res.json() as any;
     expect((body.entry ?? body).timeline.map((e: any) => e.event)).not.toContain("status_changed");
   });
@@ -344,8 +346,8 @@ describe("R3-3: restoreRowVectors does not orphan the chunks of the appends that
       insert: vi.fn(async (vs: any[]) => { for (const v of vs) store.set(v.id, v); return { mutationId: "m" } as any; }),
       deleteByIds: vi.fn(async (ids: string[]) => { for (const i of ids) store.delete(i); return { mutationId: "m" } as any; }),
     });
-    const e = makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV(), VECTORIZE: vec,
-      AI: { run: vi.fn(async () => ({ data: [new Array(384).fill(0.1)] })) } as any }) as Env;
+    const e = sqlite.admitEnv(makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV(), VECTORIZE: vec,
+      AI: { run: vi.fn(async () => ({ data: [new Array(768).fill(0.1)] })) } as any })) as Env;
     const ws = owner.personalWorkspaceId;
     const wctx = { workspaceId: ws, actorId: owner.userId };
     const change = { actorId: owner.userId, channel: "rest" as const };

@@ -125,7 +125,7 @@ const CLUSTER_STATE = unit("cluster:state");
 /**
  * How similar the core pricing-cluster entries (the two contradiction
  * entries, plus decoy-machine and decoy-mirror) are to one another —
- * measured ~0.87 pairwise, comfortably above MIN_SIMILARITY (0.80) with
+ * measured ~0.87 pairwise, comfortably above MIN_SIMILARITY (0.82) with
  * headroom both above and below. Deliberately looser than the cluster
  * default (0.92 pull, ~0.99 pairwise): decoy-recent (below) needs to land
  * above the floor against ONE core member and below it against another, and
@@ -272,9 +272,9 @@ export function makeInsightFixture() {
     });
   }
 
-  const env = makeTestEnv(undefined, {
+  const env = sqlite.admitEnv(makeTestEnv(undefined, {
     DB: sqlite.db as any, VECTORIZE: vectorize, OAUTH_KV: makeMemoryKV(),
-  });
+  }));
 
   return {
     env, sqlite, all,
@@ -289,3 +289,19 @@ export function makeInsightFixture() {
     },
   };
 }
+
+/** 料金候補のseedと一致する原文引用。根拠の捏造・欠落は個別試験で別途検証する。 */
+export function pricingInsight(text: string): string {
+  return JSON.stringify({ insight: true, shape: "contradiction", text,
+    evidence: {
+      a: "flat at nine dollars a month",
+      b: "usage-based billing",
+    },
+  });
+}
+
+export const PRICING_INSIGHTS: Record<string, string> = {
+  "0": "月額9ドルの固定料金を採用していましたが、収益を取りこぼしていたため、利用量に応じた従量制へ切り替える判断に変更しています。",
+  "1": "請求額の予測しやすさを重視する方針から、実際の使用量を収益に反映させる考え方へ移行することを決めています。",
+  "2": "料金を一定に保つ以前の判断を改め、使われた分を課金する仕組みに変更することを決めています。",
+};

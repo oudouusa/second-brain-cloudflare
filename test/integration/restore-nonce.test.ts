@@ -25,7 +25,7 @@ describe.each([["/restore"], ["/undo"]])("POST %s with a nonce", (path) => {
     await forget("a");
     const stale = await trashNonce(t.env, "a");
     // The row the caller saw is purged; the id is reused and trashed again.
-    await t.env.DB.prepare(`DELETE FROM entries_trash WHERE id = 'a'`).run();
+    await t.sqlite.deleteFixtureRows(`DELETE FROM entries_trash WHERE id = 'a'`);
     t.seed("a", { content: "second life" });
     await forget("a");
 

@@ -27,7 +27,7 @@ let companyWs = "";
 beforeEach(async () => {
   resetDatabaseInit();
   sqlite = makeSqliteD1();
-  env = makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV() });
+  env = sqlite.admitEnv(makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV() }));
   await initializeDatabase(env);
   const roots = await ensureTenantBootstrap(env);
   companyWs = roots.companyWorkspaceId;
@@ -51,15 +51,15 @@ function vectorEnv() {
     // deleteEntryVectors reads metadata.parentId first (T-0089.1.1): answer from this store.
     getByIds: vi.fn(async (ids: string[]) => ids.filter(i => store.has(i)).map(i => store.get(i))) as any,
   });
-  const e = makeTestEnv(undefined, {
+  const e = sqlite.admitEnv(makeTestEnv(undefined, {
     DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV(), VECTORIZE: vec,
     // R20's batchEmbeds sends every chunk in one call: answer with one vector per requested text.
     AI: { run: vi.fn(async (_model: string, opts: any) => {
       if (failEmbed.on) throw new Error("AI transient");
       const texts = Array.isArray(opts?.text) ? opts.text : [opts?.text];
-      return { data: texts.map(() => new Array(384).fill(0.1)) };
+      return { data: texts.map(() => new Array(768).fill(0.1)) };
     }) } as any,
-  }) as Env;
+  })) as Env;
   const put = (id: string, content: string) => store.set(id, { id, values: [0.1], metadata: { content, parentId: id } });
   // Every vector of the entry, either id form (3.7's deterministic ids, or per-upload ids since T-0089.1.1).
   const under = (id: string) => [...store.keys()].filter(k => parentIdOfVectorId(k) === id);

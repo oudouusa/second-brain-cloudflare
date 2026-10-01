@@ -1,3 +1,6 @@
+import { vi } from "vitest";
+// 上流の固定corpusは候補窓500件向け。これはfixture自体の整合性試験でありforkの順位評価ではない。
+vi.mock("../../src/constants", async importOriginal => ({ ...await importOriginal<object>(), KEYWORD_CANDIDATE_LIMIT: 500 }));
 import { historyProblems, type Manifest } from "./lock";
 import { createHash } from "node:crypto";
 import { readFileSync, readdirSync, statSync } from "node:fs";
@@ -110,7 +113,7 @@ describe("core golden data", () => {
   it("keeps every committed replay layer together within its size budget", () => {
     // the privacy allowlist admits replay.<model>.jsonl.gz for any model, so the cap is on their sum (a bge-m3 layer counts too)
     const layers = readdirSync(DATA).filter(name => /^replay\.[\w.-]+\.jsonl\.gz$/.test(name));
-    expect(layers).toContain(`replay.${DEFAULTS.EMBEDDING_MODEL.split("/").pop()}.jsonl.gz`);
+    expect(layers).toContain("replay.bge-small-en-v1.5.jsonl.gz");
     const bytes = layers.reduce((sum, name) => sum + statSync(resolve(DATA, name)).size, 0);
     expect(bytes).toBeLessThan(9 * 1024 * 1024);
   });

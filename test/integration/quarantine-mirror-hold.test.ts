@@ -21,8 +21,9 @@ const live = async (env: Env, id: string) => (await env.DB.prepare(`SELECT * FRO
 async function setup() {
   resetDatabaseInit();
   sqlite = makeSqliteD1();
-  const env = makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV() }) as Env;
+  let env = sqlite.admitEnv(makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV() })) as Env;
   await initializeDatabase(env);
+  env = sqlite.admitEnv(env);
   const roots = await ensureTenantBootstrap(env);
   const writeCtx = { workspaceId: roots.ownerPersonalWorkspaceId, actorId: roots.ownerUserId };
   return { env, writeCtx };
@@ -36,7 +37,7 @@ describe("a synced email with an injected instruction is created held, with no v
     const { env, writeCtx } = await setup();
     const ms = makeMirrorStore(env, writeCtx, undefined, "email-gmail");
 
-    const before = sqlite.issued.length;
+    const before = sqlite.batches.length;
     const id = await ms.createEntry(INSTRUCTION_TEXT, [], "email-gmail");
 
     const row = await live(env, id);
@@ -47,7 +48,7 @@ describe("a synced email with an injected instruction is created held, with no v
     expect(getStatus(tags)).toBe("draft");
     // One batch (the INSERT plus the hold's own statements): no separate embed call, since a
     // held create is never vectorized.
-    expect(sqlite.issued.slice(before).filter(s => s === "BATCH")).toHaveLength(1);
+    expect(sqlite.batches.slice(before)).toHaveLength(1);
   });
 });
 

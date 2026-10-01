@@ -15,10 +15,10 @@ describe("user-edited marker", () => {
   beforeEach(async () => {
     resetDatabaseInit();
     sqlite = makeSqliteD1();
-    env = makeTestEnv(undefined, {
+    env = sqlite.admitEnv(makeTestEnv(undefined, {
       DB: sqlite.db as any, OAUTH_KV: makeMemoryKV(), VECTORIZE: makeVectorizeMock(),
-      AI: { run: vi.fn().mockResolvedValue({ data: [new Array(384).fill(0.1)] }) } as unknown as Ai,
-    }) as Env;
+      AI: { run: vi.fn().mockResolvedValue({ data: [new Array(768).fill(0.1)] }) } as unknown as Ai,
+    })) as Env;
     await initializeDatabase(env);
   });
   afterEach(() => sqlite.close());

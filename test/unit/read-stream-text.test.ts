@@ -26,6 +26,19 @@ function concatBytes(...parts: Uint8Array[]): Uint8Array {
 }
 
 describe("readStreamText()", () => {
+  it("途中の読取失敗でもロックを解放し、元のエラーを返す", async () => {
+    const failure = new Error("synthetic read failure");
+    let pulls = 0;
+    const stream = new ReadableStream({
+      pull(controller) {
+        if (pulls++ === 0) controller.enqueue(new TextEncoder().encode('data: {"response":"partial"}\n'));
+        else controller.error(failure);
+      },
+    });
+    await expect(readStreamText(stream)).rejects.toBe(failure);
+    expect(stream.locked).toBe(false);
+  });
+
   it("keeps literal [DONE] text inside a JSON payload (response shape)", async () => {
     const input = 'data: {"response":"Keep [DONE] in this sentence."}\n\n';
     expect(await readStreamText(new Response(input).body!)).toBe("Keep [DONE] in this sentence.");
@@ -52,6 +65,7 @@ describe("readStreamText()", () => {
     const splitAt = 20;
     const stream = streamFromChunks([bytes.slice(0, splitAt), bytes.slice(splitAt)]);
     expect(await readStreamText(stream)).toBe("the quick brown fox jumps");
+    expect(stream.locked).toBe(false);
   });
 
   it("reassembles a single SSE line split across three chunks", async () => {

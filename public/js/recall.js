@@ -32,12 +32,15 @@ function extractChatChunkText(d) {
   return typeof content === 'string' ? content : ''
 }
 
-function consumeChatSseLine(line, onText) {
+function consumeChatSseLine(line, onText, onComplete) {
   if (!line.startsWith('data:')) return
   // SSE permits exactly one optional space after the field colon.
   const payload = line.slice(line.startsWith('data: ') ? 6 : 5)
   // Sentinel = the WHOLE payload, never a substring; trimEnd tolerates CRLF.
-  if (payload.trimEnd() === '[DONE]') return
+  if (payload.trimEnd() === '[DONE]') {
+    if (onComplete) onComplete()
+    return
+  }
   try {
     const d = JSON.parse(payload)
     const text = extractChatChunkText(d)
@@ -60,13 +63,13 @@ function consumeChatSseLine(line, onText) {
  * consumeChatSseLine once the stream ends. Mirrors the buffering loop in
  * src/lib/ai.ts's readStreamText.
  */
-function feedChatStream(buffer, decodedChunk, onText) {
+function feedChatStream(buffer, decodedChunk, onText, onComplete) {
   buffer += decodedChunk
   const lines = buffer.split('\n')
   // The last element is either "" (buffer ended on a newline) or an
   // incomplete line — either way it stays buffered for the next call.
   buffer = lines.pop() ?? ''
-  for (const line of lines) consumeChatSseLine(line, onText)
+  for (const line of lines) consumeChatSseLine(line, onText, onComplete)
   return buffer
 }
 
@@ -101,13 +104,19 @@ async function sendRecall(retryQuery) {
     // always outrank expanded ones (worker applies a graph-distance penalty)
     // full=1: the dashboard renders whole memories in its cards, so it opts out
     // of the snippet shortening that keeps API/agent responses small
-    const params = new URLSearchParams({ query, topK: '5', hops: '1', full: '1' })
-    if (selectedTag) params.set('tag', selectedTag)
-    if (selectedProject) params.set('project', selectedProject)
-    const layerSel = document.getElementById('recall-layer')
-    const layer = layerSel ? layerSel.value : ''
-    if (layer) params.set('workspace', layer)
-    const recallRes = await fetch(`${WORKER_URL}/recall?${params}`, { headers: { Authorization: `Bearer ${AUTH_TOKEN}` } })
+    // /chat below already turns these memories into the user-facing answer. Asking
+    // /recall to synthesize the same full memories first would pay for a second LLM
+    // pass and then send that generated text back into /chat as more input.
+    const recallBody = { query, topK: 5, hops: 1, full: true, synthesize: false }
+    if (selectedTag) recallBody.tag = selectedTag
+    if (selectedProject) recallBody.project = selectedProject
+    const layer = document.getElementById("recall-layer")?.value
+    if (layer) recallBody.workspace = layer
+    const recallRes = await fetch(`${WORKER_URL}/recall`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${AUTH_TOKEN}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(recallBody),
+    })
     const data = await recallRes.json()
     // Server/auth errors must not render as "no results" — let the catch handle them
     if (!recallRes.ok || !data.ok) {
@@ -176,13 +185,24 @@ async function sendRecall(retryQuery) {
       const res = await fetch(`${WORKER_URL}/chat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${AUTH_TOKEN}` },
-        body: JSON.stringify({ query, memories }),
+        body: JSON.stringify({ query, memories,
+          workspace: (!layer || layer === 'personal') && data.results.every(m => m.workspace === 'personal') ? 'personal' : undefined }),
       })
 
+      if (!res.ok || !res.body) throw new Error("Answer generation is temporarily unavailable")
+      const usesChatGpt = res.headers.get('X-Second-Brain-AI-Provider') === 'chatgpt'
+      if (usesChatGpt) {
+        const usage = document.createElement('div')
+        usage.className = 'ex-a-provider'
+        usage.innerHTML = `${escHtml(t('recall.chatgptPlan'))} · <a href="https://chatgpt.com/settings/usage" target="_blank" rel="noopener noreferrer">${escHtml(t('recall.manageUsage'))}</a>`
+        answerBubble.prepend(usage)
+      }
       const reader = res.body.getReader()
       const decoder = new TextDecoder()
       let fullText = ''
       let buffer = ''
+      let completed = false
+      const onComplete = () => { completed = true }
       const onText = (chunk) => {
         fullText += chunk
         answerEl.textContent = fullText
@@ -193,13 +213,19 @@ async function sendRecall(retryQuery) {
           if (done) break
           // { stream: true } holds back a trailing partial multi-byte
           // sequence until the bytes that complete it arrive next read.
-          buffer = feedChatStream(buffer, decoder.decode(value, { stream: true }), onText)
+          buffer = feedChatStream(buffer, decoder.decode(value, { stream: true }), onText, onComplete)
           msgs.scrollTop = msgs.scrollHeight
         }
         // Flush any bytes the decoder was holding back, then process a
         // final line that may have arrived with no trailing newline.
         buffer += decoder.decode()
-        if (buffer) consumeChatSseLine(buffer, onText)
+        if (buffer) consumeChatSseLine(buffer, onText, onComplete)
+        // DOから転送したstreamの途中エラーは、HTTPでは単なるEOFになる場合がある。
+        // 直接経路はserverが検証して出した完了通知まで確認し、部分回答を残さない。
+        if (usesChatGpt && !completed) throw new Error('ChatGPT response did not complete')
+      } catch (error) {
+        if (usesChatGpt) answerBubble.remove()
+        throw error
       } finally {
         reader.releaseLock()
       }

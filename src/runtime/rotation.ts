@@ -4,10 +4,8 @@ import { initializeDatabase } from "../db/init";
 /**
  * Workspace rotation for the nightly maintenance passes (v3 Team Edition).
  *
- * The free plan's real ceiling is 1,000 D1 calls per invocation, but this codebase
- * holds itself to a self-imposed budget of ~50 for cost and 10 ms-CPU reasons, and
- * the nightly passes already spend ~30 of them on a single-user brain. Scanning the
- * whole corpus per night grows
+ * Free-plan Workers allow ~50 D1 queries per invocation and the nightly passes already
+ * spend ~30 of them on a single-user brain. Scanning the whole corpus per night grows
  * linearly with workspaces, so instead each invocation processes ONE workspace's slice
  * behind this round-robin cursor, keeping per-invocation cost roughly flat as teams grow.
  * The trade-off is coverage latency: the whole deployment cycles every K nights, where
@@ -36,39 +34,21 @@ export async function nextWorkspace(env: Env): Promise<string | null> {
   try {
     await initializeDatabase(env);
 
-    const cursor = await env.DB.prepare(
-      `SELECT workspace_id FROM maintenance_cursor WHERE id = ?`,
-    ).bind(1).first<{ workspace_id: string }>();
-    const current = cursor?.workspace_id ?? "";
-
-    const { results } = await env.DB.prepare(
-      // scope-exempt: cron: nextWorkspace takes no identity and has no caller — its whole job is to enumerate EVERY workspace in turn, so a scope clause would break the ring rather than secure it; `workspace_id > ?` is the cursor, not a filter, and one workspace id comes back, never a row
-      `SELECT DISTINCT workspace_id FROM entries WHERE workspace_id > ? ORDER BY workspace_id LIMIT 1`,
-    ).bind(current).all();
-    let next = results[0]?.workspace_id as string | undefined;
-
-    if (next === undefined) {
-      // Past the end of the ring (or an empty corpus): wrap to the first workspace.
-      const wrap = await env.DB.prepare(
-        // scope-exempt: cron: ring wrap-around; returns one workspace id, never a row
-        `SELECT DISTINCT workspace_id FROM entries ORDER BY workspace_id LIMIT 1`,
-      ).all();
-      next = wrap.results[0]?.workspace_id as string | undefined;
-      if (next === undefined) return null;
-    }
-
-    const updated = await env.DB.prepare(
-      `UPDATE maintenance_cursor SET workspace_id = ?, advanced_at = ? WHERE id = ?`,
-    ).bind(next, Date.now(), 1).run();
-    if (((updated.meta as Record<string, unknown> | undefined)?.changes ??
-        (updated.meta as Record<string, unknown> | undefined)?.rows_written ?? 0) === 0) {
-      // The row was never seeded — a deployment whose cron fired before its first
-      // request, so tenancy bootstrap has not run yet. Seed it rather than silently
-      // re-processing the same slice every night forever.
-      await env.DB.prepare(
-        `INSERT INTO maintenance_cursor (id, workspace_id, advanced_at) VALUES (?, ?, ?) ON CONFLICT DO NOTHING`,
-      ).bind(1, next, Date.now()).run();
-    }
+    // scope-exempt: cronの巡回位置だけを返す。二つの索引seekは各LIMIT 1で本文を取得しない。
+    const row = await env.DB.prepare(
+      `SELECT COALESCE(
+        (SELECT workspace_id FROM entries
+          WHERE workspace_id > COALESCE((SELECT workspace_id FROM maintenance_cursor WHERE id = 1), '')
+          ORDER BY workspace_id LIMIT 1),
+        (SELECT workspace_id FROM entries ORDER BY workspace_id LIMIT 1)
+      ) AS workspace_id`,
+    ).first<{ workspace_id: string | null }>();
+    const next = row?.workspace_id;
+    if (next === null || next === undefined) return null;
+    await env.DB.prepare(
+      `INSERT INTO maintenance_cursor (id, workspace_id, advanced_at) VALUES (1, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET workspace_id = excluded.workspace_id, advanced_at = excluded.advanced_at`,
+    ).bind(next, Date.now()).run();
     return next;
   } catch (e) {
     console.error("Maintenance rotation read failed; processing the whole corpus (non-fatal):", e);

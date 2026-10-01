@@ -3,7 +3,12 @@ import worker from "../../src/index";
 import { makeTestDb, makeTestEnv, makeVectorizeMock } from "../helpers/make-env";
 import { req } from "../helpers/make-request";
 import type { Env } from "../../src/env";
+import { makeSqliteD1 } from "../helpers/sqlite-d1";
+import { initializeDatabase, resetDatabaseInit } from "../../src/db/init";
+import { ensureTenantBootstrap } from "../../src/lib/tenancy";
 import { D1Mock } from "../helpers/d1-mock";
+import { loadHistory } from "../../src/memory/versions";
+import { resolveIdentityByUserId } from "../../src/lib/identity";
 
 const ctx = { waitUntil: (_: Promise<any>) => {} } as any;
 
@@ -26,14 +31,14 @@ function makeSseStream(response: string) {
 }
 
 // Prompt-aware AI stub that distinguishes 3 call types:
-//   1. embed  — model === "@cf/baai/bge-small-en-v1.5" → return vector
+//   1. embed  — model === "@cf/google/embeddinggemma-300m" → return vector
 //   2. merge  — prompt contains "Choose exactly one action" → return mergeResponse
 //   3. classify — prompt contains "Classify this memory" → return classifyResponse
 function makePromptAwareAI(mergeResponse: string, classifyResponse: string): Ai {
   return {
     run: vi.fn().mockImplementation(async (model: string, opts: any) => {
-      if (model === "@cf/baai/bge-small-en-v1.5")
-        return { data: [new Array(384).fill(0.1)] };
+      if (model === "@cf/google/embeddinggemma-300m")
+        return { data: [new Array(768).fill(0.1)] };
       const prompt: string = (opts?.messages ?? []).map((m: any) => m.content).join("\n");
       if (prompt.includes("Choose exactly one action")) {
         return makeSseStream(mergeResponse);
@@ -51,8 +56,8 @@ function makePromptAwareAI(mergeResponse: string, classifyResponse: string): Ai 
 function makeMergeAI(response: string): Ai {
   return {
     run: vi.fn().mockImplementation(async (model: string) => {
-      if (model === "@cf/baai/bge-small-en-v1.5")
-        return { data: [new Array(384).fill(0.1)] };
+      if (model === "@cf/google/embeddinggemma-300m")
+        return { data: [new Array(768).fill(0.1)] };
       return new ReadableStream({
         start(c) {
           c.enqueue(new TextEncoder().encode(`data: {"response":${JSON.stringify(response)}}\n\n`));
@@ -77,7 +82,7 @@ function seedEntry(db: D1Mock, id = "existing-id", content = "I use VSCode", vec
   });
 }
 
-describe("POST /capture — smart merge (flagged band 0.85–0.95)", () => {
+describe("POST /capture — smart merge (calibrated flagged band 0.80–0.98)", () => {
   let db: D1Mock;
   let env: Env;
 
@@ -87,30 +92,36 @@ describe("POST /capture — smart merge (flagged band 0.85–0.95)", () => {
 
   // ── Replace ─────────────────────────────────────────────────────────────────
 
-  it("returns action=replaced, updates existing entry, does not insert a new one", async () => {
-    seedEntry(db);
-    env = makeTestEnv(db, {
-      VECTORIZE: makeVectorizeMock({
-        query: vi.fn().mockResolvedValue({
-          matches: [{ id: "existing-id", score: 0.88, metadata: { parentId: "existing-id" } }],
-        }),
-      }),
-      AI: makeMergeAI('{"action":"replace","target_id":"existing-id"}'),
-    });
-
-    const res = await worker.fetch(
-      req("POST", "/capture", { body: { content: "I switched to Cursor IDE" } }),
-      env, ctx
-    );
-
-    expect(res.status).toBe(200);
-    const data = await res.json() as any;
-    expect(data.ok).toBe(true);
-    expect(data.action).toBe("replaced");
-    expect(data.id).toBe("existing-id");
-
-    expect(db.entries).toHaveLength(1);
-    expect(db.entries[0].content).toBe("I switched to Cursor IDE");
+  it.each(["replace", "merge"] as const)("%sは現行行を更新し、entry_versionsに変更前の本文を保存する", async action => {
+    const sqlite = makeSqliteD1();
+    const pending = makeCtx();
+    resetDatabaseInit();
+    const prior = "I prefer dark mode";
+    const merged = "I prefer dark mode in all apps, especially at night";
+    const incoming = "I like dark mode especially at night";
+    const e = sqlite.admitEnv(makeTestEnv(undefined, {
+      DB: sqlite.db as unknown as D1Database,
+      VECTORIZE: makeVectorizeMock({ query: vi.fn().mockResolvedValue({ matches: [
+        { id: "existing-id", score: 0.88, metadata: { parentId: "existing-id" } },
+      ] }) }),
+      AI: makeMergeAI(JSON.stringify({ action, target_id: "existing-id", merged_content: merged })),
+    }));
+    try {
+      await initializeDatabase(e);
+      const roots = await ensureTenantBootstrap(e);
+      sqlite.seed({ id: "existing-id", content: prior, tags: ["work"], createdAt: Date.now() - 1000,
+        vectorIds: ["existing-id"], workspaceId: roots.ownerPersonalWorkspaceId });
+      const response = await worker.fetch(req("POST", "/capture", { body: { content: incoming } }), e, pending.ctx);
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({ ok: true, action: action === "merge" ? "merged" : "replaced", id: "existing-id" });
+      expect(sqlite.rows()).toHaveLength(1);
+      expect(sqlite.rows()[0].content).toBe(action === "merge" ? merged : incoming);
+      const versions = (await e.DB.prepare("SELECT seq, content, reason FROM entry_versions WHERE entry_id = ?").bind("existing-id").all()).results;
+      expect(versions).toEqual([expect.objectContaining({ seq: 1, reason: action })]);
+      const history = await loadHistory(e, (await resolveIdentityByUserId(e, roots.ownerUserId))!,
+        { id: "existing-id", content: String(sqlite.rows()[0].content) }, 20);
+      expect(history.text(1)).toBe(prior);
+    } finally { await pending.drain(); sqlite.close(); }
   });
 
   it("replace: deletes old vectors and re-embeds with new content", async () => {
@@ -134,8 +145,6 @@ describe("POST /capture — smart merge (flagged band 0.85–0.95)", () => {
     );
 
     expect(insertMock).toHaveBeenCalledOnce();
-    // Only the stale chunk is deleted; the reused "existing-id" vector survives.
-    // Per-upload vector ids (T-0089.1.1): the re-embed never reuses an old id, so every old one is retired.
     expect(deleteByIdsMock).toHaveBeenCalledWith(["existing-id", "existing-id-chunk-1"]);
   });
 
@@ -158,32 +167,6 @@ describe("POST /capture — smart merge (flagged band 0.85–0.95)", () => {
   });
 
   // ── Merge ───────────────────────────────────────────────────────────────────
-
-  it("returns action=merged, updates existing entry with merged_content, no new entry", async () => {
-    seedEntry(db, "existing-id", "I prefer dark mode");
-    env = makeTestEnv(db, {
-      VECTORIZE: makeVectorizeMock({
-        query: vi.fn().mockResolvedValue({
-          matches: [{ id: "existing-id", score: 0.88, metadata: { parentId: "existing-id" } }],
-        }),
-      }),
-      AI: makeMergeAI('{"action":"merge","target_id":"existing-id","merged_content":"I prefer dark mode in all apps, especially at night"}'),
-    });
-
-    const res = await worker.fetch(
-      req("POST", "/capture", { body: { content: "I like dark mode especially at night" } }),
-      env, ctx
-    );
-
-    expect(res.status).toBe(200);
-    const data = await res.json() as any;
-    expect(data.ok).toBe(true);
-    expect(data.action).toBe("merged");
-    expect(data.id).toBe("existing-id");
-
-    expect(db.entries).toHaveLength(1);
-    expect(db.entries[0].content).toBe("I prefer dark mode in all apps, especially at night");
-  });
 
   it("merge: embeds merged_content (not the raw new content)", async () => {
     seedEntry(db, "existing-id", "I prefer dark mode");
@@ -320,8 +303,8 @@ describe("POST /capture — smart merge (flagged band 0.85–0.95)", () => {
     expect(db.entries.find(e => e.id === "existing-id")?.content).toBe("I use VSCode");
     // The new content was stored as its own entry (keep_both).
     expect(db.entries.some(e => e.content === "I switched to Cursor")).toBe(true);
-    // The target's vectors were never deleted.
-    expect(deleteByIdsMock).not.toHaveBeenCalled();
+    // Cleanup may remove a partially accepted new vector, never the target's live id.
+    expect(deleteByIdsMock.mock.calls.flatMap(call => call[0])).not.toContain("existing-id");
   });
 
   it("merge: returns ok:true even when deleteByIds throws", async () => {
@@ -471,15 +454,15 @@ describe("POST /capture — smart merge (flagged band 0.85–0.95)", () => {
 
   // ── Existing functionality unaffected ─────────────────────────────────────────
 
-  it("blocked (≥0.95): still blocked, no LLM call for merge", async () => {
+  it("blocked (≥0.98): still blocked, no LLM call for merge", async () => {
     const aiRunMock = vi.fn().mockImplementation(async (model: string) => {
-      if (model === "@cf/baai/bge-small-en-v1.5") return { data: [new Array(384).fill(0.1)] };
+      if (model === "@cf/google/embeddinggemma-300m") return { data: [new Array(768).fill(0.1)] };
       throw new Error("LLM should not be called for blocked entries");
     });
     env = makeTestEnv(db, {
       VECTORIZE: makeVectorizeMock({
         query: vi.fn().mockResolvedValue({
-          matches: [{ id: "dup", score: 0.97, metadata: { parentId: "dup" } }],
+          matches: [{ id: "dup", score: 0.99, metadata: { parentId: "dup" } }],
         }),
       }),
       AI: { run: aiRunMock } as unknown as Ai,

@@ -49,7 +49,7 @@ const d1Tally = { ms: 0 };
 /** One vector per input text, the shape Workers AI returns for a batch. */
 function aiMock(): Ai {
   return { run: async (model: string, input: any) => {
-    if (model.startsWith("@cf/baai/bge")) {
+    if (model === "@cf/google/embeddinggemma-300m") {
       const texts = Array.isArray(input?.text) ? input.text : [input?.text];
       return { data: texts.map(() => Array.from({ length: 384 }, (_, i) => (i % 7) / 10)) };
     }
@@ -61,10 +61,10 @@ async function captureOnce(content: string): Promise<{ total: number; d1: number
   resetDatabaseInit();
   const sqlite = makeSqliteD1();
   const kv = makeMemoryKV();
-  const boot = makeTestEnv(undefined, { DB: sqlite.db as unknown as D1Database, OAUTH_KV: kv });
+  const boot = sqlite.admitEnv(makeTestEnv(undefined, { DB: sqlite.db as unknown as D1Database, OAUTH_KV: kv }));
   await initializeDatabase(boot);
   await ensureTenantBootstrap(boot);
-  const env: Env = makeTestEnv(undefined, { DB: sqlite.db as unknown as D1Database, OAUTH_KV: kv, AI: aiMock(), VECTORIZE: makeVectorizeMock() });
+  const env: Env = sqlite.admitEnv(makeTestEnv(undefined, { DB: sqlite.db as unknown as D1Database, OAUTH_KV: kv, AI: aiMock(), VECTORIZE: makeVectorizeMock() }));
   const deferred: Promise<unknown>[] = [];
   const ctx = { waitUntil: (p: Promise<unknown>) => deferred.push(p) } as unknown as ExecutionContext;
   const request = new Request("http://localhost/capture", {

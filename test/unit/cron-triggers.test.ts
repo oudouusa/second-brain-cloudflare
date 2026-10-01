@@ -13,7 +13,8 @@ import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { INTEGRATION_SYNC_CRON } from "../../src/integrations/mirror";
-import { INSIGHT_ACCRUAL_CRON, INSIGHT_TEAM_WEEKLY_CRON, INSIGHT_WEEKLY_CRON } from "../../src/insight/schedule";
+import { INSIGHT_ACCRUAL_CRON, INSIGHT_WEEKLY_CRON, INSIGHT_TEAM_WEEKLY_CRON } from "../../src/insight/schedule";
+import * as workerEntrypoint from "../../src/index";
 
 const ROOT = resolve(import.meta.dirname, "../..");
 
@@ -94,6 +95,10 @@ function canCollide(a: string, b: string): boolean {
 }
 
 describe("cron triggers", () => {
+  it("only exposes valid handlers from the Worker entrypoint", () => {
+    expect(Object.keys(workerEntrypoint).sort()).toEqual(["McpExecutor", "default", "resolveExternalToken"]);
+  });
+
   it("configures the integration schedule the worker routes on", () => {
     expect(configuredCrons()).toContain(INTEGRATION_SYNC_CRON);
   });
@@ -104,8 +109,8 @@ describe("cron triggers", () => {
     expect(maintenance.length).toBeGreaterThan(0);
   });
 
-  // This deployment is AT five as of the team insight pass (spec 4.5) — the
-  // last slot the free plan allows. The assertion stays `<= 5` rather than
+  // This deployment is AT five; Team insights reuse Sunday's integration
+  // invocation rather than adding a sixth. The assertion stays `<= 5` rather than
   // `=== 5` because the ceiling is the fact worth pinning, but the message
   // says where we are, so the next person adding a schedule reads "there is
   // no sixth slot; displace one" instead of "five is a comfortable margin".
@@ -129,14 +134,16 @@ describe("cron triggers", () => {
     }
   });
 
-  it("configures both insight schedules the worker routes on", () => {
+  it("configures all upstream insight schedules the worker routes on", () => {
     const crons = configuredCrons();
     expect(crons).toContain(INSIGHT_ACCRUAL_CRON);
     expect(crons).toContain(INSIGHT_WEEKLY_CRON);
+    expect(crons).toContain(INSIGHT_TEAM_WEEKLY_CRON);
   });
 
-  it("configures the team insight schedule the worker routes on", () => {
-    expect(configuredCrons()).toContain(INSIGHT_TEAM_WEEKLY_CRON);
+  it("configures one shared maintenance schedule without the old split trigger", () => {
+    expect(configuredCrons()).toContain("0 1 * * *");
+    expect(configuredCrons()).not.toContain("10 1 * * *");
   });
 
   // The personal weekly pass and the team one are two budgets on the same day

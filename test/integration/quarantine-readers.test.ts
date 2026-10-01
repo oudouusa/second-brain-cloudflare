@@ -66,7 +66,7 @@ describe("a held row is never in the Prompt Capsule, even with status:canonical 
   it("drops the held slot and keeps the unheld one", async () => {
     resetDatabaseInit();
     sq = makeSqliteD1();
-    const env = makeTestEnv(undefined, { DB: sq.db as unknown as D1Database, OAUTH_KV: makeMemoryKV(), AUTH_TOKEN: "test-token" });
+    const env = sq.admitEnv(makeTestEnv(undefined, { DB: sq.db as unknown as D1Database, OAUTH_KV: makeMemoryKV(), AUTH_TOKEN: "test-token" }));
     const identity = await resolveIdentityFromToken("test-token", env);
     if (!identity) throw new Error("owner identity was not bootstrapped");
     const seed = async (id: string, content: string, tags: string[]) => {
@@ -105,7 +105,7 @@ describe("a held row is never an insight candidate or a graph-pass input", () =>
       getByIds: vi.fn().mockImplementation(async (ids: string[]) => ids.map(id => ({ id, values: new Array(384).fill(0.1) }))),
       query: vi.fn().mockResolvedValue({ matches }),
     });
-    return { env: makeTestEnv(undefined, { DB: s.db as any, VECTORIZE: vectorize, OAUTH_KV: makeMemoryKV() }), vectorize };
+    return { env: s.admitEnv(makeTestEnv(undefined, { DB: s.db as any, VECTORIZE: vectorize, OAUTH_KV: makeMemoryKV() })), vectorize };
   }
   const oldMatch = {
     id: "vec-old-1", score: 0.87,

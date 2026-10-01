@@ -20,15 +20,15 @@ describe("held drafts", () => {
     resetDatabaseInit();
     const sqlite = makeSqliteD1();
     let n = 0;
-    const env = makeTestEnv(undefined, {
+    const env = sqlite.admitEnv(makeTestEnv(undefined, {
       DB: sqlite.db as any, OAUTH_KV: makeMemoryKV(),
       VECTORIZE: makeVectorizeMock({ query: vi.fn(async (): Promise<any> => {
         const held = (sqlite.rows() as any[]).filter(r => String(r.tags).includes('"synthesized"'));
         // Each new digest resembles the previous drafts (flagged) and the user row.
-        return { matches: [...held.map(r => ({ id: r.id, score: 0.9, metadata: { parentId: r.id } })), { id: "user-row", score: 0.8, metadata: { parentId: "user-row" } }] };
+        return { matches: [...held.map(r => ({ id: r.id, score: 0.9, metadata: { parentId: r.id } })), { id: "user-row", score: 0.7, metadata: { parentId: "user-row" } }] };
       }) }),
       AI: { run: vi.fn(async (model: string, opts: any) => {
-        if (model.startsWith("@cf/baai/bge")) return { data: [new Array(384).fill(0.1)] };
+        if (model === "@cf/google/embeddinggemma-300m") return { data: [new Array(768).fill(0.1)] };
         const p = String(opts?.messages?.[0]?.content ?? "");
         if (p.includes("Choose exactly one action")) return stream('{"action":"contradiction","conflicting_id":"user-row","reason":"changed"}');
         if (p.includes("checking if a new memory contradicts")) return stream('{"contradicts":true,"conflicting_id":"user-row","reason":"changed"}');
@@ -36,13 +36,13 @@ describe("held drafts", () => {
         if (p.includes("write a single cohesive paragraph")) return stream(`Digest of the work memories, run ${++n}.`);
         return stream("3");
       }) } as any,
-    }) as Env;
+    })) as Env;
     await initializeDatabase(env);
     sqlite.seed({ id: "user-row", content: "We ship the work plan in May", createdAt: now - 5 * DAY, tags: ["decisions"], source: "api" });
-    for (let i = 0; i < 12; i++) sqlite.seed({ id: `w-${i}`, content: `Memory about work number ${i}`, createdAt: now - 200 * DAY + i, tags: ["work"] });
+    for (let i = 0; i < 12; i++) sqlite.seed({ id: `w-${i}`, content: `Memory about work number ${i}`, createdAt: now - 200 * DAY + i, tags: ["rocket-project"] });
     if (withSecondTag) for (let i = 0; i < 12; i++) sqlite.seed({ id: `h-${i}`, content: `Memory about home number ${i}`, createdAt: now - 200 * DAY + i, tags: ["home"] });
     const nightly = async () => { const r = await runNightlyCompression(env, ctx); now += 2 * DAY; return r; };
-    const cycle = async () => { await compressTag("work", env, ctx); now += 2 * DAY; };
+    const cycle = async () => { await compressTag("rocket-project", env, ctx); now += 2 * DAY; };
     const held = () => (sqlite.rows() as any[]).filter(r => String(r.tags).includes('"conflict-held"'));
     return { sqlite, env, cycle, nightly, held, calls: () => n };
   }
@@ -60,12 +60,12 @@ describe("held drafts", () => {
     ["edits the held draft", (sqlite: any, id: string) => sqlite.db.prepare(`UPDATE entries SET tags = json_insert(tags, '$[#]', 'user-edited') WHERE id = ?`).bind(id).run()],
     ["confirms the held draft to canonical", (sqlite: any, id: string) => sqlite.db.prepare(`UPDATE entries SET tags = json_insert(tags, '$[#]', 'status:canonical') WHERE id = ?`).bind(id).run()],
     ["deprecates the held draft", (sqlite: any, id: string) => sqlite.db.prepare(`UPDATE entries SET tags = json_insert(tags, '$[#]', 'status:deprecated') WHERE id = ?`).bind(id).run()],
-    ["forgets the held draft", (sqlite: any, id: string) => sqlite.db.prepare(`DELETE FROM entries WHERE id = ?`).bind(id).run()],
+    ["forgets the held draft", (sqlite: any, id: string) => sqlite.deleteFixtureRows(`DELETE FROM entries WHERE id = ?`, id)],
   ])("H2: once the user %s, the next cycle digests normally again", async (_what, release) => {
     const { sqlite, cycle, held, calls } = await world();
     await cycle(); await cycle();
     expect(calls()).toBe(1);
-    release(sqlite, held()[0].id);
+    await release(sqlite, held()[0].id);
     await cycle();
     expect(calls()).toBe(2);
     sqlite.close();
@@ -76,19 +76,19 @@ describe("held drafts", () => {
     vi.spyOn(Date, "now").mockImplementation(() => now);
     resetDatabaseInit();
     const sqlite = makeSqliteD1();
-    const env = makeTestEnv(undefined, {
+    const env = sqlite.admitEnv(makeTestEnv(undefined, {
       DB: sqlite.db as any, OAUTH_KV: makeMemoryKV(),
       VECTORIZE: makeVectorizeMock({ query: vi.fn(async (): Promise<any> => ({ matches: [] })) }),
       AI: { run: vi.fn(async (model: string, opts: any) => {
-        if (model.startsWith("@cf/baai/bge")) return { data: [new Array(384).fill(0.1)] };
+        if (model === "@cf/google/embeddinggemma-300m") return { data: [new Array(768).fill(0.1)] };
         // The person shares one source to another workspace while the digest is being written.
         sqlite.db.prepare(`UPDATE entries SET workspace_id = 'company-ws' WHERE id = 'w-0'`).run();
         return opts?.stream ? stream("A digest of the work memories.") : { response: "3" };
       }) } as any,
-    }) as Env;
+    })) as Env;
     await initializeDatabase(env);
-    for (let i = 0; i < 12; i++) sqlite.seed({ id: `w-${i}`, content: `Memory about work number ${i}`, createdAt: now - 200 * DAY + i, tags: ["work"] });
-    await compressTag("work", env, ctx);
+    for (let i = 0; i < 12; i++) sqlite.seed({ id: `w-${i}`, content: `Memory about work number ${i}`, createdAt: now - 200 * DAY + i, tags: ["rocket-project"] });
+    await compressTag("rocket-project", env, ctx);
     const rows = sqlite.rows() as any[];
     const moved = rows.find(r => r.id === "w-0");
     expect(rows.filter(r => String(r.tags).includes('"rolled-up"')).length).toBe(11);
@@ -127,7 +127,7 @@ describe("held drafts", () => {
   it("the nightly run digests again for a tag whose held draft the person edited, and only that tag", async () => {
     const { sqlite, nightly, held, calls } = await world(true);
     await nightly();
-    const workHeld = held().find(r => String(r.tags).includes('"work"'))!;
+    const workHeld = held().find(r => String(r.tags).includes('"rocket-project"'))!;
     sqlite.db.prepare(`UPDATE entries SET tags = json_insert(tags, '$[#]', 'user-edited') WHERE id = ?`).bind(workHeld.id).run();
     await nightly();
     expect(calls()).toBe(3); // work digested again, home still held

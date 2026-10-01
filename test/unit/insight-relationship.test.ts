@@ -38,7 +38,7 @@ const A = { content: "The vendor contract renewal was signed on Tuesday under th
 const B = { content: "We cancelled the Halloway renewal after the pricing review came back." };
 /** Names something only A has and something only B has, so it clears the vocabulary floor. */
 const GOOD_TEXT =
-  "You signed the vendor contract on Tuesday and then cancelled it once the pricing review came back, so the commitment held for less than a week.";
+  "火曜日に契約更新へ署名しましたが、その後の料金見直しを受けて更新を取り消しており、契約方針が反転しています。";
 
 describe("parseRelationship", () => {
   it("reads the type and which side is the source", () => {
@@ -91,7 +91,7 @@ describe("parseRelationship", () => {
 describe("reasonOverPair carries the relationship", () => {
   it("returns it alongside an accepted insight", async () => {
     const env = makeTestEnv(makeTestDb(), {
-      AI: makeAI(`{"insight": true, "shape": "contradiction", "text": ${JSON.stringify(GOOD_TEXT)}, "relationship": "caused_by", "source": "B", "target": "A"}`),
+      AI: makeAI(`{"insight": true, "shape": "contradiction", "text": ${JSON.stringify(GOOD_TEXT)}, "evidence":{"a":"signed on Tuesday","b":"cancelled the Halloway renewal"}, "relationship": "caused_by", "source": "B", "target": "A"}`),
     });
 
     expect(await reasonOverPair(A, B, env)).toEqual({
@@ -122,8 +122,7 @@ describe("reasonOverPair carries the relationship", () => {
     });
 
     expect(await reasonOverPair(A, B, env)).toEqual({
-      outcome: "declined",
-      relationship: { type: "decided", source: "A" },
+      outcome: "invalid", reason: "format",
     });
   });
 
@@ -144,14 +143,14 @@ describe("reasonOverPair carries the relationship", () => {
    */
   it("treats an unparseable response as failed, not as a decline", async () => {
     const env = makeTestEnv(makeTestDb(), { AI: makeAI("the model wrote prose and never opened a brace") });
-    expect(await reasonOverPair(A, B, env)).toEqual({ outcome: "failed" });
+    expect(await reasonOverPair(A, B, env)).toEqual({ outcome: "invalid", reason: "format" });
   });
 
   it("treats a truncated JSON object as failed", async () => {
     const env = makeTestEnv(makeTestDb(), {
       AI: makeAI('{"insight": true, "shape": "connection", "text": "cut off mid'),
     });
-    expect(await reasonOverPair(A, B, env)).toEqual({ outcome: "failed" });
+    expect(await reasonOverPair(A, B, env)).toEqual({ outcome: "invalid", reason: "format" });
   });
 
   it("still reports failure when the call itself fails", async () => {
@@ -194,7 +193,7 @@ describe("the reasoning prompt", () => {
     // an edit that replaced these with a relationship-only schema would quietly
     // turn the weekly pass into an edge generator that writes no insights.
     expect(prompt).toContain('{"insight": false}');
-    expect(prompt).toContain('{"insight": true, "shape": "<shape>", "text": "<the insight>"}');
+    expect(prompt).toContain('{"insight": true, "shape": "<shape>", "text": "<Japanese insight>", "evidence":');
   });
 
   it("puts the relationship spec last, after the insight instructions", async () => {

@@ -16,6 +16,11 @@ function init() {
   const origin = window.location.origin
   document.getElementById('auth-url').value = origin
 
+  if (activateAccessDashboard()) {
+    showApp()
+    return
+  }
+
   const url = localStorage.getItem('sb_url') || origin
   const tok = localStorage.getItem('sb_token')
   if (tok) {

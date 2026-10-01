@@ -44,6 +44,80 @@ describe("vectorize workspace scoping", () => {
     }));
   });
 
+  it("recovers legacy vectors when an accepted workspace filter silently returns empty", async () => {
+    const calls: any[] = [];
+    const v = makeVectorizeMock({
+      query: vi.fn().mockImplementation(async (_values: number[], opts: any) => {
+        calls.push(opts);
+        return opts?.filter
+          ? { matches: [] }
+          : { matches: [{ id: "legacy", score: 0.9, metadata: { parentId: "legacy" } }] };
+      }),
+    });
+    const onDegrade = vi.fn();
+
+    const recovered = await queryVectorizeScoped(
+      v as never,
+      [0.1],
+      {
+        topK: 5,
+        filter: singleWorkspaceFilter("ws-p").filter,
+        fallbackOnEmpty: true,
+        onDegrade,
+      },
+    );
+
+    expect(recovered.matches.map((match: any) => match.id)).toEqual(["legacy"]);
+    expect(recovered.degraded).toBe(true);
+    expect(calls).toHaveLength(2);
+    expect(calls[0].filter).toBeDefined();
+    expect(calls[1].filter).toBeUndefined();
+    expect(vectorizeFilterState()).toEqual({ supported: false, degradedQueries: 1 });
+    expect(onDegrade).toHaveBeenCalledTimes(1);
+
+    // The evidence latches the isolate: later recall queries do not pay the
+    // known-empty filtered call again.
+    await queryVectorizeScoped(
+      v as never,
+      [0.2],
+      { topK: 5, filter: singleWorkspaceFilter("ws-p").filter, fallbackOnEmpty: true },
+    );
+    expect(calls).toHaveLength(3);
+    expect(calls[2].filter).toBeUndefined();
+  });
+
+  it("does not use the empty-filter compatibility probe unless the caller opts in", async () => {
+    const query = vi.fn().mockResolvedValue({ matches: [] });
+    const v = makeVectorizeMock({ query });
+
+    const result = await queryVectorizeScoped(
+      v as never,
+      [0.1],
+      { topK: 5, filter: singleWorkspaceFilter("ws-p").filter },
+    );
+
+    expect(result).toEqual({ matches: [], degraded: false });
+    expect(query).toHaveBeenCalledTimes(1);
+    expect(vectorizeFilterState().supported).toBe(true);
+  });
+
+  it("keeps an empty filtered result when the unfiltered probe finds only stamped foreign vectors", async () => {
+    const query = vi.fn().mockImplementation(async (_values: number[], opts: any) => opts?.filter
+      ? { matches: [] }
+      : { matches: [{ id: "foreign", score: 0.9, metadata: { workspace_id: "ws-other" } }] });
+    const v = makeVectorizeMock({ query });
+
+    const result = await queryVectorizeScoped(
+      v as never,
+      [0.1],
+      { topK: 5, filter: singleWorkspaceFilter("ws-p").filter, fallbackOnEmpty: true },
+    );
+
+    expect(result).toEqual({ matches: [], degraded: false });
+    expect(query).toHaveBeenCalledTimes(2);
+    expect(vectorizeFilterState()).toEqual({ supported: true, degradedQueries: 0 });
+  });
+
   it("retries unfiltered when Vectorize rejects the filter itself, but propagates other errors", async () => {
     const calls: unknown[] = [];
     const v = makeVectorizeMock({
@@ -114,16 +188,25 @@ describe("vectorize workspace scoping", () => {
   it("stamps the write context's workspace into upserted vector metadata", async () => {
     const d1 = makeSqliteD1();
     const v = makeVectorizeMock();
-    const env = { ...makeTestEnv(d1.db as unknown as D1Mock), VECTORIZE: v } as never;
+    let env = { ...makeTestEnv(d1.db as unknown as D1Mock), VECTORIZE: v } as never;
     resetDatabaseInit();
     await initializeDatabase(env);
+    env = d1.admitEnv(env) as never;
+    const now = Date.now();
+    d1.seed({
+      id: "e1",
+      content: "some content worth indexing",
+      createdAt: now,
+      tags: [],
+      source: "api",
+    });
     await storeEntry(
       env,
       "e1",
       "some content worth indexing",
       [],
       "api",
-      Date.now(),
+      now,
       undefined,
       { workspaceId: "ws-team", actorId: "u9" },
     );

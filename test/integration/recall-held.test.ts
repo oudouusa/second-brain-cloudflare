@@ -23,14 +23,14 @@ function denseEnv(sqlite: SqliteD1, index: { id: string; score: number; values?:
   const query = vi.fn(async (_v: unknown, opts: { topK?: number } = {}) => ({
     matches: index.slice(0, opts.topK ?? 10).map(m => ({ id: m.id, score: m.score, values: m.values, metadata: { parentId: m.id, isUpdate: false } })),
   }));
-  return makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV(), VECTORIZE: makeVectorizeMock({ query: query as never }) });
+  return sqlite.admitEnv(makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV(), VECTORIZE: makeVectorizeMock({ query: query as never }) }));
 }
 
 async function setup() {
   resetDatabaseInit();
   resetFtsReadyMemo();
   const sqlite = makeSqliteD1();
-  const env = makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV() });
+  const env = sqlite.admitEnv(makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV() }));
   await initializeDatabase(env);
   sqlite.issued.length = 0;
   return { sqlite, env };
@@ -69,7 +69,7 @@ describe("held rows never enter recall (dense arm)", () => {
     const query = vi.fn(async (_v: unknown, opts: { topK?: number } = {}) => ({
       matches: index.slice(0, opts.topK ?? 10).map(m => ({ id: m.id, score: m.score, metadata: { parentId: m.metaId, isUpdate: false } })),
     }));
-    const env = makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV(), VECTORIZE: makeVectorizeMock({ query: query as never }) });
+    const env = sqlite.admitEnv(makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV(), VECTORIZE: makeVectorizeMock({ query: query as never }) }));
     // topK above the 8 real parents forces the deeper dense-fill call.
     const { matches } = await recallEntries({ query: "topic note", topK: 10, synthesize: false }, env, ctx);
     expect(matches.map(m => m.id)).not.toContain("held-deep");

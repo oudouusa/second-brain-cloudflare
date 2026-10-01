@@ -1,12 +1,20 @@
 import { MAX_INPUT_TAGS, MAX_INPUT_TAG_CHARS, projectSlugError, projectTagError, withProjectTag, PROJECT_SLUG_RE, reservedTagsNote, stripNewReservedTags } from "../tags/system";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { McpServer } from "@modelcontextprotocol/server";
 import { resolveConfig, type Config } from "../config";
 import { z } from "zod";
 import type { Env } from "../env";
-import { RECALL_MAX_TOP_K, SEMANTIC_UNAVAILABLE_DETAIL, VECTORIZE_FIX_HINT } from "../constants";
+import { RECALL_MAX_TOP_K, VECTORIZE_FIX_HINT, SEMANTIC_UNAVAILABLE_DETAIL } from "../constants";
 import { buildEntryFilterQuery, captureEntry } from "../capture/entry";
 import { COUNTERPARTY_NAME_MAX_CHARS, partitionIgnoredTags, t7ReplyText, validateT7Capture, type T7CaptureInput } from "../capture/t7-capture";
-import { appendToEntry, EntryGoneError, updateEntryContent, WriteConflictError } from "../capture/store";
+import {
+  appendToEntry, EntryGoneError, WriteConflictError,
+  AppendOperationConflictError,
+  MEMORY_MAX_TAGS,
+  MEMORY_SOURCE_MAX_BYTES,
+  MEMORY_TAG_MAX_BYTES,
+  MemoryInputError,
+  updateEntryContent,
+} from "../capture/store";
 import { applyStatus, forgetEntry } from "../capture/lifecycle";
 import { getTrashedEntry } from "../memory/trash";
 import { revertEntry, undoGroup, undoGroupMcpReply, goneMessage, prunedMessage, restoredMessage, revertedMessage, unreadableMessage } from "../memory/undo";
@@ -14,13 +22,22 @@ import { moveEntry, restampVectorWorkspace } from "../capture/share";
 import { auditEvent, type ChangeContext } from "../lib/audit";
 import { channelNoun, lookupActorLabels, resolveActorFilter, resolveActorLabel } from "../lib/actors";
 import { readEntryVersion } from "../memory/history-view";
-import { createEdge, deleteEdge, edgeLabel, isValidEdgeType, kindMismatchMessage, kindOfRow, kindsAllowEdge, CROSS_WORKSPACE_LINK_MESSAGE } from "../graph/edges";
-import { EDGE_TYPES } from "../graph/types";
-import { getConnections } from "../graph/traverse";
 import type { Identity } from "../lib/identity";
 import { assertCanEditContent, assertCanMutateEntry, getReadableEntry, FORBIDDEN_MSG } from "../lib/entry-access";
 import { listTeamWorkspaces } from "../lib/team-admin";
-import { layerOf, readableWorkspaces, scopeWhereForRead, scopeWrite, effectiveWriteTarget, readTeamParam, readScopeWorkspaces, primaryCompanyWorkspaceId, type WriteContext } from "../lib/scope";
+import {
+  readableWorkspaces, effectiveWriteTarget,
+  readScopeWorkspaces,
+  layerOf,
+  primaryCompanyWorkspaceId,
+  readTeamParam,
+  scopeWhereForRead,
+  scopeWrite,
+  type WriteContext,
+} from "../lib/scope";
+import { createEdge, CROSS_WORKSPACE_LINK_MESSAGE, deleteEdge, edgeLabel, isValidEdgeType, kindMismatchMessage, kindOfRow, kindsAllowEdge } from "../graph/edges";
+import { EDGE_TYPES, type EdgeType } from "../graph/types";
+import { CONNECTIONS_DEFAULT_LIMIT, CONNECTIONS_MAX_LIMIT, getConnectionsPage, parseConnectionsCursor } from "../graph/traverse";
 import { isManagedMirror, mirrorEditError, mirrorUndoError } from "../integrations/mirror";
 import { KIND_VALUES, type MemoryKind } from "../memory/kind";
 import { STATUS_VALUES, type MemoryStatus } from "../memory/status";
@@ -31,11 +48,14 @@ import { maybeMarkFollowed, maybeMarkFollowedMany } from "../recall/log";
 import { renderRecallText, memoryHeader, validityBracket, standingSection } from "../recall/render";
 import { parseSupersededBy, validitySummary } from "../recall/validity-view";
 import { RECALL_OUTPUT_BUDGET, SNIPPET_MAX_CHARS, snippetOf, truncationNote } from "../recall/snippet";
-import { buildPromptCapsule } from "../prompt-capsule/build";
-import { PROMPT_CAPSULE_MCP_SCHEMA } from "../prompt-capsule/types";
+import {
+  WorkersAiQuotaError,
+  workersAiQuotaRetryMessage,
+} from "../lib/ai";
 import { autoCreateProject } from "../projects/autocreate";
 import { listProjects, type ProjectRow } from "../projects/registry";
 import { resolveProjectRead } from "../projects/resolve";
+import { createExtendedMcpTools } from "./extended-tools";
 import { computeAgentBrief } from "../brief/compute";
 import { applyInsightResolution, resolveDecisionOutcome, resolveEntryAction } from "../memory/actions";
 import { TAG_LIKE_ESCAPE, tagLikePattern } from "../memory/tag-sql";
@@ -97,10 +117,10 @@ const FOUR_AXES =
 
 export const RECALL_DESCRIPTION =
   "Recall: semantically search your second brain for relevant notes and context. "
-  + "Call recall automatically at the start of every conversation and every 3-4 messages.\n\n"
+  + "Recall when missing prior context could change the answer; otherwise reuse current context or earlier results.\n\n"
   + "EVALUATE, DON'T ASSUME. Ask for enough candidates to compare — topK 5 (the default) unless the task "
   + "justifies otherwise — then read the returned content and decide which memory actually answers the "
-  + "question. Rank order and the (NN% match) figure are retrieval signals, not calibrated confidence that a "
+  + "question. Rank order and the relative score are retrieval signals, not calibrated confidence that a "
   + "memory answers you: rank 1 is a candidate, not a guarantee.\n\n"
   + "RECOVER ONCE. If the results come back empty, off-topic, ambiguous, dominated by loosely related "
   + "memories, or missing something you expected to be there, make one more targeted recall before concluding "
@@ -125,7 +145,7 @@ export const RECALL_DESCRIPTION =
   + "TRUNCATION. Long memories come back shortened to keep the response small: any result ending in a "
   + "[truncated …] marker is PARTIAL, so call get(id) before relying on its details or quoting it. Results "
   + "without that marker are complete.\n\n"
-  + `PROJECTS. ${FOUR_AXES} Call list_projects to discover projects, then pass project to search inside one. `
+  + `PROJECTS. ${FOUR_AXES} Call list_projects, then pass project to search inside one. `
   + "An unknown project slug is an error listing the known ones, not an empty result.";
 
 const GET_DESCRIPTION =
@@ -142,14 +162,15 @@ const CONNECTIONS_DESCRIPTION =
   + "what surrounds it: causal history, decision lineage, preceding or following developments, related events, "
   + "explicit links between memories. It returns an entry's neighbors regardless of your question, so it is "
   + "not a substitute for a sharper recall query — skip it when direct recall already answers the question. "
-  + "Get the entry ID from recall or list_recent first.";
+  + "Directed relationships identify whether the requested entry is the stored source or target. Results are "
+  + "paged; pass next_cursor back as cursor to continue. Get the entry ID from recall or list_recent first.";
 
 const REMEMBER_DESCRIPTION =
   "Store a distinct, durable idea, fact, decision, task, preference, event, or reusable observation in your "
-  + "second brain. Call this automatically, without asking permission, whenever the user shares something "
-  + "durable enough to be worth retrieving in a later conversation — a goal, a decision, a preference, a "
-  + "commitment, a lasting piece of project or personal context. Passing conversational detail that will not "
-  + "matter later does not need storing.\n\n"
+  + "second brain within the user's existing storage authorization. Save settled decisions, explicit commitments, "
+  + "durable preferences and verified reusable outcomes; do not save every response or intermediate proposal. "
+  + "Save an unconfirmed idea only when requested and label it as a proposal. Respect exclusions and never store "
+  + "credentials. Do not ask again for each note already covered by the user's storage permission.\n\n"
   + "One memory per thing worth retrieving on its own. Before adding another memory about a subject you have "
   + "already stored, consider whether this is really an update to that memory: when it continues the same "
   + "thread — progress, a follow-up, a refinement, a later outcome — call append on the existing entry instead "
@@ -158,9 +179,9 @@ const REMEMBER_DESCRIPTION =
   + "author. Company = visible to the whole team. If the user says \"share this\", \"the team should know\", "
   + "or similar, pass workspace: \"company\". If they say \"keep this private\", pass workspace: \"personal\". "
   + "With no workspace argument the member's configured default decides (personal unless their admin said "
-  + "otherwise), so when policy matters to the user, be explicit. On a multi-team brain, call list_teams "
-  + "first when the user wants something shared but has not named a team — present the team names and ask "
-  + "which one if there is more than one, then pass that team's id as team. recall marks each result 'shared' or "
+  + "otherwise). Use explicit workspace: \"personal\" unless company storage is authorized. On a multi-team brain, call list_teams "
+  + "first when the user wants something shared but has not named a team; pass the selected team's id as team. "
+  + "recall marks each result 'shared' or "
   + "'personal', and the share tool moves an existing memory between layers at any time. "
   + "Do not create a new durable memory for a repeated no-op observation, an "
   + "unchanged status, or a restatement of something already stored.\n\n"
@@ -182,13 +203,16 @@ const APPEND_DESCRIPTION =
   + "investigation, or recurring monitoring where something meaningfully changed. Prefer append over remember "
   + "whenever a new memory would substantially duplicate an existing continuing one.\n\n"
   + "Do not append unrelated information merely to avoid creating a new entry — if it is its own retrieval "
-  + "target, call remember. To replace content that is simply no longer correct, use update.";
+  + "target, call remember. To replace content that is simply no longer correct, use update.\n\n"
+  + "After a successful append, inspect the rollover notice. If rollover is recommended or required, create a "
+  + "concise current-state snapshot and call rollover before the next append. The old journal remains intact.";
 
 const UPDATE_DESCRIPTION =
   "Replace the full content of an existing memory. Use it when the prior content is no longer the correct "
   + "representation — a preference reversed, a decision overturned, a fact superseded. It is not the mechanism "
   + "for incremental history: use append when the earlier content still stands and you are adding to it. Get "
-  + "the entry ID from recall or list_recent first.";
+  + "the entry ID from recall or list_recent first. Every successful replacement preserves the prior version; "
+  + "use history on the current entry ID to inspect it.";
 
 const LIST_RECENT_DESCRIPTION =
   "list_recent: List the most recent entries by date from your second brain. Use it to browse recent activity "
@@ -203,9 +227,8 @@ const LIST_RECENT_DESCRIPTION =
 
 const LIST_TEAMS_DESCRIPTION =
   "List the shared teams you belong to, with display names and workspace ids. Call this before remember or "
-  + "share with workspace:\"company\" when the user has not named a team — especially when more than one team "
-  + "is returned. Present the names to the user and ask which team they mean when it matters. Use the id "
-  + "(not the display name) as the team parameter on remember, share, recall, and list_recent.";
+  + "share with workspace:\"company\" when the user has not named a team. Use the id, not the display name, "
+  + "as the team parameter on remember, share, recall, and list_recent.";
 
 const LIST_PROJECTS_DESCRIPTION =
   "List the projects you can read, as slug — name (layer) — description. "
@@ -216,9 +239,9 @@ const LIST_PROJECTS_DESCRIPTION =
   + "to narrow to one layer.";
 
 const SHARE_DESCRIPTION =
-  "Move a memory between your private workspace and a shared team workspace. MOVE semantics: one canonical row; "
-  + "edges follow it; audited. Only the entry's author or an admin can un-share. Call list_teams first when "
-  + "sharing to company and the user has not named a team. Get the entry ID from recall or list_recent first.";
+  "Move a memory between your private workspace and a shared team workspace. The memory remains one canonical "
+  + "row and its graph links follow it. Call list_teams first when sharing to company and the user has not "
+  + "named a team.";
 
 function formatTeamsList(
   teams: { id: string; name: string; memberCount: number }[],
@@ -227,13 +250,13 @@ function formatTeamsList(
   if (!teams.length) {
     return "You are not on any shared team workspace. Use workspace:\"personal\" for private memories.";
   }
-  const lines = teams.map((t, i) => {
-    const primary = t.id === primaryId ? " [primary — used when team is omitted]" : "";
-    const label = t.name || "Unnamed team";
-    const members = t.memberCount === 1 ? "1 member" : `${t.memberCount} members`;
-    return `${i + 1}. ${label} (id: ${t.id}, ${members})${primary}`;
+  const lines = teams.map((team, index) => {
+    const primary = team.id === primaryId ? " [primary — used when team is omitted]" : "";
+    const label = team.name || "Unnamed team";
+    const members = team.memberCount === 1 ? "1 member" : `${team.memberCount} members`;
+    return `${index + 1}. ${label} (id: ${team.id}, ${members})${primary}`;
   });
-  return `Teams you can read and write:\n\n${lines.join("\n")}\n\nUse the id as the team argument when capturing, sharing, or searching one team.`;
+  return `Teams you can read and write:\n\n${lines.join("\n")}\n\nUse the id as the team argument.`;
 }
 
 const projectParam = z.string().optional();
@@ -262,9 +285,8 @@ const layerOfRow = (identity: Identity | undefined, row: Record<string, any>) =>
  *
  * The name is information only on the shared layer — a personal row is the
  * reader's own by definition — so a listing with nothing shared on it must not
- * spend a D1 call to learn that. These tools run inside the same self-imposed
- * ~50-call D1 budget per invocation as everything else (the platform's real
- * ceiling is 1,000 D1/KV/Vectorize calls per invocation).
+ * spend a subrequest to learn that. These tools run inside the same 50-subrequest
+ * invocation budget as everything else.
  */
 async function labelsForRows(
   env: Env,
@@ -282,6 +304,148 @@ async function labelsForRows(
         })
       : null;
 }
+
+// 入力制約は利用者やリクエストに依存しない。各MCPサーバーで同じスキーマを再利用する。
+// env・認証・write admission・callbackは従来どおりリクエストごとに作成する。
+const INPUT_SCHEMAS = {
+  list_projects: z.object({ workspace: z.enum(["personal", "company"]).optional(), team: z.string().optional(), include_archived: z.boolean().optional() }),
+  list_teams: z.object({}),
+  remember: z.object({
+        content: z.string().max(MAX_CONTENT_BYTES + 1).refine(value => !value.includes("\0"), "NUL is not allowed").describe("The idea, task, or note to store — one distinct item, written so it still makes sense on its own months from now"),
+        tags: z.array(z.string().max(MAX_INPUT_TAG_CHARS).refine(value => !value.includes("\0"), "NUL is not allowed")).max(MAX_INPUT_TAGS).optional().describe("Optional tags for filtering and later retrieval"),
+        project: projectParam.describe("Project slug (lowercase letters, digits, - and _) when the conversation is about one — discover slugs with list_projects. An unknown slug is created automatically. Prefer this over a bare topic tag"),
+        source: z.string().max(MEMORY_SOURCE_MAX_BYTES).optional().describe("Origin: phone, browser, voice, claude"),
+        volatility: volatilityParam,
+        workspace: z.enum(["personal", "company"]).optional().describe("Where to store it: your private workspace (default) or the shared company layer"),
+        team: z.string().optional().describe("When workspace is company, which team workspace — id from list_teams. Omit for your primary team."),
+        when: whenParam,
+        when_kind: whenKindParam,
+        standing: z.boolean().optional().describe("Set true when the user asks to be reminded of something whenever a topic comes up. Write content as \"When <situation>, <what to do or remember>.\""),
+        decision: z.boolean().optional().describe("Set true when the user commits to a meaningful choice, so it can be reviewed later and its calibration tracked."),
+        confidence: z.number().optional().describe("0 to 1 (e.g. 0.7 for 70%). Pass only with decision: true, and only if the user stated it or clearly implied it — never ask for it."),
+        confidence_source: z.enum(["stated", "inferred"]).optional().describe("\"stated\" if the user gave a number or a clear phrase like \"pretty sure\"; \"inferred\" otherwise (the default). Requires decision: true."),
+        review_by: z.string().optional().describe("When to bring this decision up again; defaults to 90 days out. Requires decision: true; use when instead for anything else."),
+        owed_by: z.string().max(COUNTERPARTY_NAME_MAX_CHARS).optional().describe("Someone promised the user something: their name. Use when for the promised date."),
+        owed_to: z.string().max(COUNTERPARTY_NAME_MAX_CHARS).optional().describe("The user promised someone something: their name. Use when for the promised date."),
+        valid_from: z.string().optional().describe("When this became true, if the user said so ('I moved to Austin in June' = 2026-06). A date, month or year. Omit it when the fact is new today. Never a future date: use when for plans and deadlines."),
+        valid_until: z.string().optional().describe("When this stopped being true, for a fact that is already over ('I lived in Boston until 2020' = 2020). Omit it for anything still true."),
+
+  }),
+  append: z.object({
+    when: whenParam,
+    when_kind: whenKindParam,
+    id: z.string().describe("Entry ID to append to — from recall or list_recent"),
+    addition: z.string().max(MAX_CONTENT_BYTES + 1).refine(value => !value.includes("\0"), "NUL is not allowed").describe("The new information to add to the existing entry — what actually changed, not a restatement of what is already there"),
+    operation_id: z.string().min(1).max(128).optional().describe("Caller-generated idempotency key. Generate a fresh UUID for a new append and reuse it only when retrying the same append after a timeout or 5xx response"),
+    volatility: volatilityParam,
+  }),
+  update: z.object({
+        id: z.string().describe("Entry ID to update — from recall or list_recent"),
+        content: z.string().max(MAX_CONTENT_BYTES + 1).refine(value => !value.includes("\0"), "NUL is not allowed").optional().describe("The new content to replace the existing entry with. Optional only when valid_from or valid_until is given."),
+        tags: z.array(z.string().max(MAX_INPUT_TAG_CHARS).refine(value => !value.includes("\0"), "NUL is not allowed")).max(MAX_INPUT_TAGS).optional().describe("Replacement topic tags. Supplying any capsule: or capsule-slot: tag replaces both capsule namespaces; include the complete new definition. Omit to preserve tags. Use set_status to unpublish."),
+        volatility: volatilityParam,
+        valid_from: z.string().nullable().optional().describe("Corrects when this memory's current content became true. Cannot be combined with new content."),
+        valid_until: z.string().nullable().optional().describe("When the memory stopped being true ('that ended in May' = 2026-05). Pass null if the user says it is true again. It stays in history and is left out of current answers. valid_until only for a date that has already passed; for future dates use when."),
+
+  }),
+  set_status: z.object({
+    id: z.string().describe("Entry ID — from recall or list_recent"),
+    status: z.enum([...STATUS_VALUES] as [string, ...string[]]).describe("canonical | draft | deprecated"),
+  }),
+  share: z.object({
+    id: z.string().describe("Entry ID from recall or list_recent"),
+    workspace: z.enum(["personal", "company"]).optional().describe("Target layer; company by default"),
+    team: z.string().optional().describe("When workspace is company, which team workspace — id from list_teams. Omit for your primary team."),
+  }),
+  recall: z.object({
+        query: z.string().describe("Natural language search query. Say what the topic is and what you are trying to do with it, and name the subject explicitly — resolve references like \"it\", \"that project\", or \"the last one\" from the conversation before querying"),
+        topK: z.number().int().min(1).max(RECALL_MAX_TOP_K).default(5).describe("Number of results. 5 (the default) gives enough candidates to compare before choosing; raise it to survey a topic, lower it only when a single exact hit is all you need"),
+        tag: z.string().optional().describe("Filter by a specific tag. Use a tag the user named or one you saw on a returned memory — a guessed tag that does not exist in this brain returns nothing"),
+        after: z.number().int().optional().describe("Only return entries after this Unix ms timestamp. Useful for narrowing a recovery search to a period the conversation identified"),
+        before: z.number().int().optional().describe("Only return entries before this Unix ms timestamp. Useful for narrowing a recovery search to a period the conversation identified"),
+        kind: z.enum([...KIND_VALUES] as [string, ...string[]]).optional().describe("Filter to episodic (events) or semantic (facts/knowledge). Useful as a recovery filter when a mixed result set buried the kind you needed"),
+        hops: z.number().int().min(0).max(3).default(0).describe("Graph expansion depth: 0 = direct matches only (default); 1–2 also surfaces related memories linked in the graph. Raise it for why/how, chronology, causes, outcomes, or what came before or after; leave it at 0 when direct matches already answer the question"),
+        workspace: z.enum(["personal", "company"]).optional().describe("Restrict the search to one layer: personal or the shared company layer. Omit to search both — the default, and right for most questions"),
+        team: z.string().optional().describe("When workspace is company, restrict to one team — id from list_teams"),
+        project: projectParam.describe("Search inside one project: its slug from list_projects. Matches the project's own memories and anything its aliases claim. An unknown slug is an error, not an empty result"),
+        explain: z.boolean().optional().describe("Add one line per result saying why it came back (meaning rank, matched keywords, boosts, rerank, link). Off by default because it costs output tokens"),
+        as_of: z.string().optional().describe("Answer what was actually true on this past date, not what is true now: a date like 2026-06-15, a month, or a year. Never a future date."),
+
+  }),
+  list_recent: z.object({
+        n: z.number().int().min(1).max(50).default(10),
+        tag: z.string().optional(),
+        after: z.number().int().optional().describe("Only return entries after this Unix ms timestamp"),
+        before: z.number().int().optional().describe("Only return entries before this Unix ms timestamp"),
+        workspace: z.enum(["personal", "company"]).optional().describe("Restrict the listing to one layer: personal or the shared company layer. Omit to list both"),
+        team: z.string().optional().describe("When workspace is company, restrict to one team — id from list_teams"),
+        actor: z.string().optional().describe('Only entries written by one person: their display name as it appears in the header, their user id, or "me" for your own'),
+        project: projectParam.describe("Only entries in one project: its slug from list_projects. An unknown slug is an error, not an empty list"),
+        in_trash: z.boolean().optional().describe("List memories in the trash instead of live ones. Works with n and workspace only."),
+
+  }),
+  get: z.object({
+        id: z.string().describe("Entry ID from recall or list_recent"),
+        version: z.number().int().min(1).optional().describe("Read the text before this change, from history — omit for the current text"),
+
+  }),
+  forget: z.object({
+    id: z.string().describe("Entry ID from recall or list_recent"),
+  }),
+  link: z.object({
+    source_id: z.string().describe("Source entry ID"),
+    target_id: z.string().describe("Target entry ID"),
+    type: z.enum(Object.keys(EDGE_TYPES) as [string, ...string[]]).default("relates_to").describe(
+      "How the memories relate, read as: SOURCE <type> TARGET. Direction is not cosmetic — source_id is the end the arrow points FROM. "
+      + "relates_to: they belong together, no direction implied (the default; use it when unsure). "
+      + "caused_by: the source happened BECAUSE of the target. "
+      + "decided: the source is a decision the target carries out or reflects; both memories must be episodic. "
+      + "follows: the source came AFTER the target in the same line of thought; both memories must be episodic. "
+      + "supersedes: the source replaces the target, and the target is treated as deprecated — use only when the older memory is genuinely wrong now. "
+      + "drawn_from: the source was derived from the target, as an insight is from its sources.",
+    ),
+  }),
+  unlink: z.object({
+    source_id: z.string().describe("Source entry ID"),
+    target_id: z.string().describe("Target entry ID"),
+    type: z.enum(Object.keys(EDGE_TYPES) as [string, ...string[]]).optional().describe("Only remove this relationship type; omit to remove all links between the pair"),
+  }),
+  connections: z.object({
+    id: z.string().describe("Entry ID from recall or list_recent"),
+    type: z.enum(Object.keys(EDGE_TYPES) as [string, ...string[]]).optional().describe("Filter to a single relationship type"),
+    limit: z.number().int().min(1).max(CONNECTIONS_MAX_LIMIT).default(CONNECTIONS_DEFAULT_LIMIT).describe("Maximum connections to return in this page"),
+    cursor: z.string().regex(/^c1\.(0|[1-9]\d*)$/)
+      .refine(value => parseConnectionsCursor(value) !== null, "Cursor is outside the supported range")
+      .optional().describe("Opaque cursor returned by the previous connections page"),
+  }),
+  brief: z.object({
+        project: projectParam.describe("Known project slug; includes its aliases"),
+        workspace: z.enum(["personal", "company"]).optional().describe("Restrict to one layer"),
+        team: z.string().optional().describe("Team id when reading one shared workspace"),
+      }),
+  resolve: z.object({
+        id: z.string().describe("Exact memory id"),
+        action: z.enum(["done", "not_a_task", "snooze", "clear_date", "confirm_insight", "dismiss_insight", "still_true", "outcome", "received", "stop_standing"]).describe("How to resolve this one item"),
+        until: z.string().optional().describe("Future date for snooze"),
+        result: z.enum(["right", "wrong", "mixed", "unknown"]).optional().describe("Required with action: outcome — how the decision turned out"),
+        note: z.string().max(1000).optional().describe("Optional detail for outcome, appended to the decision"),
+      }),
+  digest: z.object({
+        project: projectParam.describe("Known project slug; use exactly one of project or tag"),
+        tag: z.string().optional().describe("Topic tag; use exactly one of project or tag"),
+        workspace: z.enum(["personal", "company"]).optional().describe("Restrict to one layer"),
+        team: z.string().optional().describe("Team id when reading one shared workspace"),
+      }),
+  history: z.object({
+        id: z.string().describe("Exact memory id"),
+      }),
+  undo: z.object({
+        id: z.string().optional().describe("Entry ID from recall, list_recent or history"),
+        to_version: z.number().int().positive().optional().describe("Roll all the way back to this version number instead of just undoing the latest change. Get version numbers from history. Only reaches versions still within the kept history — the oldest eventually age out, and a permanently deleted memory has none left to reach."),
+        group: z.string().optional().describe("A group key copied verbatim from the brief tool's \"What AI tools changed\" block, to undo or release every memory in that group. Never build one yourself — only pass one exactly as brief gave it."),
+      }),
+
+};
 
 /** "2026-09-26 09:14 UTC" — a fixed-offset stamp for the `history` tool's own rows, one clock for
  * every reader regardless of timezone. */
@@ -394,24 +558,24 @@ export function buildMcpServer(
     const resolved = await resolveProjectRead(env, identity, slug, { layer, teamId });
     return resolved.ok ? resolved.rows : projectErrorText(resolved);
   }
+  const extendedTools = createExtendedMcpTools(env, ctx, identity, volatilityParam);
 
-  // ── list_teams ──────────────────────────────────────────────────────────
   server.registerTool(
     "list_teams",
     {
       description: LIST_TEAMS_DESCRIPTION,
-      inputSchema: {},
+      inputSchema: INPUT_SCHEMAS.list_teams,
     },
     async () => {
       if (!identity) {
-        return { content: [{ type: "text", text: "Team listing requires an authenticated identity." }] };
+        return { content: [{ type: "text" as const, text: "Team listing requires an authenticated identity." }] };
       }
       if (!identity.companyWorkspaceIds.length) {
-        return { content: [{ type: "text", text: formatTeamsList([], "") }] };
+        return { content: [{ type: "text" as const, text: formatTeamsList([], "") }] };
       }
       const teams = await listTeamWorkspaces(env, identity.companyWorkspaceIds);
       return {
-        content: [{ type: "text", text: formatTeamsList(teams, primaryCompanyWorkspaceId(identity)) }],
+        content: [{ type: "text" as const, text: formatTeamsList(teams, primaryCompanyWorkspaceId(identity)) }],
       };
     },
   );
@@ -421,11 +585,7 @@ export function buildMcpServer(
     "list_projects",
     {
       description: LIST_PROJECTS_DESCRIPTION,
-      inputSchema: {
-        workspace: z.enum(["personal", "company"]).optional().describe("Restrict to one layer: personal or the shared company layer. Omit to list both"),
-        team: z.string().optional().describe("When workspace is company, restrict to one team — id from list_teams"),
-        include_archived: z.boolean().optional().describe("Also list archived projects, marked [archived]. Off by default"),
-      },
+      inputSchema: INPUT_SCHEMAS.list_projects,
     },
     async ({ workspace, team, include_archived }) => {
       if (!identity) {
@@ -452,11 +612,7 @@ export function buildMcpServer(
     "brief",
     {
       description: "Call once at the start of a session, next to your first recall, and again after the conversation is cleared or compacted. Pass project when you know it. Mention only items that matter to what the user is doing now; if nothing does, say nothing about the brief. Do not read the whole brief back to the user.",
-      inputSchema: {
-        project: projectParam.describe("Known project slug; includes its aliases"),
-        workspace: z.enum(["personal", "company"]).optional().describe("Restrict to one layer"),
-        team: z.string().optional().describe("Team id when reading one shared workspace"),
-      },
+      inputSchema: INPUT_SCHEMAS.brief,
     },
     async ({ project, workspace, team }) => {
       if (!identity) return { content: [{ type: "text", text: "Brief requires an authenticated identity." }] };
@@ -473,13 +629,7 @@ export function buildMcpServer(
     {
       description: "Call when the user says something tracked is finished, was never a real task, should come back later, has no date, is still true, or that a suggested insight is right or wrong. Also call after you complete work the user asked you to track. Act only on a clear signal about a specific item; never close several items on your own initiative. Each resolve is recorded in the history with its prior values.\n\n"
         + "outcome: after a decision (decision: true) comes up for review, record how it went with result (right, wrong, mixed, or unknown if it's too early) and an optional note. received: something owed to the user (owed_by) arrived. stop_standing: a standing instruction (standing: true) should stop firing; it is kept as an ordinary memory.",
-      inputSchema: {
-        id: z.string().describe("Exact memory id"),
-        action: z.enum(["done", "not_a_task", "snooze", "clear_date", "confirm_insight", "dismiss_insight", "still_true", "outcome", "received", "stop_standing"]).describe("How to resolve this one item"),
-        until: z.string().optional().describe("Future date for snooze"),
-        result: z.enum(["right", "wrong", "mixed", "unknown"]).optional().describe("Required with action: outcome — how the decision turned out"),
-        note: z.string().max(1000).optional().describe("Optional detail for outcome, appended to the decision"),
-      },
+      inputSchema: INPUT_SCHEMAS.resolve,
     },
     async ({ id: rawId, action, until, result: outcomeResultParam, note }, extra) => {
       if (!identity) return { content: [{ type: "text", text: "Resolve requires an authenticated identity." }] };
@@ -521,12 +671,7 @@ export function buildMcpServer(
     "digest",
     {
       description: "Call when the user wants a summary of a project or topic. It returns the most recent automatic summary and its date; follow up with recall for anything newer than that date. It never creates a summary.",
-      inputSchema: {
-        project: projectParam.describe("Known project slug; use exactly one of project or tag"),
-        tag: z.string().optional().describe("Topic tag; use exactly one of project or tag"),
-        workspace: z.enum(["personal", "company"]).optional().describe("Restrict to one layer"),
-        team: z.string().optional().describe("Team id when reading one shared workspace"),
-      },
+      inputSchema: INPUT_SCHEMAS.digest,
     },
     async ({ project, tag, workspace, team }) => {
       if (!identity) return { content: [{ type: "text", text: "Digest requires an authenticated identity." }] };
@@ -563,9 +708,7 @@ export function buildMcpServer(
     "history",
     {
       description: "Call before you rely on or override a memory that shows [updated], a staleness warning, or 'since changed', and when the user asks why, when or by whom something changed, or wants an older version back. It lists recorded changes with the text before each one, events, and supersedes links.",
-      inputSchema: {
-        id: z.string().describe("Exact memory id"),
-      },
+      inputSchema: INPUT_SCHEMAS.history,
     },
     async ({ id: rawId }) => {
       if (!identity) return { content: [{ type: "text", text: "History requires an authenticated identity." }] };
@@ -573,7 +716,12 @@ export function buildMcpServer(
       if (!id) return { content: [{ type: "text", text: "id is required" }] };
       const history = await readEntryHistory(env, identity, id);
       if (!history) return { content: [{ type: "text", text: `No memory found with ID: ${id}` }] };
-      const text = formatHistoryReply(id, history.history, history.edges);
+      const legacyText = history.legacyVersions.length
+        ? "\n\n以前の保存形式による履歴（読み取り専用）:\n" + history.legacyVersions.map(version =>
+          `[${historyRowDate(version.replacedAt)} · ${version.reason}]\nID: ${version.id}\n${cleanStored(version.content)}`
+        ).join("\n\n")
+        : "";
+      const text = formatHistoryReply(id, history.history, history.edges) + legacyText;
       return { content: [{ type: "text", text }] };
     },
   );
@@ -583,26 +731,7 @@ export function buildMcpServer(
     "remember",
     {
       description: REMEMBER_DESCRIPTION,
-      inputSchema: {
-        content: z.string().refine(value => !value.includes("\0"), "NUL is not allowed").describe("The idea, task, or note to store — one distinct item, written so it still makes sense on its own months from now"),
-        tags: z.array(z.string().max(MAX_INPUT_TAG_CHARS).refine(value => !value.includes("\0"), "NUL is not allowed")).max(MAX_INPUT_TAGS).optional().describe("Optional tags for filtering and later retrieval"),
-        project: projectParam.describe("Project slug (lowercase letters, digits, - and _) when the conversation is about one — discover slugs with list_projects. An unknown slug is created automatically. Prefer this over a bare topic tag"),
-        source: z.string().optional().describe("Origin: phone, browser, voice, claude"),
-        volatility: volatilityParam,
-        workspace: z.enum(["personal", "company"]).optional().describe("Where to store it: your private workspace (default) or the shared company layer"),
-        team: z.string().optional().describe("When workspace is company, which team workspace — id from list_teams. Omit for your primary team."),
-        when: whenParam,
-        when_kind: whenKindParam,
-        standing: z.boolean().optional().describe("Set true when the user asks to be reminded of something whenever a topic comes up. Write content as \"When <situation>, <what to do or remember>.\""),
-        decision: z.boolean().optional().describe("Set true when the user commits to a meaningful choice, so it can be reviewed later and its calibration tracked."),
-        confidence: z.number().optional().describe("0 to 1 (e.g. 0.7 for 70%). Pass only with decision: true, and only if the user stated it or clearly implied it — never ask for it."),
-        confidence_source: z.enum(["stated", "inferred"]).optional().describe("\"stated\" if the user gave a number or a clear phrase like \"pretty sure\"; \"inferred\" otherwise (the default). Requires decision: true."),
-        review_by: z.string().optional().describe("When to bring this decision up again; defaults to 90 days out. Requires decision: true; use when instead for anything else."),
-        owed_by: z.string().max(COUNTERPARTY_NAME_MAX_CHARS).optional().describe("Someone promised the user something: their name. Use when for the promised date."),
-        owed_to: z.string().max(COUNTERPARTY_NAME_MAX_CHARS).optional().describe("The user promised someone something: their name. Use when for the promised date."),
-        valid_from: z.string().optional().describe("When this became true, if the user said so ('I moved to Austin in June' = 2026-06). A date, month or year. Omit it when the fact is new today. Never a future date: use when for plans and deadlines."),
-        valid_until: z.string().optional().describe("When this stopped being true, for a fact that is already over ('I lived in Boston until 2020' = 2020). Omit it for anything still true."),
-      },
+      inputSchema: INPUT_SCHEMAS.remember,
     },
     async ({ content, tags, project, source, volatility, workspace, team, when, when_kind, standing, decision, confidence, confidence_source, review_by, owed_by, owed_to, valid_from, valid_until }, extra) => {
       // Same grammar checks, same messages, as POST /capture. Bad input fails before any write.
@@ -675,8 +804,14 @@ export function buildMcpServer(
       // ChangeContext feeds version snapshots — BE-6, Builder A): only this
       // tool's own "created"/"updated" audit event below is BE-5's to touch.
       const client = identity ? await resolveClient(extra) : undefined;
-      const result = await captureEntry(content, withVerdict, source ?? "claude", env, ctx, undefined, targetCtx, whenInput,
+      let result;
+      try {
+        result = await captureEntry(content, withVerdict, source ?? "claude", env, ctx, undefined, targetCtx, whenInput,
         { ...(identity ? { channel: "mcp" as const } : {}), t7: t7Input, validity: validity.value });
+      } catch (error) {
+        if (error instanceof MemoryInputError) return { isError: true, content: [{ type: "text", text: `Memory was not stored: ${error.message}.` }] };
+        throw error;
+      }
       // Silent, after the write: a lost registry row never fails the memory.
       if (identity && projectSlug && result.status !== "blocked" && result.status !== "t7_refused") {
         await autoCreateProject(env, ctx, { workspaceId: targetCtx.workspaceId, actorId: identity.userId, slug: projectSlug });
@@ -748,7 +883,8 @@ export function buildMcpServer(
         const timezone = (await resolveConfig(env)).TIMEZONE;
         return { content: [{ type: "text", text: `${t7ReplyText(result.id, result.t7, { timezone, hasProject: !!projectSlug, commitmentWhenAt: whenInput?.at })}${noteSuffix}` }] };
       }
-      return { content: [{ type: "text", text: `Stored. ID: ${result.id}${noteSuffix}` }] };
+      return { content: [{ type: "text", text: `Stored. ID: ${result.id}${noteSuffix}` + (result.semanticUnavailable && result.semanticRetryAt
+        ? ` The memory is durable in D1 and keyword-searchable. Semantic indexing is pending. ${result.classificationDeferred ? "AI classification is also deferred; /classify-pending can retry it." : "AI classification is scheduled separately."} Scheduled indexing recovery starts after ${new Date(result.semanticRetryAt).toISOString()} (09:00 JST); /vectorize-pending can retry it manually.` : "") }] };
     }
   );
 
@@ -757,28 +893,9 @@ export function buildMcpServer(
     "append",
     {
       description: APPEND_DESCRIPTION,
-      inputSchema: {
-        id: z.string().describe("Entry ID to append to — from recall or list_recent"),
-        addition: z.string().refine(value => !value.includes("\0"), "NUL is not allowed").describe("The new information to add to the existing entry — what actually changed, not a restatement of what is already there"),
-        volatility: volatilityParam,
-        when: whenParam,
-        when_kind: whenKindParam,
-      },
+      inputSchema: INPUT_SCHEMAS.append,
     },
-    async ({ id, addition, volatility, when, when_kind }, extra) => {
-      const row = await getReadableEntry(env, identity, id, "id, workspace_id, actor_id, content, tags, source");
-
-      if (!row) {
-        return {
-          content: [{ type: "text", text: `No memory found with ID: ${id}` }],
-        };
-      }
-
-      const denied = assertCanEditContent(identity, row);
-      if (denied) {
-        return { content: [{ type: "text", text: denied.message }] };
-      }
-
+    async ({ id, addition, operation_id, volatility, when, when_kind }, extra) => {
       let whenInput: { at: number; kind: "due" | "event" | "wake"; source: "explicit" } | undefined;
       if (when !== undefined) {
         const parsed = parseExplicitWhen(when, when_kind, undefined, (await resolveConfig(env)).TIMEZONE);
@@ -787,10 +904,20 @@ export function buildMcpServer(
       } else if (when_kind !== undefined) {
         return { content: [{ type: "text", text: "when_kind requires when" }] };
       }
+      const row = await getReadableEntry(env, identity, id, "id, workspace_id, actor_id, content, tags, source");
 
-      const existingContent = row.content as string;
-      const tags: string[] = JSON.parse(row.tags ?? "[]");
+      if (!row) {
+        return {
+          content: [{ type: "text", text: `No entry found with ID: ${id}` }],
+        };
+      }
+
+      const denied = assertCanEditContent(identity, row);
+      if (denied) return { content: [{ type: "text", text: denied.message }] };
+
       const source = row.source as string;
+      const existingContent = row.content as string;
+      const tags: string[] = JSON.parse(row.tags as string);
       const a = addition.trim();
 
       if (!a) {
@@ -814,18 +941,26 @@ export function buildMcpServer(
       const cfg = await resolveConfig(env);
       let appendResult: Awaited<ReturnType<typeof appendToEntry>>;
       try {
-        appendResult = await appendToEntry(env, id, existingContent, a, tags, source, cfg, volatility as Volatility | undefined, writeCtx, { ...mcpChange, client }, whenInput, row.workspace_id as string, ctx);
+        appendResult = await appendToEntry(env, id, existingContent, a, tags, source, cfg, volatility as Volatility | undefined, writeCtx, { ...mcpChange, client }, whenInput, row.workspace_id as string, ctx, { operationId: operation_id });
       } catch (e) {
         if (e instanceof WriteConflictError) return { content: [{ type: "text", text: `Entry ${id} changed while saving, so nothing was appended. Please try again.` }] };
         if (e instanceof EntryGoneError) return { content: [{ type: "text", text: e.message }] };
         console.error("Append failed:", e);
+        if (e instanceof AppendOperationConflictError) {
+          return { content: [{ type: "text", text: `Append was not applied: ${e.message}.` }] };
+        }
+        if (e instanceof WorkersAiQuotaError) {
+          return {
+            content: [{ type: "text", text: `Append was not applied. Your memory is unchanged. ${workersAiQuotaRetryMessage(e.retryAt)}` }],
+          };
+        }
         return {
           content: [{ type: "text", text: `Append failed: ${(e as Error).message}` }],
         };
       }
       const { indexed, held, wasCanonical, eventId } = appendResult;
 
-      if (identity) {
+      if (identity && !appendResult.replayed) {
         auditEvent(env, ctx, {
           id: eventId,
           entryId: id, actorId: identity.userId, event: "appended",
@@ -853,11 +988,31 @@ export function buildMcpServer(
       return {
         content: [{
           type: "text",
-          text: `Appended to entry ${id}. The original content is preserved and your update has been added with today's date.`
-            + (indexed ? "" : ` Note: it was not indexed for semantic search because the Vectorize index is missing, so it is findable by keyword only. Fix: ${VECTORIZE_FIX_HINT}.`),
+          text: (appendResult.replayed
+            ? `Append operation for entry ${id} was already applied. No duplicate was added.`
+            : `Appended to entry ${id}. The original content is preserved and your update has been added with today's date.`)
+            + (appendResult.indexed
+              ? ""
+              : appendResult.semanticUnavailableReason === "workers_ai_quota_exhausted"
+                ? ` The append is durable in D1 and already keyword-searchable. Semantic indexing is queued; ${appendResult.semanticRetryAt ? workersAiQuotaRetryMessage(appendResult.semanticRetryAt) : "scheduled recovery will retry it"} /vectorize-pending can also retry it manually.`
+                : appendResult.semanticUnavailableReason === "vectorize_unavailable"
+                  ? ` The append is durable in D1 and already keyword-searchable. Semantic indexing is queued because Vectorize is unavailable; /vectorize-pending will retry it. Fix: ${VECTORIZE_FIX_HINT}.`
+                  : " Semantic indexing is still queued; the append is already keyword-searchable and /vectorize-pending will retry it.")
+            + (appendResult.rollover.status === "required"
+              ? ` Entry length is ${appendResult.rollover.contentChars} characters; call rollover now with a concise current-state snapshot before the next append.`
+              : appendResult.rollover.status === "recommended"
+                ? ` Entry length is ${appendResult.rollover.contentChars} characters; rollover is recommended before it reaches ${appendResult.rollover.rolloverAt}.`
+                : ""),
         }],
       };
     }
+  );
+
+  // ── rollover ─────────────────────────────────────────────────────────────
+  server.registerTool(
+    "rollover",
+    extendedTools.rollover.config,
+    extendedTools.rollover.callback,
   );
 
   // ── update ───────────────────────────────────────────────────────────────
@@ -865,14 +1020,7 @@ export function buildMcpServer(
     "update",
     {
       description: UPDATE_DESCRIPTION,
-      inputSchema: {
-        id: z.string().describe("Entry ID to update — from recall or list_recent"),
-        content: z.string().refine(value => !value.includes("\0"), "NUL is not allowed").optional().describe("The new content to replace the existing entry with. Optional only when valid_from or valid_until is given."),
-        tags: z.array(z.string().max(MAX_INPUT_TAG_CHARS).refine(value => !value.includes("\0"), "NUL is not allowed")).max(MAX_INPUT_TAGS).optional().describe("Replacement topic tags. Supplying any capsule: or capsule-slot: tag replaces both capsule namespaces; include the complete new definition. Omit to preserve tags. Use set_status to unpublish."),
-        volatility: volatilityParam,
-        valid_from: z.string().nullable().optional().describe("Corrects when this memory's current content became true. Cannot be combined with new content."),
-        valid_until: z.string().nullable().optional().describe("When the memory stopped being true ('that ended in May' = 2026-05). Pass null if the user says it is true again. It stays in history and is left out of current answers. valid_until only for a date that has already passed; for future dates use when."),
-      },
+      inputSchema: INPUT_SCHEMAS.update,
     },
     async ({ id, content, volatility, tags, valid_from, valid_until }, extra) => {
       // T-0089.2.1: validity fields, checked before any write (P5 future dates, P6 no start with new text).
@@ -931,7 +1079,13 @@ export function buildMcpServer(
 
       const client = identity ? await resolveClient(extra) : undefined;
       const cfg = await resolveConfig(env);
-      const result = await updateEntryContent(env, id, newContent, cfg, volatility as Volatility | undefined, tags, writeCtx, { ...mcpChange, client }, row.workspace_id as string, ctx);
+      let result;
+      try {
+        result = await updateEntryContent(env, id, newContent, cfg, volatility as Volatility | undefined, tags, writeCtx, { ...mcpChange, client }, row.workspace_id as string, ctx);
+      } catch (error) {
+        if (error instanceof MemoryInputError) return { content: [{ type: "text", text: `Memory was not updated: ${error.message}.` }] };
+        throw error;
+      }
 
       // Only reachable if the entry was deleted between the guard read and the write.
       if (result.status === "not_found") {
@@ -948,6 +1102,14 @@ export function buildMcpServer(
       // text, and no repair path could see it — /vectorize-pending and /stats both look for
       // an empty vector_ids, which a mis-indexed entry does not have (#289).
       if (result.status === "reembed_failed") {
+        if (result.reason === "workers_ai_quota_exhausted" && result.retryAt) {
+          return {
+            content: [{
+              type: "text",
+              text: `Couldn't update entry ${id}. Your memory is unchanged. ${workersAiQuotaRetryMessage(result.retryAt)}`,
+            }],
+          };
+        }
         return { content: [{ type: "text", text: `Couldn't update memory ${id}: search did not update. The memory is unchanged. Try again.` }] };
       }
 
@@ -1013,10 +1175,7 @@ export function buildMcpServer(
     "set_status",
     {
       description: "Set a memory's lifecycle status. 'canonical' = confirmed/authoritative (protected from auto-overwrite), 'draft' = tentative, 'deprecated' = wrong or not to be used (hidden from recall, kept in history). Get the entry ID from recall or list_recent first.",
-      inputSchema: {
-        id: z.string().describe("Entry ID — from recall or list_recent"),
-        status: z.enum([...STATUS_VALUES] as [string, ...string[]]).describe("canonical | draft | deprecated"),
-      },
+      inputSchema: INPUT_SCHEMAS.set_status,
     },
     async ({ id, status }, extra) => {
       const row = await getReadableEntry(env, identity, id);
@@ -1045,16 +1204,11 @@ export function buildMcpServer(
     }
   );
 
-  // ── share ────────────────────────────────────────────────────────────────
   server.registerTool(
     "share",
     {
       description: SHARE_DESCRIPTION,
-      inputSchema: {
-        id: z.string().describe("Entry ID — from recall or list_recent"),
-        workspace: z.enum(["personal", "company"]).optional().describe("Target layer, company by default"),
-        team: z.string().optional().describe("When workspace is company, which team workspace — id from list_teams. Omit for your primary team."),
-      },
+      inputSchema: INPUT_SCHEMAS.share,
     },
     async ({ id, workspace, team }) => {
       if (!identity) return { content: [{ type: "text", text: "Sharing requires an authenticated team identity." }] };
@@ -1071,79 +1225,38 @@ export function buildMcpServer(
       // Vectorize outage here costs only this cosmetic ranking follow-up.
       ctx.waitUntil(restampVectorWorkspace(env, result.vectorIds, result.workspaceId));
       return { content: [{ type: "text", text: `Entry ${id} ${result.status}: now in the ${workspace ?? "company"} workspace.` }] };
-    }
+    },
   );
 
-  // ── prompt capsule ─────────────────────────────────────────────────────
+  // ── manual memory tiers ─────────────────────────────────────────────────
+  server.registerTool(
+    "set_memory_tier",
+    extendedTools.setMemoryTier.config,
+    extendedTools.setMemoryTier.callback,
+  );
+
+  server.registerTool(
+    "pin_memory",
+    extendedTools.pinMemory.config,
+    extendedTools.pinMemory.callback,
+  );
+
+  server.registerTool(
+    "unpin_memory",
+    extendedTools.unpinMemory.config,
+    extendedTools.unpinMemory.callback,
+  );
+
   server.registerTool(
     "get_prompt_capsule",
-    {
-      description: "Return one deterministic Prompt Capsule and its strong ETag. This read-only tool is for gateways that construct stable prompt prefixes; use recall for query-specific context. Only entries with canonical status are included: give the entry canonical status in its tags at remember time, or call set_status canonical afterwards. To re-slot an entry, use update with tags containing the complete capsule: and capsule-slot: definition.",
-      inputSchema: {
-        kind: z.enum(["core", "project"]).describe("Capsule kind"),
-        project_id: z.string().regex(PROJECT_SLUG_RE).optional()
-          .describe("Required for project; omitted for core"),
-        workspace: z.enum(["personal", "company"]).default("personal")
-          .describe("Read exactly one private or shared workspace layer"),
-        team: z.string().max(128).optional()
-          .describe("Company workspace id from list_teams; required when company membership is ambiguous"),
-      },
-    },
-    async ({ kind, project_id, workspace, team }) => {
-      if (!identity) {
-        return {
-          isError: true,
-          content: [{ type: "text", text: JSON.stringify({
-            ok: false,
-            schema: PROMPT_CAPSULE_MCP_SCHEMA,
-            code: "unauthenticated",
-            status: 401,
-            error: "Prompt Capsule retrieval requires an authenticated identity.",
-          }) }],
-        };
-      }
+    extendedTools.promptCapsule.config,
+    extendedTools.promptCapsule.callback,
+  );
 
-      try {
-        const built = await buildPromptCapsule(env, identity, {
-          kind,
-          projectId: project_id,
-          workspace,
-          team,
-        });
-        if (!built.ok) {
-          return {
-            isError: true,
-            content: [{ type: "text", text: JSON.stringify({
-              schema: PROMPT_CAPSULE_MCP_SCHEMA,
-              status: built.status,
-              ...built.body,
-            }) }],
-          };
-        }
-
-        return {
-          content: [{ type: "text", text: JSON.stringify({
-            ok: true,
-            schema: PROMPT_CAPSULE_MCP_SCHEMA,
-            etag: built.etag,
-            capsule: built.payload,
-          }, null, 2) }],
-        };
-      } catch {
-        // 例外本文にはSQLや入力が含まれ得るため、応答とログへ流さない。
-        console.error("Prompt Capsule retrieval failed");
-        return {
-          isError: true,
-          content: [{ type: "text", text: JSON.stringify({
-            ok: false,
-            schema: PROMPT_CAPSULE_MCP_SCHEMA,
-            code: "internal_error",
-            status: 500,
-            error: "Prompt Capsule retrieval failed. Please try again later.",
-          }) }],
-        };
-      }
-    },
+  server.registerTool(
+    "get_hot_context",
+    extendedTools.hotContext.config,
+    extendedTools.hotContext.callback,
   );
 
   // ── recall ───────────────────────────────────────────────────────────────
@@ -1151,20 +1264,7 @@ export function buildMcpServer(
     "recall",
     {
       description: RECALL_DESCRIPTION,
-      inputSchema: {
-        query: z.string().describe("Natural language search query. Say what the topic is and what you are trying to do with it, and name the subject explicitly — resolve references like \"it\", \"that project\", or \"the last one\" from the conversation before querying"),
-        topK: z.number().int().min(1).max(RECALL_MAX_TOP_K).default(5).describe("Number of results. 5 (the default) gives enough candidates to compare before choosing; raise it to survey a topic, lower it only when a single exact hit is all you need"),
-        tag: z.string().optional().describe("Filter by a specific tag. Use a tag the user named or one you saw on a returned memory — a guessed tag that does not exist in this brain returns nothing"),
-        after: z.number().int().optional().describe("Only return entries after this Unix ms timestamp. Useful for narrowing a recovery search to a period the conversation identified"),
-        before: z.number().int().optional().describe("Only return entries before this Unix ms timestamp. Useful for narrowing a recovery search to a period the conversation identified"),
-        kind: z.enum([...KIND_VALUES] as [string, ...string[]]).optional().describe("Filter to episodic (events) or semantic (facts/knowledge). Useful as a recovery filter when a mixed result set buried the kind you needed"),
-        hops: z.number().int().min(0).max(3).default(0).describe("Graph expansion depth: 0 = direct matches only (default); 1–2 also surfaces related memories linked in the graph. Raise it for why/how, chronology, causes, outcomes, or what came before or after; leave it at 0 when direct matches already answer the question"),
-        workspace: z.enum(["personal", "company"]).optional().describe("Restrict the search to one layer: personal or the shared company layer. Omit to search both — the default, and right for most questions"),
-        team: z.string().optional().describe("When workspace is company, restrict to one team — id from list_teams"),
-        project: projectParam.describe("Search inside one project: its slug from list_projects. Matches the project's own memories and anything its aliases claim. An unknown slug is an error, not an empty result"),
-        explain: z.boolean().optional().describe("Add one line per result saying why it came back (meaning rank, matched keywords, boosts, rerank, link). Off by default because it costs output tokens"),
-        as_of: z.string().optional().describe("Answer what was actually true on this past date, not what is true now: a date like 2026-06-15, a month, or a year. Never a future date."),
-      },
+      inputSchema: INPUT_SCHEMAS.recall,
     },
     async ({ query, topK, tag, after, before, kind, hops, workspace, team, project, explain, as_of }) => {
       const teamRead = identity ? readTeamParam(team, identity, workspace) : {};
@@ -1179,19 +1279,26 @@ export function buildMcpServer(
         if (typeof parsed !== "number") return { content: [{ type: "text", text: parsed.error }] };
         asOf = parsed;
       }
-      const { matches, insight, semanticUnavailable, queryTokens, compoundStale, asOf: asOfHeader, standing, receipt } = await recallEntries({ query, topK, tag, after, before, kind: kind as MemoryKind | undefined, hops, synthesize: false, project: projectRows, explain, channel: "mcp" }, env, ctx, cfg, { identity, workspaceFilter: workspace, teamId: teamRead.teamId, asOf });
+      const { matches, insight, semanticUnavailable, semanticUnavailableReason, semanticRetryAt, currentQueryTokens, graphContribution, queryTokens, compoundStale, asOf: asOfHeader, standing, receipt } = await recallEntries({ query, topK, tag, after, before, kind: kind as MemoryKind | undefined, hops, synthesize: false, project: projectRows, explain, channel: "mcp" }, env, ctx, cfg, { identity, workspaceFilter: workspace, teamId: teamRead.teamId, asOf });
 
       const notice = semanticUnavailable
-        ? `Note: semantic search was unavailable or incomplete for this query, so these results may be keyword matches only. ${SEMANTIC_UNAVAILABLE_DETAIL}\n\n`
+        ? semanticUnavailableReason === "workers_ai_quota_exhausted" && semanticRetryAt
+          ? `Note: semantic search is temporarily unavailable, so these are keyword matches only. ${workersAiQuotaRetryMessage(semanticRetryAt)}\n\n`
+          : semanticUnavailableReason === "embedding_unavailable"
+            ? "Note: query embedding failed, so these are keyword matches only. Please retry later.\n\n"
+            : `Note: semantic search was unavailable or incomplete for this query, so these results may be keyword matches only. ${SEMANTIC_UNAVAILABLE_DETAIL}\n\n`
+        : "";
+      const graphNotice = graphContribution.requestedHops > 0
+        ? `\n\nGraph contribution: ${graphContribution.selectedCount} selected / ${graphContribution.eligibleCount} eligible / ${graphContribution.expandedCount} expanded from ${graphContribution.seedCount} seeds (hops ${graphContribution.requestedHops}).`
         : "";
 
       if (!matches.length) {
         // A standing instruction can fire above zero results (spec 15 2.8 step 5): it still renders.
         const standingText = standing?.length ? standingSection(standing) : "";
-        return { content: [{ type: "text", text: notice + standingText + `Nothing found matching that query.\n\nreceipt: ${receipt}` }] };
+        return { content: [{ type: "text", text: notice + standingText + `Nothing found matching that query.\n\nreceipt: ${receipt}` + graphNotice }] };
       }
 
-      return { content: [{ type: "text", text: notice + renderRecallText(matches, insight, { queryTokens, config: cfg, compoundStale, asOf: asOfHeader, standing, receipt }) }] };
+      return { content: [{ type: "text", text: notice + renderRecallText(matches, insight, { queryTokens, currentQueryTokens, config: cfg, compoundStale, asOf: asOfHeader, standing, receipt }) + graphNotice }] };
     }
   );
 
@@ -1200,17 +1307,7 @@ export function buildMcpServer(
     "list_recent",
     {
       description: LIST_RECENT_DESCRIPTION,
-      inputSchema: {
-        n: z.number().int().min(1).max(50).default(10),
-        tag: z.string().optional(),
-        after: z.number().int().optional().describe("Only return entries after this Unix ms timestamp"),
-        before: z.number().int().optional().describe("Only return entries before this Unix ms timestamp"),
-        workspace: z.enum(["personal", "company"]).optional().describe("Restrict the listing to one layer: personal or the shared company layer. Omit to list both"),
-        team: z.string().optional().describe("When workspace is company, restrict to one team — id from list_teams"),
-        actor: z.string().optional().describe('Only entries written by one person: their display name as it appears in the header, their user id, or "me" for your own'),
-        project: projectParam.describe("Only entries in one project: its slug from list_projects. An unknown slug is an error, not an empty list"),
-        in_trash: z.boolean().optional().describe("List memories in the trash instead of live ones. Works with n and workspace only."),
-      },
+      inputSchema: INPUT_SCHEMAS.list_recent,
     },
     async ({ n, tag, after, before, workspace, team, actor, project, in_trash }) => {
       if (in_trash) {
@@ -1357,10 +1454,7 @@ export function buildMcpServer(
     "get",
     {
       description: GET_DESCRIPTION,
-      inputSchema: {
-        id: z.string().describe("Entry ID from recall or list_recent"),
-        version: z.number().int().min(1).optional().describe("Read the text before this change, from history — omit for the current text"),
-      },
+      inputSchema: INPUT_SCHEMAS.get,
     },
     async ({ id, version }) => {
       if (version !== undefined) {
@@ -1441,9 +1535,7 @@ export function buildMcpServer(
     "forget",
     {
       description: "Move a memory to the trash by ID. Only call when the user explicitly asks to forget or delete something. Confirm the ID with recall or list_recent first. It stays in the trash for the retention period (14 days unless the owner changed it), and undo brings it back until then.",
-      inputSchema: {
-        id: z.string().describe("Entry ID from recall or list_recent"),
-      },
+      inputSchema: INPUT_SCHEMAS.forget,
       annotations: { destructiveHint: true },
     },
     async ({ id }, extra) => {
@@ -1481,11 +1573,7 @@ export function buildMcpServer(
     "undo",
     {
       description: "Reverse the most recent change to a memory, or restore a memory from the trash. Call when the user says a change was wrong or asks to put something back. Every undo can itself be undone. Pass group (from brief) only when the user asks to undo that whole group.",
-      inputSchema: {
-        id: z.string().optional().describe("Entry ID from recall, list_recent or history"),
-        to_version: z.number().int().positive().optional().describe("Roll all the way back to this version number instead of just undoing the latest change. Get version numbers from history. Only reaches versions still within the kept history — the oldest eventually age out, and a permanently deleted memory has none left to reach."),
-        group: z.string().optional().describe("A group key copied verbatim from the brief tool's \"What AI tools changed\" block, to undo or release every memory in that group. Never build one yourself — only pass one exactly as brief gave it."),
-      },
+      inputSchema: INPUT_SCHEMAS.undo,
       // Reverting a redo lands right back on the change it just reversed (server.ts's own docs on
       // the tool describe this), so calling it twice does not repeat the first call's effect.
       annotations: { idempotentHint: false },
@@ -1563,22 +1651,12 @@ export function buildMcpServer(
     "link",
     {
       description: "Create an explicit relationship link between two memories by ID (e.g. connect a decision to its outcome). Get the IDs from recall or list_recent first.",
-      inputSchema: {
-        source_id: z.string().describe("Source entry ID"),
-        target_id: z.string().describe("Target entry ID"),
-        type: z.enum(Object.keys(EDGE_TYPES) as [string, ...string[]]).default("relates_to").describe(
-          "How the memories relate, read as: SOURCE <type> TARGET. Direction is not cosmetic — source_id is the end the arrow points FROM. "
-          + "relates_to: they belong together, no direction implied (the default; use it when unsure). "
-          + "caused_by: the source happened BECAUSE of the target. "
-          + "decided: the source is a decision the target carries out or reflects; both memories must be episodic. "
-          + "follows: the source came AFTER the target in the same line of thought; both memories must be episodic. "
-          + "supersedes: the source replaces the target, and the target is treated as deprecated — use only when the older memory is genuinely wrong now. "
-          + "drawn_from: the source was derived from the target, as an insight is from its sources.",
-        ),
-      },
+      inputSchema: INPUT_SCHEMAS.link,
     },
     async ({ source_id, target_id, type }) => {
-      // tags ride along on the reads this tool already makes, for the kind gate below.
+      if (source_id === target_id) {
+        return { content: [{ type: "text", text: "Cannot link an entry to itself." }] };
+      }
       const source = await getReadableEntry(env, identity, source_id, "id, workspace_id, actor_id, tags");
       if (!source) return { content: [{ type: "text", text: `No memory found with ID: ${source_id}` }] };
       const target = await getReadableEntry(env, identity, target_id, "id, workspace_id, actor_id, tags");
@@ -1587,7 +1665,6 @@ export function buildMcpServer(
       if (source.workspace_id !== target.workspace_id) {
         return { content: [{ type: "text", text: CROSS_WORKSPACE_LINK_MESSAGE }] };
       }
-      // Same gate as POST /link, same sentence — see kindMismatchMessage.
       if (isValidEdgeType(type) && !kindsAllowEdge(type, kindOfRow(source), kindOfRow(target))) {
         return { content: [{ type: "text", text: kindMismatchMessage(type) }] };
       }
@@ -1608,15 +1685,11 @@ export function buildMcpServer(
     "unlink",
     {
       description: "Remove a relationship link between two memories by ID. Use when a link is incorrect or no longer relevant. Get the IDs from recall or connections first.",
-      inputSchema: {
-        source_id: z.string().describe("Source entry ID"),
-        target_id: z.string().describe("Target entry ID"),
-        type: z.enum(Object.keys(EDGE_TYPES) as [string, ...string[]]).optional().describe("Only remove this relationship type; omit to remove all links between the pair"),
-      },
+      inputSchema: INPUT_SCHEMAS.unlink,
     },
     async ({ source_id, target_id, type }) => {
-      const source = await getReadableEntry(env, identity, source_id);
-      if (!source) return { content: [{ type: "text", text: `No memory found with ID: ${source_id}` }] };
+      const source = await getReadableEntry(env, identity, source_id, "id, workspace_id, actor_id, tags");
+      if (!source) return { content: [{ type: "text", text: `No entry found with ID: ${source_id}` }] };
       const target = await getReadableEntry(env, identity, target_id);
       if (!target) return { content: [{ type: "text", text: `No memory found with ID: ${target_id}` }] };
 
@@ -1631,13 +1704,13 @@ export function buildMcpServer(
     "connections",
     {
       description: CONNECTIONS_DESCRIPTION,
-      inputSchema: {
-        id: z.string().describe("Entry ID from recall or list_recent"),
-        type: z.enum(Object.keys(EDGE_TYPES) as [string, ...string[]]).optional().describe("Filter to a single relationship type"),
-      },
+      inputSchema: INPUT_SCHEMAS.connections,
     },
-    async ({ id, type }) => {
-      const connections = await getConnections(id, type, env, await resolveConfig(env), identity);
+    async ({ id, type, limit, cursor }) => {
+      const row = await getReadableEntry(env, identity, id);
+      if (!row) return { content: [{ type: "text", text: `No entry found with ID: ${id}` }] };
+      const page = await getConnectionsPage(id, type, { limit, cursor }, env, await resolveConfig(env), identity);
+      const { connections } = page;
       if (!connections.length) {
         return { content: [{ type: "text", text: `No connections found for ${id}.` }] };
       }
@@ -1645,10 +1718,16 @@ export function buildMcpServer(
         .map(c => {
           const who = c.provenance === "explicit" ? "you linked" : c.provenance === "system" ? "system-linked" : "auto-linked";
           const when = c.linkedAt ? ` · ${new Date(c.linkedAt).toLocaleDateString("en-US", { year: "numeric", month: "short", day: "numeric" })}` : "";
-          return `- (${c.label} · ${who}${when}) ${c.id}: ${c.content.slice(0, 120)}`;
+          const edge = c.direction === "undirected"
+            ? `${c.sourceId} ↔ ${c.targetId}`
+            : `${c.sourceId} → ${c.targetId} · requested entry is ${c.direction === "outgoing" ? "source" : "target"}`;
+          return `- (${c.label} · ${edge} · ${who}${when}) ${c.id}: ${c.content.slice(0, 120)}`;
         })
         .join("\n");
-      return { content: [{ type: "text", text }] };
+      const continuation = page.nextCursor
+        ? `\n\nNext cursor: ${page.nextCursor}`
+        : "";
+      return { content: [{ type: "text", text: text + continuation }] };
     }
   );
 

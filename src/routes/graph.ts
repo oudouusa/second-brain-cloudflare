@@ -1,11 +1,17 @@
 import type { Env } from "../env";
-import { intParam, json, readWorkspaceParam, readTeamQueryParam } from "../lib/http";
-import { getReadableEntry } from "../lib/entry-access";
+import { intParam, json, readJsonBody, readTeamQueryParam, readWorkspaceParam } from "../lib/http";
 import { requireIdentity } from "../lib/identity";
-import { readableWorkspaces } from "../lib/scope";
-import { createEdge, deleteEdge, isValidEdgeType, kindMismatchMessage, kindOfRow, kindsAllowEdge, CROSS_WORKSPACE_LINK_MESSAGE } from "../graph/edges";
+import { getReadableEntry } from "../lib/entry-access";
+import { readTeamParam, readableWorkspaces } from "../lib/scope";
+import { createEdge, CROSS_WORKSPACE_LINK_MESSAGE, deleteEdge, isValidEdgeType, kindMismatchMessage, kindOfRow, kindsAllowEdge } from "../graph/edges";
 import { EDGE_TYPES } from "../graph/types";
-import { buildGraph, getConnections } from "../graph/traverse";
+import {
+  buildGraph,
+  CONNECTIONS_DEFAULT_LIMIT,
+  CONNECTIONS_MAX_LIMIT,
+  getConnectionsPage,
+  parseConnectionsCursor,
+} from "../graph/traverse";
 import { resolveConfig } from "../config";
 import { readProjectParam } from "./project-param";
 import { maybeMarkFollowedMany } from "../recall/log";
@@ -31,9 +37,6 @@ export async function handleGraphRoutes(
       return json({ ok: false, error: `type must be one of: ${Object.keys(EDGE_TYPES).join(", ")}` }, 400);
     }
     if (sourceId === targetId) return json({ ok: false, error: "Cannot link an entry to itself" }, 400);
-
-    // tags ride along on the reads this route already makes, so the kind gate
-    // below costs no extra query.
     const source = await getReadableEntry(env, auth, sourceId, "id, workspace_id, actor_id, tags");
     if (!source) return json({ ok: false, error: `No memory found with ID: ${sourceId}` }, 404);
     const target = await getReadableEntry(env, auth, targetId, "id, workspace_id, actor_id, tags");
@@ -48,11 +51,6 @@ export async function handleGraphRoutes(
     if (source.workspace_id !== target.workspace_id) {
       return json({ ok: false, error: CROSS_WORKSPACE_LINK_MESSAGE, code: "cross_workspace_link" }, 400);
     }
-
-    // `decided` and `follows` mean something only between episodic memories.
-    // Inference and the insight pass both check this; an explicit caller that
-    // did not would be the one writer able to create the edge the type exists
-    // to exclude.
     if (!kindsAllowEdge(type, kindOfRow(source), kindOfRow(target))) {
       return json({ ok: false, error: kindMismatchMessage(type), code: "kind_not_allowed" }, 400);
     }
@@ -84,8 +82,8 @@ export async function handleGraphRoutes(
       return json({ ok: false, error: `type must be one of: ${Object.keys(EDGE_TYPES).join(", ")}` }, 400);
     }
 
-    const source = await getReadableEntry(env, auth, sourceId);
-    if (!source) return json({ ok: false, error: `No memory found with ID: ${sourceId}` }, 404);
+    const source = await getReadableEntry(env, auth, sourceId, "id, workspace_id, actor_id, tags");
+    if (!source) return json({ ok: false, error: `No entry found with ID: ${sourceId}` }, 404);
     const target = await getReadableEntry(env, auth, targetId);
     if (!target) return json({ ok: false, error: `No memory found with ID: ${targetId}` }, 404);
 
@@ -93,17 +91,44 @@ export async function handleGraphRoutes(
     return json({ ok: true, deleted });
   }
 
-  // GET /connections — 1-hop neighbors of an entry, mirrors the MCP `connections` tool
   if (url.pathname === "/connections" && request.method === "GET") {
+    return new Response(JSON.stringify({ ok: false, error: "Use POST /connections with a JSON body" }), {
+      status: 405,
+      headers: { "Content-Type": "application/json", "Allow": "POST" },
+    });
+  }
+
+  // POST /connections — 1-hop neighbors of an entry, mirrors the MCP `connections` tool
+  if (url.pathname === "/connections" && request.method === "POST") {
     const auth = await requireIdentity(request, env);
     if (auth instanceof Response) return auth;
 
-    const id = url.searchParams.get("id")?.trim();
+    const parsed = await readJsonBody<{ id?: unknown; type?: unknown; limit?: unknown; cursor?: unknown }>(request, 8 * 1024);
+    if (!parsed.ok) return parsed.response;
+    const id = typeof parsed.value.id === "string" ? parsed.value.id.trim() : "";
     if (!id) return json({ ok: false, error: "id is required" }, 400);
-    const type = url.searchParams.get("type")?.trim() || undefined;
+    if (!await getReadableEntry(env, auth, id)) {
+      return json({ ok: false, error: `No entry found with ID: ${id}` }, 404);
+    }
+    const type = typeof parsed.value.type === "string" ? parsed.value.type.trim() || undefined : undefined;
+    if (type && !isValidEdgeType(type)) {
+      return json({ ok: false, error: `type must be one of: ${Object.keys(EDGE_TYPES).join(", ")}` }, 400);
+    }
+    const limit = parsed.value.limit === undefined ? CONNECTIONS_DEFAULT_LIMIT : parsed.value.limit;
+    if (typeof limit !== "number" || !Number.isSafeInteger(limit) || limit < 1 || limit > CONNECTIONS_MAX_LIMIT) {
+      return json({ ok: false, error: `limit must be an integer from 1 to ${CONNECTIONS_MAX_LIMIT}` }, 400);
+    }
+    const cursor = parsed.value.cursor === undefined
+      ? undefined
+      : typeof parsed.value.cursor === "string" ? parsed.value.cursor.trim() : null;
+    if (cursor === null || parseConnectionsCursor(cursor) === null) {
+      return json({ ok: false, error: "cursor is invalid" }, 400);
+    }
 
-    const connections = await getConnections(id, type, env, await resolveConfig(env), auth);
-    return json({ ok: true, id, connections });
+    const page = await getConnectionsPage(
+      id, type, { limit, cursor }, env, await resolveConfig(env), auth,
+    );
+    return json({ ok: true, id, connections: page.connections, next_cursor: page.nextCursor });
   }
 
   // GET /graph — node+edge subgraph for the dashboard graph view (dashboard-only;
@@ -112,7 +137,10 @@ export async function handleGraphRoutes(
     const auth = await requireIdentity(request, env);
     if (auth instanceof Response) return auth;
 
-    const seed = url.searchParams.get("seed")?.trim() || undefined;
+    if (url.searchParams.has("seed")) {
+      return json({ ok: false, error: "Use POST /graph for a private seed" }, 405);
+    }
+    const seed = undefined;
     // Omitted still means the whole graph, up to buildGraph's own ceiling. The
     // floor of 1 is what stops `?limit=0` and `?limit=-1` from meaning that too.
     const limit = intParam(url, "limit", { min: 1 });
@@ -124,11 +152,44 @@ export async function handleGraphRoutes(
     const team = readTeamQueryParam(url, auth, workspace);
     if (team instanceof Response) return team;
 
-    // Restricts the unseeded view to a project's members; an explicit seed walks from that seed regardless.
     const project = await readProjectParam(env, auth, url, { layer: workspace, teamId: team });
     if (project instanceof Response) return project;
+    const { nodes, edges } = await buildGraph(
+      { seed, limit, only: workspace, teamId: team, project },
+      env,
+      await resolveConfig(env),
+      auth,
+    );
+    return json({ ok: true, nodes, edges });
+  }
 
-    const { nodes, edges } = await buildGraph({ seed, limit, only: workspace, teamId: team, project }, env, await resolveConfig(env), auth);
+  if (url.pathname === "/graph" && request.method === "POST") {
+    const auth = await requireIdentity(request, env);
+    if (auth instanceof Response) return auth;
+    const parsed = await readJsonBody<{ seed?: unknown; limit?: unknown; workspace?: unknown; team?: unknown; project?: unknown }>(request, 8 * 1024);
+    if (!parsed.ok) return parsed.response;
+    const seed = typeof parsed.value.seed === "string" ? parsed.value.seed.trim() || undefined : undefined;
+    if (parsed.value.limit !== undefined
+      && (typeof parsed.value.limit !== "number" || !Number.isSafeInteger(parsed.value.limit))) {
+      return json({ ok: false, error: "limit must be an integer" }, 400);
+    }
+    const limit = typeof parsed.value.limit === "number" ? Math.max(1, parsed.value.limit) : undefined;
+    if (parsed.value.workspace !== undefined
+      && parsed.value.workspace !== "personal"
+      && parsed.value.workspace !== "company") {
+      return json({ ok: false, error: 'workspace must be "personal" or "company"' }, 400);
+    }
+    if (seed && !await getReadableEntry(env, auth, seed)) {
+      return json({ ok: false, error: `No entry found with ID: ${seed}` }, 404);
+    }
+    const only = parsed.value.workspace as "personal" | "company" | undefined;
+    const teamRead = readTeamParam(parsed.value.team, auth, only);
+    if (teamRead.error) return json({ ok: false, error: teamRead.error }, 400);
+    const project = await readProjectParam(env, auth, url, { layer: only, teamId: teamRead.teamId }, parsed.value.project);
+    if (project instanceof Response) return project;
+    const { nodes, edges } = await buildGraph(
+      { seed, limit, only, teamId: teamRead.teamId, project }, env, await resolveConfig(env), auth,
+    );
     return json({ ok: true, nodes, edges });
   }
 

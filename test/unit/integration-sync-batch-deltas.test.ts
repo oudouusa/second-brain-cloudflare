@@ -3,6 +3,7 @@ import { makeMemoryKV } from "../helpers/make-env";
 import { notionProvider, makeCalendarProvider, loadIntegration, ItemMapDeltas } from "../../src/integrations";
 import type { IntegrationRecord, ItemMapEntry } from "../../src/integrations";
 
+// fork では 1 回 1 件の上限を保ち、後続呼出しでも同一キーの更新・削除が収束することを確認する。
 // #348 follow-up. A sync now records its writes as deltas over its read
 // snapshot and applies them to a fresh record at save time. Within one batch a
 // later iteration must still see earlier successful puts/deletes, exactly as
@@ -52,17 +53,16 @@ describe("Notion sync: in-batch reads see earlier deltas", () => {
     const kv = makeMemoryKV();
     await kv.put("integrations:notion", JSON.stringify(seed("notion")));
     let search = 0;
-    vi.stubGlobal("fetch", vi.fn(async (url: string) => ({
-      ok: true,
-      json: async () => url.endsWith("/search")
+    vi.stubGlobal("fetch", vi.fn(async (url: string) => new Response(JSON.stringify(url.endsWith("/search")
         ? { results: [page("p", ++search === 1 ? "v1" : "v2")], has_more: search === 1, next_cursor: "next" }
-        : { results: [], has_more: false },
-    })));
+        : { results: [], has_more: false }), { status: 200 })));
     const s = store();
 
     const out = await notionProvider.sync({ OAUTH_KV: kv }, s);
 
-    expect(out).toMatchObject({ ok: true, created: 1, updated: 1, failed: 0 });
+    expect(out).toMatchObject({ ok: true, created: 1, updated: 0, failed: 0, remaining: 1 });
+    const next = await notionProvider.sync({ OAUTH_KV: kv }, s);
+    expect(next).toMatchObject({ ok: true, created: 0, updated: 1, failed: 0 });
     expect(s.createEntry).toHaveBeenCalledTimes(1);
     expect(s.updateEntry).toHaveBeenCalledWith("e-1", expect.any(String));
     expect((await loadIntegration({ OAUTH_KV: kv }, "notion"))!.itemMap.p).toEqual({ entryId: "e-1", version: "v2" });
@@ -71,12 +71,9 @@ describe("Notion sync: in-batch reads see earlier deltas", () => {
   it("a page archived twice is deleted and counted once", async () => {
     const kv = makeMemoryKV();
     await kv.put("integrations:notion", JSON.stringify(seed("notion", { p: { entryId: "old", version: "v0" } })));
-    vi.stubGlobal("fetch", vi.fn(async (url: string) => ({
-      ok: true,
-      json: async () => url.endsWith("/search")
+    vi.stubGlobal("fetch", vi.fn(async (url: string) => new Response(JSON.stringify(url.endsWith("/search")
         ? { results: [page("p", "v1", true), page("p", "v1", true)], has_more: false }
-        : { results: [], has_more: false },
-    })));
+        : { results: [], has_more: false }), { status: 200 })));
     const s = store();
 
     const out = await notionProvider.sync({ OAUTH_KV: kv }, s);
@@ -90,18 +87,17 @@ describe("Notion sync: in-batch reads see earlier deltas", () => {
     const kv = makeMemoryKV();
     await kv.put("integrations:notion", JSON.stringify(seed("notion", { p: { entryId: "old", version: "v0" } })));
     // Listed live (changed) and archived (delete signal) in one listing.
-    vi.stubGlobal("fetch", vi.fn(async (url: string) => ({
-      ok: true,
-      json: async () => url.endsWith("/search")
+    vi.stubGlobal("fetch", vi.fn(async (url: string) => new Response(JSON.stringify(url.endsWith("/search")
         ? { results: [page("p", "v1"), page("p", "v1", true)], has_more: false }
-        : { results: [], has_more: false },
-    })));
+        : { results: [], has_more: false }), { status: 200 })));
     const s = store();
     s.updateEntry.mockResolvedValue("not_found"); // mirror gone out-of-band: re-create
 
     const out = await notionProvider.sync({ OAUTH_KV: kv }, s);
 
-    expect(out).toMatchObject({ ok: true, created: 1, deleted: 1 });
+    expect(out).toMatchObject({ ok: true, created: 1, deleted: 0 });
+    const next = await notionProvider.sync({ OAUTH_KV: kv }, s);
+    expect(next).toMatchObject({ ok: true, created: 0, deleted: 1 });
     expect(s.deleteEntry).toHaveBeenCalledTimes(1);
     expect(s.deleteEntry).toHaveBeenCalledWith("e-1");
     expect((await loadIntegration({ OAUTH_KV: kv }, "notion"))!.itemMap).toEqual({});
@@ -127,7 +123,9 @@ describe("calendar sync: in-batch reads see earlier deltas", () => {
 
     const out = await provider.sync({ OAUTH_KV: kv }, s);
 
-    expect(out).toMatchObject({ ok: true, total: 2, created: 1, updated: 1, failed: 0 });
+    expect(out).toMatchObject({ ok: true, total: 2, created: 1, updated: 0, failed: 0, remaining: 1 });
+    const next = await provider.sync({ OAUTH_KV: kv }, s);
+    expect(next).toMatchObject({ ok: true, created: 0, updated: 1, failed: 0 });
     expect(s.createEntry).toHaveBeenCalledTimes(1);
     expect(s.updateEntry).toHaveBeenCalledWith("e-1", expect.any(String));
     const rec = (await loadIntegration({ OAUTH_KV: kv }, "calendar-google"))!;

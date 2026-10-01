@@ -33,7 +33,7 @@ describe("GET /standing reports the configured limit", () => {
     resetDatabaseInit();
     resetStandingIsolateState();
     sqlite = makeSqliteD1();
-    env = makeTestEnv(undefined, { DB: sqlite.db as unknown as D1Database, OAUTH_KV: makeMemoryKV(), AUTH_TOKEN: token });
+    env = sqlite.admitEnv(makeTestEnv(undefined, { DB: sqlite.db as unknown as D1Database, OAUTH_KV: makeMemoryKV(), AUTH_TOKEN: token }));
     await initializeDatabase(env);
     await ensureTenantBootstrap(env);
   });

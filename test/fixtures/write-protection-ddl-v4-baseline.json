@@ -1,0 +1,40 @@
+{
+  "fresh": {
+    "result": {
+      "changed": true
+    },
+    "schemaVersion": {
+      "version": 9
+    },
+    "statementCount": 101,
+    "statementsSha256": "1439b2a98fda1786e8cae6ae83fc9f285c44ec589a0729d91c0eb971335c568f",
+    "objectCount": 130,
+    "sqliteMasterSha256": "4db38e2d6c9e8a8adc0c1405a193a0231d2f17a8bf737b7ba841629868c5edb8"
+  },
+  "v3": {
+    "result": {
+      "changed": true
+    },
+    "schemaVersion": {
+      "version": 9
+    },
+    "statementCount": 66,
+    "statementsSha256": "683abcf7e6110220f6c7bdac11c19c224049dc19f3f03dd1ef65a623c3d699ad",
+    "objectCount": 131,
+    "sqliteMasterSha256": "fec45d31332d1319a94b82cc4d625e59143844aca3e270bcfbcbf0436f5803d8"
+  },
+  "v7": {
+    "result": {
+      "changed": true
+    },
+    "schemaVersion": {
+      "version": 9
+    },
+    "statementCount": 44,
+    "statementsSha256": "71be6f34aeebea466384c3c6798f319099447fb14f83925359b89326dc0f49ad",
+    "objectCount": 130,
+    "sqliteMasterSha256": "71123fdd79e22a4f7914645bfb0951d0d7fd0f95db2d6f21efd9bcd5b6abba7c"
+  },
+  "referenceObjectCount": 130,
+  "referenceSqliteMasterSha256": "13135ad9891ccbeaabb73270261f37802aec500a71373346ba53c963d522cc3d"
+}

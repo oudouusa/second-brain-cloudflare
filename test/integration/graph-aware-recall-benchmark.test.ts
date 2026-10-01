@@ -19,7 +19,7 @@ const cases = [
 function suppressKeywordSearch(db: ReturnType<typeof makeTestDb>) {
   const prepare = db.prepare.bind(db);
   (db as any).prepare = (sql: string) => {
-    if (sql.includes("WHERE content LIKE") && sql.includes("ORDER BY created_at DESC LIMIT")) {
+    if (/WHERE \(?content LIKE/.test(sql) && /ORDER BY (?:\(CASE WHEN content LIKE|created_at DESC LIMIT)/.test(sql)) {
       return { bind: () => ({ all: async () => ({ results: [] }) }) };
     }
     return prepare(sql);

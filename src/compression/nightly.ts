@@ -1,7 +1,7 @@
 import type { Env } from "../env";
 import { resolveConfig } from "../config";
 import { initializeDatabase } from "../db/init";
-import { COMPRESSION_MIN_AGE_MS, compressionEligibilitySql, isTopicTagSql } from "./eligibility";
+import { COMPRESSION_MIN_AGE_MS, compressionEligibilitySql, isCompressionTagSql } from "./eligibility";
 import { compressTag, HELD_DIGESTS_READ_LIMIT, heldSetFrom, prepareHeldDigests } from "./digest";
 import { prepareActiveProjects, projectRowsOf, type ProjectRow } from "../projects/registry";
 import { PROJECT_TAG_PREFIX } from "../tags/system";
@@ -20,7 +20,7 @@ import { PROJECT_TAG_PREFIX } from "../tags/system";
  * Nothing bounded this before: every tag with more than ten eligible entries was
  * compressed on every run, so both costs grew with how many distinct tags a user had.
  */
-export const COMPRESSION_MAX_TAGS_PER_RUN = 4;
+export const COMPRESSION_MAX_TAGS_PER_RUN = 2;
 
 /** Where the rotation resumes from. Operational state, so KV rather than a tags value. */
 const TAG_CURSOR_KEY = "compression:tag-cursor";
@@ -34,8 +34,8 @@ const TAG_CURSOR_KEY = "compression:tag-cursor";
  * shifts as entries are rolled up — an index would silently skip whatever moved.
  * An unknown or missing cursor starts from the top, which is also the first-run path.
  */
-async function selectTagsForRun(env: Env, tags: string[]): Promise<string[]> {
-  if (tags.length <= COMPRESSION_MAX_TAGS_PER_RUN) return tags;
+async function selectTagsForRun(env: Env, tags: string[], maxTags: number): Promise<string[]> {
+  if (tags.length <= maxTags) return tags;
 
   let start = 0;
   try {
@@ -47,7 +47,7 @@ async function selectTagsForRun(env: Env, tags: string[]): Promise<string[]> {
   }
 
   const picked = Array.from(
-    { length: Math.min(COMPRESSION_MAX_TAGS_PER_RUN, tags.length) },
+    { length: Math.min(maxTags, tags.length) },
     (_, i) => tags[(start + i) % tags.length],
   );
 
@@ -71,7 +71,11 @@ export async function runNightlyCompression(
   env: Env,
   ctx: ExecutionContext,
   workspaceId?: string | null,
-): Promise<{ digestsWritten: number }> {
+  maxTags = COMPRESSION_MAX_TAGS_PER_RUN,
+): Promise<{ digestsWritten: number; complete?: false }> {
+  if (!Number.isInteger(maxTags) || maxTags < 1 || maxTags > COMPRESSION_MAX_TAGS_PER_RUN) {
+    throw new RangeError("Invalid compression tag limit");
+  }
   const cfg = await resolveConfig(env);
   await initializeDatabase(env);
 
@@ -82,7 +86,7 @@ export async function runNightlyCompression(
   const candidateQuery = env.DB.prepare(`
     SELECT value as tag, COUNT(*) as count
     FROM entries, json_each(entries.tags)
-    WHERE ${isTopicTagSql()}
+    WHERE ${isCompressionTagSql()}
       AND entries.tags NOT LIKE '%"rolled-up"%'
       AND entries.tags NOT LIKE '%"synthesized"%'
       AND entries.tags NOT LIKE '%"auto-pattern"%'
@@ -97,7 +101,7 @@ export async function runNightlyCompression(
 
   // Registry-driven project digests join the topic candidates, keyed `project:<slug>`, and
   // share the one bound and cursor: the key space just gains project members. The registry
-  // read rides in ONE batch with the candidate query, so it costs no extra subrequest against
+  // read is batched with the candidate query. D1 counts both SQL statements against
   // the cron's shared budget. Members are decided by compressTag (the tag or any alias, and
   // the usual >= 10 eligible entries), so a thin project costs one rotation slot and two
   // statements, never a wrong digest.
@@ -130,21 +134,25 @@ export async function runNightlyCompression(
   }
   const projectKeys = [...projectsBySlug.keys()].sort().map(slug => `${PROJECT_TAG_PREFIX}${slug}`);
 
-  const tags = await selectTagsForRun(env, [...results.map(r => r.tag as string), ...projectKeys]);
+  const tags = await selectTagsForRun(env, [...results.map(r => r.tag as string), ...projectKeys], maxTags);
+
+
 
   let digestsWritten = 0;
+  let complete = true;
   for (const tag of tags) {
     try {
       const rows = tag.startsWith(PROJECT_TAG_PREFIX) ? projectsBySlug.get(tag.slice(PROJECT_TAG_PREFIX.length)) : undefined;
-      // Only the workspaces that hold the project are rolled up, each with its own row's aliases.
       const result = await compressTag(tag, env, ctx, rows
         ? { workspaceIds: [...new Set(rows.map(r => r.workspace_id))], project: rows, heldDigests }
-        : { heldDigests });
+        : { heldDigests, ...(workspaceId == null ? {} : { workspaceIds: [workspaceId] }) });
       if (result.synthesizedId) digestsWritten++;
+      if (result.complete === false) complete = false;
     } catch (e) {
+      complete = false;
       console.error(`Compression failed for tag "${tag}" (non-fatal):`, e);
     }
   }
 
-  return { digestsWritten };
+  return complete ? { digestsWritten } : { digestsWritten, complete: false };
 }

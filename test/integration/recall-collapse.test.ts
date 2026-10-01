@@ -21,13 +21,13 @@ function denseEnv(sqlite: SqliteD1, index: { id: string; score: number }[]): Env
   const query = vi.fn(async (_v: unknown, opts: { topK?: number } = {}) => ({
     matches: index.slice(0, opts.topK ?? 10).map(m => ({ id: m.id, score: m.score, metadata: { parentId: m.id, isUpdate: false } })),
   }));
-  return makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV(), VECTORIZE: makeVectorizeMock({ query: query as never }) });
+  return sqlite.admitEnv(makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV(), VECTORIZE: makeVectorizeMock({ query: query as never }) }));
 }
 
 async function setup() {
   resetDatabaseInit();
   const sqlite = makeSqliteD1();
-  const env = makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV() });
+  const env = sqlite.admitEnv(makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV() }));
   await initializeDatabase(env);
   sqlite.issued.length = 0;
   return { sqlite, env };
@@ -177,7 +177,7 @@ describe("REST /recall exposes similar[]", () => {
         ],
       })),
     });
-    const res = await worker.fetch(req("GET", "/recall?query=statement+balance"), env, ctx);
+    const res = await worker.fetch(req("POST", "/recall?query=statement+balance"), env, ctx);
     const body = await res.json() as any;
     const survivor = body.results.find((r: any) => r.id === "notice1");
     expect(survivor.similar).toEqual([{ id: "notice2", created_at: 1000 }]);

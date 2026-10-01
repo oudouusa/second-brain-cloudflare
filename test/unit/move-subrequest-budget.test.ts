@@ -36,9 +36,7 @@ import type { Env } from "../../src/env";
 
 const FREE_PLAN_SUBREQUESTS = 50;
 
-// D1 bills EXECUTIONS: run/first/all/exec spend one each, batch() spends one
-// however many statements it carries — same rule cron-subrequest-budget.test.ts
-// uses, so the two budgets stay comparable.
+// D1はbatch内の各statementも計数し、Vectorizeとは別に上限を検査する。
 function countingD1(sqliteDb: any, tally: { d1: number }) {
   const wrap = (stmt: any, sql: string): any => ({
     bind: (...a: any[]) => wrap(stmt.bind(...a), sql),
@@ -50,7 +48,7 @@ function countingD1(sqliteDb: any, tally: { d1: number }) {
   return {
     prepare(sql: string) { return wrap(sqliteDb.prepare(sql), sql); },
     exec(sql: string) { tally.d1++; return sqliteDb.exec(sql); },
-    batch: (stmts: any[]) => { tally.d1++; return sqliteDb.batch(stmts.map((s: any) => s.__inner ?? s)); },
+    batch: (stmts: any[]) => { tally.d1 += stmts.length; return sqliteDb.batch(stmts.map((s: any) => s.__inner ?? s)); },
   } as unknown as D1Database;
 }
 
@@ -96,9 +94,10 @@ describe("#347 move batch subrequest budget (D1 + Vectorize)", () => {
     // ── Phase 1: probe the real batch size, without pretending to know it ──
     const probeD1 = makeSqliteD1();
     const probeKv = makeMemoryKV();
-    const probeEnv = { ...makeTestEnv(undefined, { DB: probeD1.db as unknown as any, VECTORIZE: makeVectorizeMock(), OAUTH_KV: probeKv }), AUTH_TOKEN: "test-token" } as Env;
+    let probeEnv = { ...makeTestEnv(undefined, { DB: probeD1.db as unknown as any, VECTORIZE: makeVectorizeMock(), OAUTH_KV: probeKv }), AUTH_TOKEN: "test-token" } as Env;
     resetDatabaseInit();
     await initializeDatabase(probeEnv);
+    probeEnv = probeD1.admitEnv(probeEnv);
     const probeRoots = await ensureTenantBootstrap(probeEnv);
     const probeHelper = makeCtx();
     // Far more than any plausible batch size, so the response's `moved` count
@@ -125,23 +124,15 @@ describe("#347 move batch subrequest budget (D1 + Vectorize)", () => {
     const tally = { d1: 0, vectorize: 0 };
     const vectorize = countingVectorize(tally);
     const kv = makeMemoryKV();
-    const env = { ...makeTestEnv(undefined, { DB: countingD1(d1.db, tally), VECTORIZE: vectorize, OAUTH_KV: kv }), AUTH_TOKEN: "test-token" } as Env;
+    let env = { ...makeTestEnv(undefined, { DB: countingD1(d1.db, tally), VECTORIZE: vectorize, OAUTH_KV: kv }), AUTH_TOKEN: "test-token" } as Env;
     resetDatabaseInit();
     await initializeDatabase(env);
+    env = d1.admitEnv(env);
     const roots = await ensureTenantBootstrap(env);
     const helper = makeCtx();
 
-    // Long, NON-mirrored content: chunkText splits above CHUNK_MAX_CHARS
-    // (1600), and only mirrored sources are truncated to their first chunk.
-    // Notion's own MAX_PAGE_CONTENT_CHARS (8000, ~5 chunks) is the documented
-    // worst case for ONE provider, but MOVE_BATCH_SIZE has no per-entry size
-    // ceiling at all — nothing stops an entry mirrored from a large
-    // transcript, a long email thread, or a future provider with no
-    // equivalent cap from carrying far more chunks than that. 48000 chars
-    // (~30 chunks/entry) models that unbounded case: not Notion specifically,
-    // but the batch's actual worst case, which is "as large as one entry's
-    // content is allowed to get" — currently unlimited.
-    const longContent = "x".repeat(48000);
+    // フォークの12,000文字上限内で最大級の複数chunkを作る。
+    const longContent = "x".repeat(11980);
     for (let i = 0; i < batchSize; i++) {
       await captureEntry(`${longContent} unique-${i}`, [], "api", env, helper.ctx, undefined, {
         workspaceId: roots.ownerPersonalWorkspaceId, actorId: roots.ownerUserId,

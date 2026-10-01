@@ -45,6 +45,8 @@ function captureReceipt(result, typedTags) {
     notes.push(t('home.receiptSimilarNote'))
   }
 
+  if (result.semantic_unavailable) notes.push(t('home.receiptIndexPending'))
+
   el.innerHTML =
     `<div class="receipt-headline"><span class="receipt-dot"></span>${escHtml(headline)}</div>` +
     (filed.length || projects

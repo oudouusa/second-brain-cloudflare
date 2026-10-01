@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { makeSqliteD1 } from "../helpers/sqlite-d1";
 import type { Env } from "../../src/env";
 import { hashToken, resolveIdentity } from "../../src/lib/identity";
@@ -58,10 +58,62 @@ describe("tenant bootstrap", () => {
     expect(c.companies).toBe(1);
   });
 
+  it.each([0, 2, 3])("解放失敗%d回でも初期化済みの認証と3回上限を維持する", async (failures) => {
+    const d1 = makeSqliteD1();
+    const env = makeEnv(d1.db);
+    const errorLog = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      d1.seed({ id: "legacy", content: "legacy memory", createdAt: 1000 });
+      await env.DB.prepare("DELETE FROM memory_write_admissions").run();
+      const prepare = env.DB.prepare.bind(env.DB);
+      let attempts = 0;
+      vi.spyOn(env.DB, "prepare").mockImplementation(sql => {
+        const statement = prepare(sql);
+        if (!sql.startsWith("DELETE FROM memory_write_admissions WHERE token =")) return statement;
+        const bind = statement.bind.bind(statement);
+        statement.bind = (...values) => {
+          const bound = bind(...values);
+          const run = bound.run.bind(bound);
+          bound.run = async () => {
+            if (++attempts <= failures) throw new Error("provider-private-detail");
+            return run();
+          };
+          return bound;
+        };
+        return statement;
+      });
+      const roots = await ensureTenantBootstrap(env);
+      expect(attempts).toBe(Math.min(failures + 1, 3));
+      const row = await env.DB.prepare("SELECT workspace_id FROM entries WHERE id = 'legacy'")
+        .first<{ workspace_id: string }>();
+      expect(row?.workspace_id).toBe(roots.ownerPersonalWorkspaceId);
+      const remaining = await env.DB.prepare("SELECT COUNT(*) AS n FROM memory_write_admissions")
+        .first<{ n: number }>();
+      expect(remaining?.n).toBe(failures === 3 ? 1 : 0);
+      if (failures === 3) {
+        expect(errorLog).toHaveBeenCalledExactlyOnceWith("Tenant bootstrap admission release failed");
+      } else {
+        expect(errorLog).not.toHaveBeenCalled();
+      }
+      expect(await ensureTenantBootstrap(env)).toEqual(roots);
+    } finally {
+      vi.restoreAllMocks();
+      d1.close();
+    }
+  });
+
   it("backfills legacy entries and edges into the owner's personal workspace", async () => {
     const d1 = makeSqliteD1();
     d1.seed({ id: "e1", content: "legacy memory", createdAt: 1000 });
     const env = { DB: d1.db as unknown as Env["DB"], AUTH_TOKEN: "t" } as Env;
+    await env.DB.prepare(
+      `INSERT INTO edges (id, source_id, target_id, type, weight, provenance, metadata, created_at, updated_at, write_marker)
+       VALUES ('edge-1', 'e1', 'e1', 'relates_to', 0.5, 'explicit', '{}', 1000, 1000, ?)`,
+    ).bind(d1.fixtureMarker()).run();
+    // Match an upgraded production brain: legacy rows were written under an old,
+    // expired capability and no admission is live when Team bootstrap begins.
+    await env.DB.prepare(`DELETE FROM memory_write_admissions`).run();
+
     const roots = await ensureTenantBootstrap(env);
     const row = await env.DB.prepare(`SELECT workspace_id FROM entries WHERE id = 'e1'`).first<{
       workspace_id: string;
@@ -72,6 +124,14 @@ describe("tenant bootstrap", () => {
       `SELECT COUNT(*) AS n FROM entries WHERE workspace_id = ''`,
     ).first<{ n: number }>();
     expect(orphans?.n).toBe(0);
+    const edge = await env.DB.prepare(
+      `SELECT workspace_id FROM edges WHERE id = 'edge-1'`,
+    ).first<{ workspace_id: string }>();
+    expect(edge?.workspace_id).toBe(roots.ownerPersonalWorkspaceId);
+    const admissions = await env.DB.prepare(
+      `SELECT COUNT(*) AS n FROM memory_write_admissions`,
+    ).first<{ n: number }>();
+    expect(admissions?.n).toBe(0);
   });
 });
 
@@ -127,11 +187,11 @@ describe("identity resolution", () => {
     )
       .bind(await hashToken("b-token"))
       .run();
-    const request = new Request("https://x/", { headers: { Authorization: "Bearer b-token" } });
+    const request = () => new Request("https://x/", { headers: { Authorization: "Bearer b-token" } });
     // No memberships yet: the JOIN finds neither a personal nor the company
     // workspace, so the user cannot authenticate at all (invariant 3 enforced
     // structurally, not by convention).
-    expect(await resolveIdentity(request, env)).toBeNull();
+    expect(await resolveIdentity(request(), env)).toBeNull();
     await env.DB.batch([
       env.DB.prepare(
         `INSERT INTO workspaces (id, kind, name, created_at) VALUES ('ws-b', 'personal', 'B', 1)`,
@@ -141,7 +201,7 @@ describe("identity resolution", () => {
         `INSERT INTO memberships (user_id, workspace_id, created_at) VALUES ('u2', ?, 1)`,
       ).bind(roots.companyWorkspaceId),
     ]);
-    const identity = await resolveIdentity(request, env);
+    const identity = await resolveIdentity(request(), env);
     expect(identity).not.toBeNull();
     expect(identity!.role).toBe("member");
     expect(identity!.personalWorkspaceId).toBe("ws-b");

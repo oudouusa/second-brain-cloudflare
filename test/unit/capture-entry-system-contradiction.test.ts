@@ -41,7 +41,7 @@ function makeSseStream(response: string) {
 function makeContradictionAI(response: string) {
   return {
     run: vi.fn().mockImplementation(async (model: string) => {
-      if (model === "@cf/baai/bge-small-en-v1.5") return { data: [new Array(384).fill(0.1)] };
+      if (model === "@cf/google/embeddinggemma-300m") return { data: [new Array(768).fill(0.1)] };
       return makeSseStream(response);
     }),
   } as unknown as Ai;
@@ -60,7 +60,7 @@ describe("captureEntry() system-job contradiction protection (D2)", () => {
     ["digest", "system:digest", "synthesized"],
     ["insight", "system:insight", "auto-insight"],
   ] as const)("a %s capture that contradicts a user row stores it as a held draft and leaves the user row's status alone", async (job, channel, ownJobTag) => {
-    const env = {
+    const env = d1.admitEnv({
       DB: d1.db as unknown as Env["DB"],
       VECTORIZE: makeVectorizeMock({
         query: vi.fn().mockResolvedValue({
@@ -70,7 +70,7 @@ describe("captureEntry() system-job contradiction protection (D2)", () => {
       AI: makeContradictionAI('{"contradicts": true, "conflicting_id": "user-row", "reason": "changed"}'),
       OAUTH_KV: makeMemoryKV(),
       AUTH_TOKEN: "test-token",
-    } as Env;
+    } as Env);
     await initializeDatabase(env);
     d1.seed({ id: "user-row", content: "We decided the plan is X", createdAt: Date.now(), tags: ["decisions"], source: "api" });
 
@@ -96,7 +96,7 @@ describe("captureEntry() system-job contradiction protection (D2)", () => {
   });
 
   it("a system job still supersedes its own untouched system row", async () => {
-    const env = {
+    const env = d1.admitEnv({
       DB: d1.db as unknown as Env["DB"],
       VECTORIZE: makeVectorizeMock({
         query: vi.fn().mockResolvedValue({
@@ -106,7 +106,7 @@ describe("captureEntry() system-job contradiction protection (D2)", () => {
       AI: makeContradictionAI('{"contradicts": true, "conflicting_id": "old-insight", "reason": "superseded"}'),
       OAUTH_KV: makeMemoryKV(),
       AUTH_TOKEN: "test-token",
-    } as Env;
+    } as Env);
     await initializeDatabase(env);
     // source "system", no actor_id (defaults to '' per db/schema.sql): a real
     // system-authored row, the way runWeeklyInsights and compressTag write one.

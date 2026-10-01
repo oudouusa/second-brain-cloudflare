@@ -11,6 +11,7 @@ import { recallEntries } from "../../src/recall/search";
 import { makeTestEnv, makeTestDb, makeVectorizeMock, makeMemoryKV } from "../helpers/make-env";
 import { CONFIG_KEY } from "../../src/config";
 import { D1Mock } from "../helpers/d1-mock";
+import { VECTORIZE_WIDEN_MAX_CANDIDATES } from "../../src/constants";
 
 function makeCtx() {
   const pending: Promise<any>[] = [];
@@ -25,7 +26,7 @@ function seed(db: D1Mock, id: string, content: string) {
 }
 
 /**
- * Narrow queries return only the weak match; the widened re-query (topK 50)
+ * Narrow queries return only the weak match; the bounded widened re-query
  * also returns `extra`. So `extra` appearing in the result IS the observable
  * evidence that widening happened — no assertions on mock call counts.
  */
@@ -37,7 +38,7 @@ function wideningEnv(db: D1Mock, overrides?: Record<string, unknown>) {
       query: vi.fn().mockImplementation(async (_v: unknown, opts: { topK?: number } = {}) => {
         const weak = { id: "weak", score: 0.5, metadata: { parentId: "weak", isUpdate: false } };
         const extra = { id: "extra", score: 0.45, metadata: { parentId: "extra", isUpdate: false } };
-        return { matches: opts.topK === 50 ? [weak, extra] : [weak] };
+        return { matches: opts.topK === VECTORIZE_WIDEN_MAX_CANDIDATES ? [weak, extra] : [weak] };
       }),
     }),
   });
@@ -57,7 +58,7 @@ describe("recall widening threshold (#245)", () => {
     await seedConfig();
     const { ctx } = makeCtx();
 
-    const res = await recallEntries({ query: "anything", topK: 10 }, env, ctx);
+    const res = await recallEntries({ query: "anything", topK: 5 }, env, ctx);
 
     expect(res.matches.map(m => m.id)).toContain("extra");
   });
@@ -67,7 +68,7 @@ describe("recall widening threshold (#245)", () => {
     await seedConfig();
     const { ctx } = makeCtx();
 
-    const res = await recallEntries({ query: "anything", topK: 10 }, env, ctx);
+    const res = await recallEntries({ query: "anything", topK: 5 }, env, ctx);
 
     expect(res.matches.map(m => m.id)).not.toContain("extra");
   });
@@ -79,9 +80,9 @@ describe("recall widening threshold (#245)", () => {
     await seedConfig();
     const { ctx } = makeCtx();
 
-    const res = await recallEntries({ query: "anything", topK: 10 }, env, ctx);
+    const res = await recallEntries({ query: "anything", topK: 5 }, env, ctx);
 
-    // Widening still governed by RECALL_WIDEN_THRESHOLD's default of 0.85.
+    // Widening is still governed by RECALL_WIDEN_THRESHOLD's calibrated default.
     expect(res.matches.map(m => m.id)).toContain("extra");
   });
 });

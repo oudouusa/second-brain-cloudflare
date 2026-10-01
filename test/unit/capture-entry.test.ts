@@ -15,8 +15,8 @@ function makeCtx() {
 function makeContradictionAI(response: string) {
   return {
     run: vi.fn().mockImplementation(async (model: string) => {
-      if (model === "@cf/baai/bge-small-en-v1.5")
-        return { data: [new Array(384).fill(0.1)] };
+      if (model === "@cf/google/embeddinggemma-300m")
+        return { data: [new Array(768).fill(0.1)] };
       return new ReadableStream({
         start(c) {
           c.enqueue(new TextEncoder().encode(`data: {"response":${JSON.stringify(response)}}\n\n`));
@@ -34,6 +34,7 @@ describe("captureEntry()", () => {
 
   beforeEach(() => {
     db = makeTestDb();
+    vi.spyOn(db, "prepare");
     env = makeTestEnv(db);
   });
 
@@ -92,11 +93,11 @@ describe("captureEntry()", () => {
 
   // ── Duplicate: blocked ──────────────────────────────────────────────────────
 
-  it("returns status=blocked and does not insert when similarity >= 0.95", async () => {
+  it("returns status=blocked and does not insert when similarity >= 0.98", async () => {
     env = makeTestEnv(db, {
       VECTORIZE: makeVectorizeMock({
         query: vi.fn().mockResolvedValue({
-          matches: [{ id: "existing", score: 0.97, metadata: { parentId: "existing" } }],
+          matches: [{ id: "existing", score: 0.99, metadata: { parentId: "existing" } }],
         }),
       }),
     });
@@ -105,7 +106,7 @@ describe("captureEntry()", () => {
     expect(result.status).toBe("blocked");
     if (result.status !== "blocked") return;
     expect(result.matchId).toBe("existing");
-    expect(result.score).toBeCloseTo(0.97);
+    expect(result.score).toBeCloseTo(0.99);
     expect(db.entries).toHaveLength(0);
   });
 
@@ -113,7 +114,7 @@ describe("captureEntry()", () => {
     env = makeTestEnv(db, {
       VECTORIZE: makeVectorizeMock({
         query: vi.fn().mockResolvedValue({
-          matches: [{ id: "existing", score: 0.97, metadata: { parentId: "existing" } }],
+          matches: [{ id: "existing", score: 0.99, metadata: { parentId: "existing" } }],
         }),
       }),
     });
@@ -206,7 +207,7 @@ describe("captureEntry()", () => {
 
   // ── Smart merge: replace ────────────────────────────────────────────────────
 
-  it("replace: updates existing entry content, does NOT insert a new entry", async () => {
+  it("replace: updates the current entry and archives its prior version", async () => {
     db.entries.push({
       id: "existing", content: "I use VSCode", tags: '["work"]', source: "api",
       created_at: Date.now(), vector_ids: '["existing"]', recall_count: 0, importance_score: 3,
@@ -224,9 +225,10 @@ describe("captureEntry()", () => {
     expect(result.status).toBe("replaced");
     if (result.status !== "replaced") return;
     expect(result.id).toBe("existing");
-    // No new entry — only the existing one remains
+    expect(db.prepare).toHaveBeenCalledWith(expect.stringContaining("INSERT INTO entry_versions"));
     expect(db.entries).toHaveLength(1);
-    expect(db.entries[0].content).toBe("I switched to Cursor");
+    expect(db.entries.find(entry => entry.id === "existing")?.content).toBe("I switched to Cursor");
+
   });
 
   it.each([
@@ -278,8 +280,6 @@ describe("captureEntry()", () => {
     });
     const { ctx } = makeCtx();
     await captureEntry("I switched to Cursor", [], "api", env, ctx);
-    // Only the stale chunk is deleted; the reused "existing" vector survives.
-    // Per-upload vector ids (T-0089.1.1): the re-embed never reuses an old id, so every old one is retired.
     expect(deleteByIdsMock).toHaveBeenCalledWith(["existing", "existing-chunk-1"]);
   });
 
@@ -302,7 +302,7 @@ describe("captureEntry()", () => {
 
   // ── Smart merge: merge ──────────────────────────────────────────────────────
 
-  it("merge: updates existing entry with merged_content, does NOT insert a new entry", async () => {
+  it("merge: updates the current entry and archives its prior version", async () => {
     db.entries.push({
       id: "existing", content: "I prefer dark mode", tags: '["personal"]', source: "api",
       created_at: Date.now(), vector_ids: '["existing"]', recall_count: 0, importance_score: 2,
@@ -320,8 +320,11 @@ describe("captureEntry()", () => {
     expect(result.status).toBe("merged");
     if (result.status !== "merged") return;
     expect(result.id).toBe("existing");
+    expect(db.prepare).toHaveBeenCalledWith(expect.stringContaining("INSERT INTO entry_versions"));
     expect(db.entries).toHaveLength(1);
-    expect(db.entries[0].content).toBe("I prefer dark mode in all apps, especially at night");
+    expect(db.entries.find(entry => entry.id === "existing")?.content)
+      .toBe("I prefer dark mode in all apps, especially at night");
+
   });
 
   it("merge: uses merged_content (not new content) for re-embedding", async () => {
@@ -363,8 +366,6 @@ describe("captureEntry()", () => {
     });
     const { ctx } = makeCtx();
     await captureEntry("I like dark mode at night", [], "api", env, ctx);
-    // Only the stale chunk is deleted; the reused "existing" vector survives.
-    // Per-upload vector ids (T-0089.1.1): the re-embed never reuses an old id, so every old one is retired.
     expect(deleteByIdsMock).toHaveBeenCalledWith(["existing", "existing-chunk-1"]);
   });
 
@@ -415,8 +416,8 @@ describe("captureEntry()", () => {
     env = makeTestEnv(db, {
       AI: {
         run: vi.fn().mockImplementation(async (model: string) => {
-          if (model === "@cf/baai/bge-small-en-v1.5")
-            return { data: [new Array(384).fill(0.1)] };
+          if (model === "@cf/google/embeddinggemma-300m")
+            return { data: [new Array(768).fill(0.1)] };
           return makeSseStream('{"importance":5,"canonical":true}');
         }),
       } as unknown as Ai,
@@ -442,8 +443,8 @@ describe("captureEntry()", () => {
     env = makeTestEnv(db, {
       AI: {
         run: vi.fn().mockImplementation(async (model: string) => {
-          if (model === "@cf/baai/bge-small-en-v1.5")
-            return { data: [new Array(384).fill(0.1)] };
+          if (model === "@cf/google/embeddinggemma-300m")
+            return { data: [new Array(768).fill(0.1)] };
           return makeSseStream('{"importance":2,"canonical":false}');
         }),
       } as unknown as Ai,
@@ -483,8 +484,8 @@ describe("captureEntry()", () => {
       }),
       AI: {
         run: vi.fn().mockImplementation(async (model: string) => {
-          if (model === "@cf/baai/bge-small-en-v1.5")
-            return { data: [new Array(384).fill(0.1)] };
+          if (model === "@cf/google/embeddinggemma-300m")
+            return { data: [new Array(768).fill(0.1)] };
           // Both the smart-merge/contradiction call and the classify call get this
           // stream. The contradiction handler parses "contradicts/conflicting_id";
           // the classify handler parses "importance/canonical". Returning a JSON
@@ -534,8 +535,8 @@ describe("captureEntry()", () => {
     env = makeTestEnv(db, {
       AI: {
         run: vi.fn().mockImplementation(async (model: string) => {
-          if (model === "@cf/baai/bge-small-en-v1.5")
-            return { data: [new Array(384).fill(0.1)] };
+          if (model === "@cf/google/embeddinggemma-300m")
+            return { data: [new Array(768).fill(0.1)] };
           return makeSseStream('{"importance":2,"canonical":false,"kind":"episodic"}');
         }),
       } as unknown as Ai,
@@ -561,8 +562,8 @@ describe("captureEntry()", () => {
     env = makeTestEnv(db, {
       AI: {
         run: vi.fn().mockImplementation(async (model: string) => {
-          if (model === "@cf/baai/bge-small-en-v1.5")
-            return { data: [new Array(384).fill(0.1)] };
+          if (model === "@cf/google/embeddinggemma-300m")
+            return { data: [new Array(768).fill(0.1)] };
           return makeSseStream('{"importance":3,"canonical":false}');
         }),
       } as unknown as Ai,
@@ -631,7 +632,9 @@ describe("captureEntry()", () => {
     const { ctx } = makeCtx();
     const result = await captureEntry("User: longer tail of the same session.", [], "claude-code", env, ctx);
     expect(result.status).toBe("replaced");
+    // 上流の版テーブルへ履歴を保存し、entriesにarchive行を増やさない。
     expect(db.entries).toHaveLength(1);
+    expect(db.prepare).toHaveBeenCalledWith(expect.stringContaining("INSERT INTO entry_versions"));
   });
 
   // The block threshold sits above the merge branch and must stay there: a
@@ -641,7 +644,7 @@ describe("captureEntry()", () => {
     db.entries = [existingNote("claude")];
     env = makeTestEnv(db, {
       VECTORIZE: makeVectorizeMock({
-        query: vi.fn().mockResolvedValue({ matches: [{ id: "existing", score: 0.97, metadata: { parentId: "existing" } }] }),
+        query: vi.fn().mockResolvedValue({ matches: [{ id: "existing", score: 0.99, metadata: { parentId: "existing" } }] }),
       }),
       AI: makeContradictionAI('{"action":"replace","target_id":"existing"}'),
     });
@@ -733,7 +736,7 @@ describe("captureEntry()", () => {
     db.entries = [existingNote("api")];
     env = makeTestEnv(db, {
       VECTORIZE: makeVectorizeMock({
-        query: vi.fn().mockResolvedValue({ matches: [{ id: "existing", score: 0.97, metadata: { parentId: "existing" } }] }),
+        query: vi.fn().mockResolvedValue({ matches: [{ id: "existing", score: 0.999, metadata: { parentId: "existing" } }] }),
       }),
     });
     const { ctx } = makeCtx();

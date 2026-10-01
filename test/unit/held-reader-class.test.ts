@@ -182,6 +182,7 @@ function scan(): Hit[] {
  * content ever reaches a caller or model — each with why.
  */
 const EXEMPT: { file: string; has: string; why: string }[] = [
+  { file: "src/entries/export.ts", has: "AS entry_bytes", why: "export容量の件数・UTF8バイト数だけを返す。JOINを含んでも本文は射影しない。" },
   { file: "src/recall/distill.ts", has: "SELECT 1 FROM entries_fts JOIN entries e ON e.rowid = entries_fts.rowid AND e.id = entries_fts.id WHERE entries_fts MATCH", why: "distillation's document-frequency counts: content only feeds a LIKE predicate inside count(*), nothing is projected, and held rows must count here exactly as the LIKE pass over entries counts them, or df would depend on the route" },
   { file: "src/brief/changes.ts", has: "LEFT JOIN entries en ON en.id = e.entry_id", why: "the recent-changes feed deliberately lists 'held' events, with a preview, to the brain's own owner: surfacing a hold IS the point, not a bypass of it" },
   { file: "src/brief/changes.ts", has: "FROM (${scopedEvents}) e", why: "the same recent-changes feed, now visible here too since this guard resolves the ${scopedEvents} interpolation -- classify() (this same file) masks heldNow downstream in JS before a preview reaches the caller, the same reasoning as the entry above" },

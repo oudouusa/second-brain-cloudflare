@@ -39,7 +39,7 @@ function capped(db: D1Database, message: string): D1Database {
 function cappedAfter(db: D1Database, n: number, message: string): D1Database {
   let calls = 0;
   const fail = async () => { throw new Error(message); };
-  const guarded = (fn: () => Promise<unknown>) => async () => { calls++; return calls > n ? fail() : fn(); };
+  const guarded = (fn: (...args: any[]) => Promise<unknown>) => async (...args: any[]) => { calls++; return calls > n ? fail() : fn(...args); };
   const stmt = (s: D1PreparedStatement): D1PreparedStatement => new Proxy(s, {
     get(t, p) {
       if (p === "bind") return (...a: unknown[]) => stmt(t.bind(...a));
@@ -49,7 +49,7 @@ function cappedAfter(db: D1Database, n: number, message: string): D1Database {
     },
   });
   const prepare = db.prepare.bind(db);
-  return { prepare: (sql: string) => stmt(prepare(sql)), batch: guarded(() => db.batch([])), exec: db.exec.bind(db), dump: db.dump?.bind(db) } as unknown as D1Database;
+  return { prepare: (sql: string) => stmt(prepare(sql)), batch: guarded((statements: D1PreparedStatement[]) => db.batch(statements)), exec: db.exec.bind(db), dump: db.dump?.bind(db) } as unknown as D1Database;
 }
 
 describe("a spent D1 daily cap is a clear, visible limit", () => {
@@ -62,7 +62,7 @@ describe("a spent D1 daily cap is a clear, visible limit", () => {
     const sqlite = makeSqliteD1();
     open.push(sqlite);
     const kv = makeMemoryKV();
-    const boot = makeTestEnv(undefined, { DB: sqlite.db as unknown as D1Database, OAUTH_KV: kv });
+    const boot = sqlite.admitEnv(makeTestEnv(undefined, { DB: sqlite.db as unknown as D1Database, OAUTH_KV: kv }));
     await initializeDatabase(boot);
     await ensureTenantBootstrap(boot);
     const env = makeTestEnv(undefined, { DB: wrap(sqlite.db as unknown as D1Database), OAUTH_KV: kv });
@@ -75,7 +75,7 @@ describe("a spent D1 daily cap is a clear, visible limit", () => {
     const { env } = await brain(db => capped(db, READ_CAP));
     let thrown: unknown;
     let res: Response | undefined;
-    try { res = await worker.fetch(req("GET", "/recall?query=atlas&topK=5"), env, ctx); } catch (e) { thrown = e; }
+    try { res = await worker.fetch(req("POST", "/recall?query=atlas&topK=5"), env, ctx); } catch (e) { thrown = e; }
     expect(thrown, "an uncaught throw reaches the caller as Cloudflare error 1101").toBeUndefined();
     expect(res!.status).toBe(429);
     expect(res!.headers.get("Retry-After")).toMatch(/^\d+$/);

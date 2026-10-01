@@ -1,3 +1,6 @@
+import { afterEach } from "vitest";
+import { chatGptResponse, mockChatGptFetch } from "../helpers/chatgpt-provider";
+afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 import { describe, it, expect, vi } from "vitest";
 import { classifyEntry } from "../../src/capture/classify";
 import { makeTestDb, makeTestEnv } from "../helpers/make-env";
@@ -16,15 +19,52 @@ function makeSseStream(response: string) {
 function makeClassifyAI(response: string | null = null, shouldThrow = false) {
   return {
     run: vi.fn().mockImplementation(async (model: string) => {
-      if (model === "@cf/baai/bge-small-en-v1.5")
-        return { data: [new Array(384).fill(0.1)] };
+      if (model === "@cf/google/embeddinggemma-300m")
+        return { data: [new Array(768).fill(0.1)] };
       if (shouldThrow) throw new Error("AI failure");
       return makeSseStream(response ?? "");
     }),
   } as unknown as Ai;
 }
 
+function makeChatGptFetch(content: string, status = 200) {
+  return mockChatGptFetch(vi.fn().mockImplementation(async () => chatGptResponse(content, "stop", status)));
+}
+
 describe("classifyEntry()", () => {
+  it("ChatGPT直接接続で分類しWorkers AIを呼ばない", async () => {
+    const aiRun = vi.fn();
+    const directFetch = makeChatGptFetch('{"importance":4,"canonical":true,"kind":"semantic"}');
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const env = makeTestEnv(makeTestDb(), {
+      AI: { run: aiRun } as unknown as Ai,
+      CHATGPT_MODEL: "gpt-5.6-luna", CHATGPT_OPERATIONS: "classify", CHATGPT_OWNER_WORKSPACE_ID: "owner-personal", CHATGPT_WORKSPACE_ID: "owner-personal",
+    });
+
+    await expect(classifyEntry("A durable project decision", env)).resolves.toEqual({
+      importance: 4,
+      canonical: true,
+      kind: "semantic",
+    });
+    expect(directFetch).toHaveBeenCalledTimes(1);
+    expect(aiRun).not.toHaveBeenCalled();
+  });
+
+  it("直接接続の失敗では未分類を保ちWorkers AIへ戻らない", async () => {
+    const aiRun = vi.fn();
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    makeChatGptFetch("unavailable", 503);
+    const env = makeTestEnv(makeTestDb(), { AI: { run: aiRun } as unknown as Ai, CHATGPT_OPERATIONS: "classify", CHATGPT_OWNER_WORKSPACE_ID: "owner-personal", CHATGPT_WORKSPACE_ID: "owner-personal" });
+
+    await expect(classifyEntry("Keep this pending", env)).resolves.toEqual({
+      importance: 0,
+      canonical: false,
+      kind: null,
+      deferred: true,
+    });
+    expect(aiRun).not.toHaveBeenCalled();
+  });
+
   it('parses {"importance":5,"canonical":true,"kind":"semantic"} correctly', async () => {
     const env = makeTestEnv(makeTestDb(), {
       AI: makeClassifyAI('{"importance":5,"canonical":true,"kind":"semantic"}'),

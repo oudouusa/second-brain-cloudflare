@@ -17,6 +17,7 @@
  * UTC (test/budget/t5-recall-log-kv.test.ts). D1's free-tier budget (100k rows written,
  * 5M read, per day) is two to three orders of magnitude larger, so the cap lives there.
  */
+import { memoryWriteMarker } from "../migration/write-lock";
 import type { Env } from "../env";
 import type { Config } from "../config";
 import { resolveConfig } from "../config";
@@ -59,8 +60,8 @@ export async function maybeLogRecall(env: Env, cfg: Config, input: RecallLogInpu
     const cutoff = input.now - RECALL_LOG_RETENTION_DAYS * 86400000;
     await env.DB.batch([
       env.DB.prepare(
-        `INSERT INTO recall_log (id, workspace_id, created_at, channel, query, params, returned_ids)
-         SELECT ?, ?, ?, ?, ?, ?, ?
+        `INSERT INTO recall_log (id, workspace_id, created_at, channel, query, params, returned_ids, write_marker)
+         SELECT ?, ?, ?, ?, ?, ?, ?, ?
          WHERE (SELECT COUNT(*) FROM recall_log WHERE workspace_id = ? AND created_at >= ?) < ?`,
       ).bind(
         input.id ?? crypto.randomUUID(),
@@ -70,6 +71,7 @@ export async function maybeLogRecall(env: Env, cfg: Config, input: RecallLogInpu
         input.query,
         JSON.stringify(input.params),
         JSON.stringify(input.returnedIds),
+        memoryWriteMarker(env),
         input.workspaceId,
         dayStart,
         RECALL_LOG_PER_DAY,
@@ -87,6 +89,9 @@ export async function maybeLogRecall(env: Env, cfg: Config, input: RecallLogInpu
       // SCAN the table, and each workspace now purges only its own expired rows — every
       // workspace's retention is still enforced, just on its own logging, not on a global
       // sweep one workspace's traffic happened to trigger.
+      env.DB.prepare(
+        `UPDATE recall_log SET write_marker = ? WHERE id IN (SELECT id FROM recall_log WHERE workspace_id = ? AND created_at < ? ORDER BY created_at ASC LIMIT ?)`,
+      ).bind(memoryWriteMarker(env, "delete"), input.workspaceId, cutoff, RECALL_LOG_PURGE_BATCH),
       env.DB.prepare(
         `DELETE FROM recall_log WHERE id IN (SELECT id FROM recall_log WHERE workspace_id = ? AND created_at < ? ORDER BY created_at ASC LIMIT ?)`,
       ).bind(input.workspaceId, cutoff, RECALL_LOG_PURGE_BATCH),
@@ -135,8 +140,8 @@ export async function maybeMarkFollowedMany(env: Env, workspaceId: string, entry
     const newlyFollowed = entryIds.filter(id => returned.includes(id) && !followedList.includes(id));
     if (!newlyFollowed.length) return;
 
-    await env.DB.prepare(`UPDATE recall_log SET followed_ids = ? WHERE id = ?`)
-      .bind(JSON.stringify([...followedList, ...newlyFollowed]), row.id).run();
+    await env.DB.prepare(`UPDATE recall_log SET followed_ids = ?, write_marker = ? WHERE id = ?`)
+      .bind(JSON.stringify([...followedList, ...newlyFollowed]), memoryWriteMarker(env), row.id).run();
   } catch (e) {
     console.error("recall_log follow update failed (non-fatal):", e);
   }

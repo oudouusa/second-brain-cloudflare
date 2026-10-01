@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { Client } from "@modelcontextprotocol/client";
+import { InMemoryTransport } from "@modelcontextprotocol/client";
 import worker from "../../src/index";
 import { initializeDatabase, resetDatabaseInit } from "../../src/db/init";
 import { ensureTenantBootstrap } from "../../src/lib/tenancy";
@@ -15,10 +15,16 @@ import { makeMemoryKV, makeTestEnv, makeVectorizeMock } from "../helpers/make-en
 import { makeSqliteD1, type SqliteD1 } from "../helpers/sqlite-d1";
 import { req } from "../helpers/make-request";
 
-const ctx = { waitUntil: (_: Promise<unknown>) => {} } as ExecutionContext;
+const pending: Promise<unknown>[] = [];
+const ctx = { waitUntil: (p: Promise<unknown>) => { pending.push(p); } } as ExecutionContext;
+async function drain() {
+  for (let i = 0; i < pending.length; i++) await pending[i];
+  pending.length = 0;
+}
 const databases: SqliteD1[] = [];
 
-afterEach(() => {
+afterEach(async () => {
+  await drain();
   for (const sqlite of databases.splice(0)) sqlite.close();
   vi.restoreAllMocks();
 });
@@ -33,14 +39,14 @@ async function setup(publicPath = false, tagged = false, memberVectors = false) 
   });
   const getByIds = vi.fn().mockImplementation(async (ids: string[]) => ids.map(id => ({
     id,
-    values: new Array(384).fill(0.1),
+    values: new Array(128).fill(0.1),
     metadata: { parentId: id.split("-chunk-")[0] },
   })));
-  const env = makeTestEnv(undefined, {
+  const env = sqlite.admitEnv(makeTestEnv(undefined, {
     DB: sqlite.db as unknown as Env["DB"],
     OAUTH_KV: makeMemoryKV(),
     VECTORIZE: makeVectorizeMock({ query, getByIds }),
-  });
+  }));
   await initializeDatabase(env);
   const roots = publicPath ? await ensureTenantBootstrap(env) : undefined;
   const tags = tagged ? ["pulsar", "work", "project:alpha"] : [];
@@ -49,7 +55,7 @@ async function setup(publicPath = false, tagged = false, memberVectors = false) 
   sqlite.seed({ id: "kw-doc", content: "the zylophantine rollout checklist", createdAt: 2,
     tags, vectorIds: memberVectors ? ["kw-doc-chunk-0"] : [] });
   if (roots) {
-    await sqlite.db.prepare("UPDATE entries SET workspace_id = ?").bind(roots.ownerPersonalWorkspaceId).run();
+    await sqlite.db.prepare("UPDATE entries SET workspace_id = ? WHERE 1").bind(roots.ownerPersonalWorkspaceId).run();
   }
   await env.OAUTH_KV.put(FTS_READY_KV_KEY, "1");
   resetFtsReadyMemo();
@@ -68,7 +74,8 @@ async function run(
   const result = await recallEntries(
     { query, topK: 5, synthesize: false, ...filters }, env, ctx, undefined, { diagnostics, variant },
   );
-  return { ids: result.matches.map(m => m.id), matches: result.matches.map(m => ({ id: m.id, score: m.score })), diagnostics };
+  await drain();
+  return { ids: result.matches.map(m => m.id), matches: result.matches.map(m => ({ id: m.id, score: m.score })), diagnostics, cacheHit: result.querySignalCacheHit };
 }
 
 describe("internal.variant.arms", () => {
@@ -114,14 +121,14 @@ describe("internal.variant.arms", () => {
     expect(sqlite.batches.some(batch => batch.some(sql => sql.includes("SELECT e.id, e.content") && sql.includes("entries_fts MATCH")))).toBe(false);
   });
 
-  it("dense-only still sends a real 384-dimension embedding to Vectorize", async () => {
+  it("dense-only still sends a real 128-dimension embedding to Vectorize", async () => {
     const { env, query } = await setup();
     await run(env, { arms: "dense-only" });
     expect((env.AI.run as ReturnType<typeof vi.fn>).mock.calls.filter(([model]) => model === DEFAULTS.EMBEDDING_MODEL)).toHaveLength(1);
     expect(query).toHaveBeenCalledTimes(1);
     const vector = query.mock.calls[0][0] as number[];
-    expect(vector).toHaveLength(384);
-    expect(vector).toEqual(new Array(384).fill(0.1));
+    expect(vector).toHaveLength(128);
+    expect(vector.every(value => Math.abs(value - 1 / Math.sqrt(128)) < 1e-12)).toBe(true);
   });
 
   it.each(["tag", "project"])("ignores every arm flag for %s-scoped member-first recall", async scope => {
@@ -139,7 +146,9 @@ describe("internal.variant.arms", () => {
       outputs.push(result.matches);
       expect(result.ids).toEqual(expect.arrayContaining(["kw-doc", "dense-doc"]));
       expect(getByIds.mock.calls.length).toBeGreaterThan(before);
-      expect(ai.mock.calls.filter(([model]) => model === DEFAULTS.EMBEDDING_MODEL)).toHaveLength(embeddingsBefore + 1);
+      expect(result.cacheHit).toBe(outputs.length > 1);
+      expect(ai.mock.calls.filter(([model]) => model === DEFAULTS.EMBEDDING_MODEL)).toHaveLength(embeddingsBefore + (result.cacheHit ? 0 : 1));
+      expect(result.diagnostics.operations?.embeddingCalls).toBe(result.cacheHit ? 0 : 1);
       expect(result.diagnostics.ftsRoute).toBe("like-member-first");
     }
     for (const output of outputs.slice(1)) expect(output).toEqual(outputs[0]);
@@ -163,14 +172,14 @@ describe("internal.variant.arms", () => {
 
   it("HTTP and MCP recall cannot pass a variant through", async () => {
     const { env, query } = await setup(true);
-    const response = await worker.fetch(req("GET", "/recall?query=zylophantine+rollout&variant=dense-only&arms=keyword-only"), env, ctx);
+    const response = await worker.fetch(req("POST", "/recall", { body: { query: "zylophantine rollout", variant: { arms: "dense-only" }, arms: "keyword-only", synthesize: false } }), env, ctx);
     expect(response.status).toBe(200);
     const body = await response.json() as { results: { id: string }[] };
     expect(body.results.map(item => item.id)).toEqual(expect.arrayContaining(["kw-doc", "dense-doc"]));
     expect(query).toHaveBeenCalled();
 
     query.mockClear();
-    const server = buildMcpServer(env, ctx);
+    const server = buildMcpServer(databases.at(-1)!.admitEnv(env), ctx);
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
     const client = new Client({ name: "variant-boundary-test", version: "1.0.0" });
     await Promise.all([client.connect(clientTransport), server.connect(serverTransport)]);

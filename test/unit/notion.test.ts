@@ -71,6 +71,20 @@ describe("flattenBlocks", () => {
     ];
     expect(flattenBlocks(blocks)).toBe("kept");
   });
+
+  it("stops joining legal maximum rich-text arrays at the page budget", () => {
+    const hugeRichText = Array.from({ length: 100 }, (_, index) => ({
+      plain_text: `${String(index).padStart(3, "0")}:${"x".repeat(1996)}`,
+    }));
+    const blocks = Array.from({ length: 100 }, () => ({
+      type: "paragraph",
+      paragraph: { rich_text: hugeRichText },
+    }));
+
+    const text = flattenBlocks(blocks);
+    expect(text.length).toBeLessThanOrEqual(8000);
+    expect(text).not.toContain("099:");
+  });
 });
 
 describe("buildPageContent", () => {

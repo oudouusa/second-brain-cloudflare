@@ -21,20 +21,12 @@ async function apiCapture(content, tags, source, workspace, project) {
 }
 
 async function apiList(n = 50, workspace, actor, tag, project) {
-  const params = new URLSearchParams({ n: String(n) })
-  if (workspace) params.set('workspace', workspace)
-  // Only ever set from the shared layer's author filter (js/recent.js), so a
-  // solo brain's URL stays byte-identical to what it has always sent.
-  if (actor) params.set('actor', actor)
-  // Server-side, not just the client-side pass in applyRecentFilters: without
-  // this, a tag filter only narrows whichever `n` most-recent rows already
-  // happened to be fetched, a tag with real matches outside that window read
-  // as "no results" (this bit the contradictions tile, whose tag is hidden
-  // from the select and so was easy to miss testing without it).
-  if (tag) params.set('tag', tag)
-  // A project's memories: its own tag plus any aliases it claims, expanded server-side.
-  if (project) params.set('project', project)
-  const res = await fetch(`${WORKER_URL}/list?${params}`, { headers: { Authorization: `Bearer ${AUTH_TOKEN}` } })
+  const body = { n }
+  if (workspace) body.workspace = workspace
+  if (actor) body.actor = actor
+  if (tag) body.tag = tag
+  if (project) body.project = project
+  const res = await fetch(`${WORKER_URL}/list`, { method: "POST", headers: { Authorization: `Bearer ${AUTH_TOKEN}`, "Content-Type": "application/json" }, body: JSON.stringify(body) })
   return res.json()
 }
 

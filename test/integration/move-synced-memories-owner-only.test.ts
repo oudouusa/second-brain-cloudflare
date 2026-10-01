@@ -34,7 +34,7 @@ async function makeEnv() {
   resetDatabaseInit();
   await initializeDatabase(env);
   const roots = await ensureTenantBootstrap(env);
-  return { env, roots };
+  return { env: d1.admitEnv(env), roots };
 }
 
 async function seedMirrored(env: Env, roots: TenantRoots, helper: { ctx: ExecutionContext; drain: () => Promise<unknown> }, n: number): Promise<string[]> {

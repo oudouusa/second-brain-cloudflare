@@ -77,7 +77,7 @@ function installControlledQueries(db: D1Mock, c: RootQualityCase): void {
         },
       };
     }
-    if (sql.includes("WHERE content LIKE") && sql.includes("ORDER BY created_at DESC LIMIT")) {
+    if (/WHERE \(?content LIKE/.test(sql) && /ORDER BY (?:\(CASE WHEN content LIKE|created_at DESC LIMIT)/.test(sql)) {
       const results = c.candidates
         .filter(candidate => candidate.keywordCandidate)
         .map(candidate => ({

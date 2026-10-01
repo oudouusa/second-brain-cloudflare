@@ -76,6 +76,7 @@ describe("openD1 workerd plumbing (stubbed wrangler)", () => {
     const root = mkdtempSync(join(tmpdir(), "sb-eval-root-"));
     try {
       mkdirSync(join(root, "db"));
+      writeFileSync(join(root, "db/fork-write-protection.sql"), "");
       writeFileSync(join(root, "db/schema.sql"), "SELECT 1;");
       writeFileSync(join(root, "wrangler.jsonc"), '{ "compatibility_date": "2001-01-01" }');
       const seen = fakeWrangler();
@@ -97,6 +98,7 @@ describe("SB_EVAL_ROOT on the sqlite facade", () => {
     const root = mkdtempSync(join(tmpdir(), "sb-eval-root-"));
     try {
       mkdirSync(join(root, "db"));
+      writeFileSync(join(root, "db/fork-write-protection.sql"), "");
       writeFileSync(join(root, "db/schema.sql"), "CREATE TABLE eval_root_marker (id TEXT);");
       process.env.SB_EVAL_ROOT = root;
       const { makeSqliteD1 } = await import("../helpers/sqlite-d1");

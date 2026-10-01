@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { storeEntry } from "../../src/capture/store";
 import { CHUNK_MAX_CHARS, MIRRORED_SOURCES } from "../../src/constants";
 import { INTEGRATION_PROVIDERS } from "../../src/integrations";
-import { makeTestEnv } from "../helpers/make-env";
+import { makeTestDb, makeTestEnv } from "../helpers/make-env";
 
 /**
  * A mirrored record is one line of fact wrapped in a templated trailer, and the
@@ -34,24 +34,32 @@ function longMirroredRecord(): string {
 }
 
 describe("storeEntry chunk indexing for mirrored sources", () => {
+  const world = (id: string, content: string, tags: string[], source: string) => {
+    const db = makeTestDb();
+    const now = Date.now();
+    db.entries.push({ id, content, tags: JSON.stringify(tags), source, created_at: now, vector_ids: "[]" });
+    return { env: makeTestEnv(db), now };
+  };
+
   it("embeds only the first chunk of a mirrored record", async () => {
-    const env = makeTestEnv();
     const content = longMirroredRecord();
+    const { env, now } = world("entry-1", content, ["email"], "email-gmail");
     expect(content.length).toBeGreaterThan(CHUNK_MAX_CHARS);
 
-    const { vectorIds } = await storeEntry(env, "entry-1", content, ["email"], "email-gmail", Date.now());
+    const vectorIds = await storeEntry(env, "entry-1", content, ["email"], "email-gmail", now);
 
     const upserted = (env.VECTORIZE.upsert as any).mock.calls[0][0];
     expect(upserted).toHaveLength(1);
     expect(upserted[0].metadata.chunkIndex).toBe(0);
     expect(upserted[0].metadata.content).toContain("Closing balance $1,240.55");
-    expect(vectorIds).toHaveLength(1);
+    expect(vectorIds.vectorIds).toHaveLength(1);
   });
 
   it("embeds a calendar record the same way", async () => {
-    const env = makeTestEnv();
+    const content = longMirroredRecord();
+    const { env, now } = world("entry-2", content, ["calendar"], "calendar-icloud");
 
-    await storeEntry(env, "entry-2", longMirroredRecord(), ["calendar"], "calendar-icloud", Date.now());
+    await storeEntry(env, "entry-2", content, ["calendar"], "calendar-icloud", now);
 
     expect((env.VECTORIZE.upsert as any).mock.calls[0][0]).toHaveLength(1);
   });
@@ -60,9 +68,10 @@ describe("storeEntry chunk indexing for mirrored sources", () => {
   // wrote is signal end to end, and truncating its index would lose real
   // content. This passes today and must keep passing.
   it("still embeds every chunk of a hand-written memory", async () => {
-    const env = makeTestEnv();
+    const content = longMirroredRecord();
+    const { env, now } = world("entry-3", content, [], "claude-desktop");
 
-    await storeEntry(env, "entry-3", longMirroredRecord(), [], "claude-desktop", Date.now());
+    await storeEntry(env, "entry-3", content, [], "claude-desktop", now);
 
     expect((env.VECTORIZE.upsert as any).mock.calls[0][0].length).toBeGreaterThan(1);
   });

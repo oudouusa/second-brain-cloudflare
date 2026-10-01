@@ -1,6 +1,6 @@
 import { vi } from "vitest";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { Client } from "@modelcontextprotocol/client";
+import { InMemoryTransport } from "@modelcontextprotocol/client";
 import { buildMcpServer } from "../../src/mcp/server";
 import { makeSqliteD1, type SqliteD1 } from "./sqlite-d1";
 import { makeTestEnv, makeMemoryKV, makeVectorizeMock } from "./make-env";
@@ -13,7 +13,8 @@ import type { Env } from "../../src/env";
 
 export const NOW = Date.UTC(2026, 8, 25, 12, 0, 0);
 const DAY = 86_400_000;
-const ctx = { waitUntil: (_: Promise<any>) => {} } as ExecutionContext;
+const deferred: Promise<unknown>[] = [];
+const ctx = { waitUntil: (p: Promise<unknown>) => { deferred.push(p); } } as ExecutionContext;
 
 export interface ExplainFixture { env: Env; sqlite: SqliteD1; close(): void }
 
@@ -24,7 +25,7 @@ export async function makeExplainFixture(): Promise<ExplainFixture> {
   const sqlite = makeSqliteD1();
   const match = (id: string, score: number, ageDays: number, tags: string[]) =>
     ({ id, score, metadata: { parentId: id, isUpdate: false, created_at: NOW - ageDays * DAY, tags } });
-  const env = makeTestEnv(undefined, {
+  const env = sqlite.admitEnv(makeTestEnv(undefined, {
     DB: sqlite.db as unknown as Env["DB"],
     OAUTH_KV: makeMemoryKV(),
     VECTORIZE: makeVectorizeMock({
@@ -34,7 +35,7 @@ export async function makeExplainFixture(): Promise<ExplainFixture> {
         match("e3", 0.7, 10, []),
       ] }),
     }),
-  });
+  }));
   await initializeDatabase(env);
   const roots = await ensureTenantBootstrap(env);
   const ws = roots.ownerPersonalWorkspaceId;
@@ -51,12 +52,15 @@ export async function makeExplainFixture(): Promise<ExplainFixture> {
     `INSERT INTO edges (id, source_id, target_id, type, weight, provenance, metadata, created_at, updated_at, workspace_id)
      VALUES ('ed1', 'e1', 'e4', 'relates_to', 0.9, 'explicit', '{}', ?, ?, ?)`,
   ).bind(NOW - DAY, NOW - DAY, ws).run();
-  return { env, sqlite, close: () => { sqlite.close(); vi.restoreAllMocks(); } };
+  return { env: sqlite.admitEnv(env), sqlite, close: () => { sqlite.close(); vi.restoreAllMocks(); } };
 }
 
 export async function restRecall(env: Env, qs: string): Promise<any> {
-  const res = await worker.fetch(req("GET", `/recall?${qs}`), env, ctx);
-  return res.json();
+  const res = await worker.fetch(req("POST", `/recall?${qs}`), env, ctx);
+  await Promise.all(deferred.splice(0));
+  const body = await res.json();
+  if (!res.ok) throw new Error(`REST recall failed (${res.status}): ${JSON.stringify(body)}`);
+  return body;
 }
 
 export async function mcpRecall(env: Env, args: Record<string, unknown>): Promise<string> {
@@ -67,6 +71,7 @@ export async function mcpRecall(env: Env, args: Record<string, unknown>): Promis
   await Promise.all([client.connect(ct), server.connect(st)]);
   try {
     const res: any = await client.callTool({ name: "recall", arguments: args });
+    await Promise.all(deferred.splice(0));
     return String(res.content[0].text);
   } finally { await client.close(); }
 }

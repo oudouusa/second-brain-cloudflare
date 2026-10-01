@@ -5,8 +5,8 @@
  * candidate-selection SQL is untouched (only the log write's own bound id changes).
  */
 import { describe, it, expect, beforeEach, vi } from "vitest";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { Client } from "@modelcontextprotocol/client";
+import { InMemoryTransport } from "@modelcontextprotocol/client";
 import worker from "../../src/index";
 import { buildMcpServer } from "../../src/mcp/server";
 import { makeTestEnv, makeTestDb, makeVectorizeMock, makeMemoryKV } from "../helpers/make-env";
@@ -58,7 +58,7 @@ describe("recall receipt", () => {
   describe("REST, RECALL_LOG off (the default everywhere)", () => {
     it("carries a receipt on a recall with results", async () => {
       const env = envWithMatches();
-      const res = await worker.fetch(req("GET", "/recall?query=the+topic"), env, ctx);
+      const res = await worker.fetch(req("POST", "/recall?query=the+topic"), env, ctx);
       const data = await res.json() as any;
       expect(typeof data.receipt).toBe("string");
       expect(data.receipt.length).toBeGreaterThan(0);
@@ -68,7 +68,7 @@ describe("recall receipt", () => {
       const env = envWithMatches({
         VECTORIZE: makeVectorizeMock({ query: vi.fn().mockResolvedValue({ matches: [] }) }),
       });
-      const res = await worker.fetch(req("GET", "/recall?query=nothing+matches+this"), env, ctx);
+      const res = await worker.fetch(req("POST", "/recall?query=nothing+matches+this"), env, ctx);
       const data = await res.json() as any;
       expect(data.results).toEqual([]);
       expect(typeof data.receipt).toBe("string");
@@ -77,9 +77,9 @@ describe("recall receipt", () => {
 
     it("the same query gets the same receipt moments apart; a different query gets a different one", async () => {
       const env = envWithMatches();
-      const first = await (await worker.fetch(req("GET", "/recall?query=the+topic"), env, ctx)).json() as any;
-      const second = await (await worker.fetch(req("GET", "/recall?query=the+topic"), env, ctx)).json() as any;
-      const different = await (await worker.fetch(req("GET", "/recall?query=a+different+topic"), env, ctx)).json() as any;
+      const first = await (await worker.fetch(req("POST", "/recall?query=the+topic"), env, ctx)).json() as any;
+      const second = await (await worker.fetch(req("POST", "/recall?query=the+topic"), env, ctx)).json() as any;
+      const different = await (await worker.fetch(req("POST", "/recall?query=a+different+topic"), env, ctx)).json() as any;
       expect(second.receipt).toBe(first.receipt);
       expect(different.receipt).not.toBe(first.receipt);
     });
@@ -87,7 +87,7 @@ describe("recall receipt", () => {
     it("writes no recall_log row and makes no extra D1 call for the receipt itself", async () => {
       const env = envWithMatches();
       const before = db.entries.length;
-      await worker.fetch(req("GET", "/recall?query=the+topic"), env, ctx);
+      await worker.fetch(req("POST", "/recall?query=the+topic"), env, ctx);
       // recall_log is a D1Mock-unmodeled table; the real assertion is that the log write
       // path is the existing no-op (test/unit/recall-log.test.ts pins that directly). This
       // just confirms the receipt code path does not touch the entries the mock does model.
@@ -106,7 +106,7 @@ describe("recall receipt", () => {
 
     it("the receipt is the id of the row this call logged", async () => {
       const env = await envWithLogOn();
-      const res = await worker.fetch(req("GET", "/recall?query=the+topic"), env, ctx);
+      const res = await worker.fetch(req("POST", "/recall?query=the+topic"), env, ctx);
       const data = await res.json() as any;
       expect(typeof data.receipt).toBe("string");
       // A real recall_log id (crypto.randomUUID()), not the short hex hash the off-path uses.
@@ -116,9 +116,9 @@ describe("recall receipt", () => {
     it("still returns a receipt once the daily cap is spent and this call is not actually logged", async () => {
       const env = await envWithLogOn();
       for (let i = 0; i < RECALL_LOG_PER_DAY; i++) {
-        await worker.fetch(req("GET", "/recall?query=warm+up+the+cap"), env, ctx);
+        await worker.fetch(req("POST", "/recall?query=warm+up+the+cap"), env, ctx);
       }
-      const res = await worker.fetch(req("GET", "/recall?query=the+topic"), env, ctx);
+      const res = await worker.fetch(req("POST", "/recall?query=the+topic"), env, ctx);
       const data = await res.json() as any;
       expect(res.status).toBe(200);
       expect(typeof data.receipt).toBe("string");

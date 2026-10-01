@@ -49,8 +49,8 @@ describe("1. forgetEntry goes through the trash tiers, on both REST and MCP", ()
     t = await makeTrashEnv();
     t.seed("m1");
     const { buildMcpServer } = await import("../../src/mcp/server");
-    const { Client } = await import("@modelcontextprotocol/sdk/client/index.js");
-    const { InMemoryTransport } = await import("@modelcontextprotocol/sdk/inMemory.js");
+    const { Client } = await import("@modelcontextprotocol/client");
+    const { InMemoryTransport } = await import("@modelcontextprotocol/client");
     const identity = ownerIdentity();
     const server = buildMcpServer(t.env, ctx, identity);
     const [ct, st] = InMemoryTransport.createLinkedPair();

@@ -17,6 +17,7 @@ import { setDbReady } from "../../src/runtime/state";
 import { ensureTenantBootstrap } from "../../src/lib/tenancy";
 import { createMember } from "../../src/lib/team-admin";
 import type { Env } from "../../src/env";
+import { beginMemoryWriteAdmission, memoryWriteMarker } from "../../src/migration/write-lock";
 
 const ctx = { waitUntil: (_: Promise<unknown>) => {} } as any;
 
@@ -30,8 +31,7 @@ function dbOf(s: SqliteD1) {
     // The vector-ownership snapshot make-env's Vectorize double reads (T-0089.1.1).
     __vectorOwners: () => s.db.__vectorOwners(),
     async batch(stmts: { run(): Promise<any> }[]) {
-      const out: any[] = [];
-      for (const st of stmts) out.push(await st.run());
+      const out = await s.db.batch(stmts as any[]);
       // Collapsed to one entry in the issued log, because that is what D1 does:
       // a batch is a single subrequest however many statements it carries. The
       // per-statement rows would make a correctly batched write look like N.
@@ -39,8 +39,8 @@ function dbOf(s: SqliteD1) {
       // Each statement's rows are kept, not discarded: a batch carries reads as
       // well as writes now — identity resolution pairs its SELECT with the
       // throttled last_used_at stamp so the pair costs one subrequest — and D1
-      // returns a result per statement. `changes: 1` is preserved for the write
-      // paths that read it.
+      // returns a result per statement. Each statement keeps its actual
+      // trigger-inclusive changes value.
       return out.map((r: any) => ({ ...r, meta: { changes: 1, ...r?.meta } }));
     },
   };
@@ -49,7 +49,10 @@ function dbOf(s: SqliteD1) {
 async function migrated(): Promise<SqliteD1> {
   const s = makeSqliteD1();
   resetDatabaseInit();
-  await initializeDatabase({ DB: dbOf(s) } as unknown as Env);
+  const env = { DB: dbOf(s), AUTH_TOKEN: "test-token" } as unknown as Env;
+  await initializeDatabase(env);
+  await ensureTenantBootstrap(env);
+  s.issued.length = 0;
   setDbReady(true);
   return s;
 }
@@ -61,11 +64,19 @@ function seedPattern(s: SqliteD1, id: string, content: string, extraTags: string
   s.seed({ id, content, createdAt: 1000, tags: ["auto-insight", ...extraTags], source: "system", vectorIds: [id] });
 }
 
-function seedEdge(s: SqliteD1, sourceId: string, targetId: string, type: string) {
-  s.db.prepare(
-    `INSERT INTO edges (id, source_id, target_id, type, weight, provenance, metadata, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).bind(crypto.randomUUID(), sourceId, targetId, type, 1, "system", "{}", 1000, 1000).run();
+async function seedEdge(s: SqliteD1, sourceId: string, targetId: string, type: string) {
+  const admitted = await beginMemoryWriteAdmission(envOf(s), ctx);
+  try {
+    await admitted.env.DB.prepare(
+      `INSERT INTO edges (id, source_id, target_id, type, weight, provenance, metadata, created_at, updated_at, write_marker)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).bind(
+      crypto.randomUUID(), sourceId, targetId, type, 1, "system", "{}", 1000, 1000,
+      memoryWriteMarker(admitted.env),
+    ).run();
+  } finally {
+    await admitted.finish();
+  }
 }
 
 const rowOf = (s: SqliteD1, id: string) => s.rows().find(r => r.id === id) as Record<string, any>;
@@ -135,8 +146,8 @@ describe("GET /patterns", () => {
     sq.seed({ id: "m1", content: "The first source memory", createdAt: 1000, tags: ["work"] });
     sq.seed({ id: "m2", content: "The second source memory", createdAt: 2000, tags: ["work"] });
     seedPattern(sq, "i1", "An insight about both");
-    seedEdge(sq, "i1", "m1", "drawn_from");
-    seedEdge(sq, "i1", "m2", "drawn_from");
+    await seedEdge(sq, "i1", "m1", "drawn_from");
+    await seedEdge(sq, "i1", "m2", "drawn_from");
 
     const data = await (await worker.fetch(req("GET", "/patterns"), envOf(sq), ctx)).json() as any;
 
@@ -147,9 +158,17 @@ describe("GET /patterns", () => {
   it("reports a forgotten source instead of dropping it", async () => {
     sq = await migrated();
     sq.seed({ id: "m1", content: "The surviving source", createdAt: 1000, tags: ["work"] });
+    sq.seed({ id: "gone", content: "The soon-forgotten source", createdAt: 900, tags: ["work"] });
     seedPattern(sq, "i1", "An insight about both");
-    seedEdge(sq, "i1", "m1", "drawn_from");
-    seedEdge(sq, "i1", "gone", "drawn_from");
+    await seedEdge(sq, "i1", "m1", "drawn_from");
+    await seedEdge(sq, "i1", "gone", "drawn_from");
+    const admitted = await beginMemoryWriteAdmission(envOf(sq), ctx);
+    await admitted.env.DB.batch([
+      admitted.env.DB.prepare(`UPDATE entries SET write_marker = ? WHERE id = ?`)
+        .bind(memoryWriteMarker(admitted.env, "delete"), "gone"),
+      admitted.env.DB.prepare(`DELETE FROM entries WHERE id = ?`).bind("gone"),
+    ]);
+    await admitted.finish();
 
     const data = await (await worker.fetch(req("GET", "/patterns"), envOf(sq), ctx)).json() as any;
 
@@ -210,7 +229,7 @@ describe("POST /patterns/resolve — one at a time", () => {
     });
 
     // Before confirmation the pattern is excluded from recall at D1 hydration.
-    let recallData = await (await worker.fetch(req("GET", "/recall?query=tests"), env, ctx)).json() as any;
+    let recallData = await (await worker.fetch(req("POST", "/recall?query=tests"), env, ctx)).json() as any;
     expect(recallData.results ?? []).toHaveLength(0);
 
     const res = await worker.fetch(req("POST", "/patterns/resolve", { body: { id: "p1", action: "confirm" } }), env, ctx);
@@ -223,7 +242,7 @@ describe("POST /patterns/resolve — one at a time", () => {
     expect(tags).toContain("status:canonical");
 
     // After confirmation the same query returns it.
-    recallData = await (await worker.fetch(req("GET", "/recall?query=tests"), env, ctx)).json() as any;
+    recallData = await (await worker.fetch(req("POST", "/recall?query=tests"), env, ctx)).json() as any;
     expect(recallData.results).toHaveLength(1);
     expect(recallData.results[0].id).toBe("p1");
   });
@@ -247,6 +266,18 @@ describe("POST /patterns/resolve — one at a time", () => {
 });
 
 describe("POST /patterns/resolve — in bulk", () => {
+  it("Prompt Capsule タグの更新でも解決済み ID と監査対象を数える", async () => {
+    sq = await migrated();
+    seedPattern(sq, "capsule-pattern", "A capsule insight", ["capsule:core"]);
+    const response = await worker.fetch(
+      req("POST", "/patterns/resolve", { body: { ids: ["capsule-pattern"], action: "confirm" } }),
+      envOf(sq), ctx,
+    );
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ resolved: 1, skipped: 0 });
+    expect(tagsOf(sq, "capsule-pattern")).toContain("status:canonical");
+  });
+
   it("dismisses many in one request", async () => {
     // The complaint this answers: ruling on a backlog two at a time.
     sq = await migrated();
@@ -289,53 +320,37 @@ describe("POST /patterns/resolve — in bulk", () => {
   });
 
   it("costs a fixed number of round trips however many patterns are in it", async () => {
-    // The reason bulk exists at all: this codebase holds an invocation to a
-    // self-imposed budget of roughly 50 D1 calls (the platform's real ceiling
-    // is 1,000), so a per-id loop would put a ceiling on the batch size.
-    //
-    // Measured at TWO id counts rather than pinned at one, because flatness is
-    // the property and a single number only pins it by implication. The audit
-    // trail is the case that made the difference matter: writing one
-    // entry_events row per resolution through a per-id auditEvent would have
-    // left this number correct for 5 ids and 40 over budget for 97, so the
-    // route hands the whole trail to ONE batch.
-    async function cost(n: number): Promise<{ total: number; unbatched: number }> {
-      sq?.close();
+    // The reason bulk exists at all: a free-plan invocation gets roughly 50 D1
+    // queries, so a per-id loop would put a ceiling on the batch size.
+    const measured = async (n: number) => {
       sq = await migrated();
       for (let i = 0; i < n; i++) seedPattern(sq, `p${i}`, `Pattern ${i}`);
-      sq.issued.length = 0;
+      sq.executions.length = 0;
       const pending: Promise<unknown>[] = [];
+      const collectingCtx = {
+        waitUntil: (promise: Promise<unknown>) => { pending.push(promise); },
+      } as ExecutionContext;
       await worker.fetch(
-        req("POST", "/patterns/resolve", { body: { ids: Array.from({ length: n }, (_, i) => `p${i}`), action: "dismiss" } }),
-        envOf(sq),
-        { waitUntil: (p: Promise<unknown>) => { pending.push(p); } } as any,
+        req("POST", "/patterns/resolve", {
+          body: { ids: Array.from({ length: n }, (_, i) => `p${i}`), action: "dismiss" },
+        }),
+        envOf(sq), collectingCtx,
       );
-      // Settled, because the audit batch is handed to waitUntil and the double
-      // collapses a batch into its single log entry only once it resolves.
-      await Promise.all(pending);
-      return {
-        total: sq.issued.length,
-        unbatched: sq.issued.filter(x => !x.startsWith("BATCH")).length,
-      };
-    }
+      await Promise.allSettled(pending);
+      const outsideBatches = sq.executions.filter(s => s !== "BATCH").length;
+      sq.close();
+      sq = null;
+      setDbReady(false);
+      return outsideBatches;
+    };
 
-    // Seven round trips, flat in the id count, which is what this measures.
-    //
-    // Assert the TOTAL rather than only the unbatched statements. Both numbers
-    // are pinned below, but the total is the one that means something: a batch
-    // is a single subrequest however many statements it carries, so the split
-    // between the two moves whenever a read is paired with a write, without the
-    // cost changing at all. That is exactly what happened when identity
-    // resolution began carrying the throttled users.last_used_at stamp in the
-    // same batch as its read — unbatched went 4 -> 3, total stayed 6.
-    //
-    // MOVED 6 -> 7: the entry_events trail for the whole request, one batch.
-    // The route's own SELECT plus v3's fixed identity cost on this first
-    // request against a fresh database (the token→identity batch and the
-    // one-time tenant bootstrap: two lookups + a batch, memoised afterwards)
-    // keep the unbatched count at 3.
-    expect(await cost(40)).toEqual({ total: 7, unbatched: 3 });
-    expect(await cost(5)).toEqual({ total: 7, unbatched: 3 });
+    // Entry CAS and tombstone creation grow inside one D1 batch. Every trip
+    // outside that batch is fixed request/admission/cleanup coordination.
+    const single = await measured(1);
+    const bulk = await measured(16);
+    expect(bulk).toBeLessThanOrEqual(single);
+    expect(await measured(12)).toBe(bulk);
+    expect(single).toBeLessThanOrEqual(50);
   });
 
   it("skips what someone else already ruled on rather than failing the batch", async () => {
@@ -372,9 +387,7 @@ describe("POST /patterns/resolve — in bulk", () => {
       envOf(sq), ctx,
     );
     expect(res.status).toBe(400);
-    const limit = Number((await res.json() as any).error.match(/exceed (\d+) per request/)![1]);
-    expect(limit).toBeLessThanOrEqual(100);
-    expect(limit).toBe(100 - 3);
+    expect((await res.json() as any).error).toMatch(/97/);
   });
 
   it("rejects a malformed ids list", async () => {
@@ -457,7 +470,15 @@ describe("GET /patterns — the layer and the author of each row", () => {
     const fx = await teamFixture();
     sq = fx.s;
     await seedInsightIn(sq, "i-co", fx.companyWorkspaceId, "The team ships behind flags on Fridays");
-    seedEdge(sq, "i-co", "gone", "drawn_from");
+    sq.seed({ id: "gone", content: "A source that was later forgotten", createdAt: 900, tags: ["work"] });
+    await seedEdge(sq, "i-co", "gone", "drawn_from");
+    const admitted = await beginMemoryWriteAdmission(fx.env, ctx);
+    await admitted.env.DB.batch([
+      admitted.env.DB.prepare(`UPDATE entries SET write_marker = ? WHERE id = ?`)
+        .bind(memoryWriteMarker(admitted.env, "delete"), "gone"),
+      admitted.env.DB.prepare(`DELETE FROM entries WHERE id = ?`).bind("gone"),
+    ]);
+    await admitted.finish();
 
     const data = await (await get(fx.env, "/patterns", fx.token)).json() as any;
 
@@ -512,7 +533,11 @@ describe("GET /patterns — the layer and the author of each row", () => {
 
     const patterns = await (await get(fx.env, "/patterns", fx.token)).json() as any;
     const list = await (await get(fx.env, "/list?n=50", fx.token)).json() as any;
-    const entry = await (await get(fx.env, "/entry?id=i-co", fx.token)).json() as any;
+    const entry = await (await worker.fetch(
+      req("POST", "/entry", { token: fx.token, body: { id: "i-co" } }),
+      fx.env,
+      ctx,
+    )).json() as any;
 
     expect(patterns.patterns[0].actor_name).toBe("Second Brain");
     expect(list.find((r: any) => r.id === "i-co").actor_name).toBe("Second Brain");

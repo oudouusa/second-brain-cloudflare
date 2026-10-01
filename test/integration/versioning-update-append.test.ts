@@ -1,7 +1,7 @@
 import { parentIdOfVectorId } from "../../src/vectorize/ids";
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { Client } from "@modelcontextprotocol/client";
+import { InMemoryTransport } from "@modelcontextprotocol/client";
 import worker from "../../src/index";
 import { buildMcpServer } from "../../src/mcp/server";
 import { makeSqliteD1, type SqliteD1 } from "../helpers/sqlite-d1";
@@ -22,7 +22,7 @@ let d1: SqliteD1;
 let env: Env;
 let wsId = "";
 let ownerId = "";
-let vectorize: VectorizeIndex;
+let vectorize: Vectorize;
 let deleted: string[][] = [];
 
 beforeEach(async () => {
@@ -30,8 +30,9 @@ beforeEach(async () => {
   deleted = [];
   d1 = makeSqliteD1();
   vectorize = makeVectorizeMock({ deleteByIds: vi.fn(async (ids: string[]) => { deleted.push(ids); return { mutationId: "m" } as any; }) });
-  env = makeTestEnv(undefined, { DB: d1.db as unknown as D1Database, OAUTH_KV: makeMemoryKV(), VECTORIZE: vectorize, AI: makeAIMock() });
+  env = d1.admitEnv(makeTestEnv(undefined, { DB: d1.db as unknown as D1Database, OAUTH_KV: makeMemoryKV(), VECTORIZE: vectorize, AI: makeAIMock() }));
   await initializeDatabase(env);
+  env = d1.admitEnv(env);
   const roots = await ensureTenantBootstrap(env);
   wsId = roots.ownerPersonalWorkspaceId;
   ownerId = roots.ownerUserId;
@@ -76,10 +77,10 @@ describe("versioning update", () => {
 
   it("a failed re-embed writes no version", async () => {
     await seed("e1", "before", []);
-    const failing = makeTestEnv(undefined, {
+    const failing = d1.admitEnv(makeTestEnv(undefined, {
       DB: d1.db as unknown as D1Database, OAUTH_KV: makeMemoryKV(), VECTORIZE: vectorize,
       AI: { run: vi.fn(async () => { throw new Error("overloaded"); }) } as unknown as Ai,
-    });
+    }));
     const r = await updateEntryContent(failing, "e1", "after", DEFAULTS, undefined, undefined, { workspaceId: wsId, actorId: ownerId }, change, wsId);
     expect(r.status).toBe("reembed_failed");
     expect(await versions("e1")).toEqual([]);
@@ -90,13 +91,15 @@ describe("versioning update", () => {
     await seed("e1", "before", []);
     // The row is forgotten while the re-embed's upsert is in flight.
     (vectorize.upsert as any).mockImplementation(async () => {
+      await d1.db.prepare(`UPDATE entries SET write_marker = ? WHERE id = 'e1'`).bind(d1.fixtureMarker('delete')).run();
       await d1.db.prepare(`DELETE FROM entries WHERE id = 'e1'`).run();
       return { mutationId: "m" };
     });
     const r = await updateEntryContent(env, "e1", "after", DEFAULTS, undefined, undefined, { workspaceId: wsId, actorId: ownerId }, change, wsId);
     expect(r).toEqual({ status: "not_found" });
     // The update's own upload (fresh ids naming e1) is deleted: nothing owns it now.
-    expect(deleted.flat().some((v: string) => parentIdOfVectorId(v) === "e1")).toBe(true);
+    expect(deleted.flat()).toHaveLength(1);
+    expect(deleted.flat()[0]).toMatch(/^v-[0-9a-f-]+-0$/);
     expect(await versions("e1")).toEqual([]);
   });
 

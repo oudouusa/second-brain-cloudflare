@@ -19,6 +19,13 @@ function fakeEnv(rowsRead: number) {
 }
 
 describe("observeRecallEnv rows_read", () => {
+  it("batch内の各SQL文を個別に計数する", async () => {
+    const diagnostics: RecallDiagnostics = {};
+    const env = observeRecallEnv(fakeEnv(1), diagnostics);
+    await env.DB.batch([env.DB.prepare("a"), env.DB.prepare("b")]);
+    expect(diagnostics.operations?.d1Statements).toBe(2);
+  });
+
   it("counts first() as all(): same statement, same rows_read, same return value", async () => {
     const diagnostics: RecallDiagnostics = {};
     const env = observeRecallEnv(fakeEnv(918), diagnostics);

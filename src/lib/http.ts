@@ -1,3 +1,4 @@
+import { BodyTooLargeError, readBoundedBytes } from "./body";
 import type { Env } from "../env";
 import type { AuthFailureCode, Identity } from "./identity";
 import { readTeamParam } from "./scope";
@@ -9,18 +10,7 @@ export const CORS_HEADERS = {
   "Access-Control-Expose-Headers": "ETag, X-Counts-Approximate",
 };
 
-export function json(data: unknown, status = 200): Response {
-  return new Response(JSON.stringify(data, null, 2), {
-    status,
-    headers: { "Content-Type": "application/json", ...CORS_HEADERS },
-  });
-}
-
-/**
- * The ?workspace= layer filter shared by /list, /recall and /graph. Only narrows
- * the caller's readable set — "personal" and "company" both resolve from the
- * identity, so a caller can never name a workspace it does not belong to.
- */
+/** Narrow a readable memory set to one user-facing layer. */
 export function readWorkspaceParam(url: URL): "personal" | "company" | undefined | Response {
   const raw = url.searchParams.get("workspace")?.trim();
   if (!raw) return undefined;
@@ -30,11 +20,7 @@ export function readWorkspaceParam(url: URL): "personal" | "company" | undefined
   return raw;
 }
 
-/**
- * The ?team= filter shared by read routes. Narrows to one company workspace
- * the caller belongs to — the same ids GET /team/workspaces and MCP list_teams
- * return. Only valid alone or with ?workspace=company.
- */
+/** Narrow a company-layer read to one validated team workspace. */
 export function readTeamQueryParam(
   url: URL,
   identity: Identity,
@@ -47,33 +33,122 @@ export function readTeamQueryParam(
   return result.teamId;
 }
 
+export const VERIFIED_AUTH_HEADER = "X-Second-Brain-Auth-Verified";
+
+export function json(data: unknown, status = 200): Response {
+  return new Response(JSON.stringify(data, null, 2), {
+    status,
+    headers: { "Content-Type": "application/json", ...CORS_HEADERS },
+  });
+}
+
+export async function readBodyBytes(
+  body: ReadableStream<Uint8Array> | null,
+  declared: string | null,
+  maxBytes: number,
+): Promise<{ ok: true; bytes: Uint8Array } | { ok: false; response: Response }> {
+  try {
+    return { ok: true, bytes: await readBoundedBytes(body, declared, maxBytes) };
+  } catch (error) {
+    return error instanceof BodyTooLargeError
+      ? { ok: false, response: json({ ok: false, error: "Request body is too large" }, 413) }
+      : { ok: false, response: json({ ok: false, error: "Invalid request body" }, 400) };
+  }
+}
+
+/** Buffer an authenticated request once, with a hard cap even for chunked bodies. */
+export async function boundRequestBody(
+  request: Request,
+  maxBytes: number,
+): Promise<{ ok: true; request: Request; bytes: Uint8Array } | { ok: false; response: Response }> {
+  const result = await readBodyBytes(request.body, request.headers.get("Content-Length"), maxBytes);
+  if (!result.ok) return result;
+  return {
+    ok: true,
+    // Always override the source body, including when it is a zero-byte stream.
+    // `undefined` means "inherit from request" to the Request constructor; after
+    // readBodyBytes has drained that stream, workerd rejects the reconstruction as
+    // "Cannot reconstruct a Request with a used body".
+    request: new Request(request, { body: result.bytes }),
+    bytes: result.bytes,
+  };
+}
+
+export async function readJsonBody<T>(
+  request: Request,
+  maxBytes: number,
+): Promise<{ ok: true; value: T } | { ok: false; response: Response }> {
+  const result = await readBodyBytes(request.body, request.headers.get("Content-Length"), maxBytes);
+  if (!result.ok) {
+    if (result.response.status === 413) {
+      return { ok: false, response: json({ ok: false, error: "JSON body is too large" }, 413) };
+    }
+    return result;
+  }
+  if (result.bytes.byteLength === 0) {
+    return { ok: false, response: json({ ok: false, error: "Invalid JSON" }, 400) };
+  }
+  try {
+    return { ok: true, value: JSON.parse(new TextDecoder().decode(result.bytes)) as T };
+  } catch {
+    return { ok: false, response: json({ ok: false, error: "Invalid JSON" }, 400) };
+  }
+}
+
+export async function readFormUrlEncodedBody(
+  request: Request,
+  maxBytes: number,
+): Promise<{ ok: true; value: URLSearchParams } | { ok: false; response: Response }> {
+  const contentType = request.headers.get("Content-Type")?.split(";", 1)[0].trim().toLowerCase();
+  if (contentType !== "application/x-www-form-urlencoded") {
+    return { ok: false, response: json({ ok: false, error: "Unsupported form content type" }, 415) };
+  }
+  const result = await readBodyBytes(request.body, request.headers.get("Content-Length"), maxBytes);
+  if (!result.ok) return result;
+  return { ok: true, value: new URLSearchParams(new TextDecoder().decode(result.bytes)) };
+}
+
+async function tokenDigest(value: string): Promise<ArrayBuffer> {
+  return crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
+}
+
+export async function isValidAuthToken(candidate: unknown, env: Env): Promise<boolean> {
+  const configured = env.AUTH_TOKEN;
+  if (typeof configured !== "string" || configured.length === 0 || typeof candidate !== "string") {
+    return false;
+  }
+  const [candidateHash, configuredHash] = await Promise.all([
+    tokenDigest(candidate),
+    tokenDigest(configured),
+  ]);
+  return crypto.subtle.timingSafeEqual(candidateHash, configuredHash);
+}
+
+export async function isAuthorized(request: Request, env: Env): Promise<boolean> {
+  const authorization = request.headers.get("Authorization");
+  const bearer = authorization?.match(/^Bearer (.+)$/i);
+  return bearer ? isValidAuthToken(bearer[1], env) : false;
+}
+
 /**
- * The legacy AUTH_TOKEN check: `Authorization: Bearer <token>` and nothing else.
- *
- * The `?token=` query form was removed in v3 for the reason extractToken
- * (src/lib/identity.ts) gives — a URL is copied into browser history, proxy and
- * CDN access logs and outbound Referer headers, none of which a credential
- * should reach. It mattered most here: the two surfaces behind this guard are
- * the migration runner and OAuth revocation, so the token it compares is the
- * deployment-wide AUTH_TOKEN rather than one member's.
+ * Marks a request only after the outer Worker has verified its static token.
+ * Any client-supplied marker is removed first, so inner route handlers can
+ * retain their synchronous early-return shape without comparing a secret.
  */
-export function isAuthorized(request: Request, env: Env): boolean {
-  return request.headers.get("Authorization") === `Bearer ${env.AUTH_TOKEN}`;
+export async function withVerifiedAuth(request: Request, env: Env): Promise<Request> {
+  const verified = await isAuthorized(request, env);
+  if (!verified && !request.headers.has(VERIFIED_AUTH_HEADER)) return request;
+  const headers = new Headers(request.headers);
+  headers.delete(VERIFIED_AUTH_HEADER);
+  if (verified) headers.set(VERIFIED_AUTH_HEADER, "1");
+  return new Request(request, { headers });
 }
 
 // Returns a 401 Response if the request lacks a valid token, otherwise null —
 // lets routes early-return with `const authErr = requireAuth(...); if (authErr) return authErr;`
-//
-// Carries the same `code` field requireIdentity's 401s do, so a client can read
-// one shape across every surface. Always "invalid_token": this guard compares
-// against the AUTH_TOKEN binding and has no users row to classify, so there is
-// no suspension or removal for it to report. The type import is erased at
-// compile time, so naming AuthFailureCode here costs no runtime cycle with
-// identity.ts (which imports json from this file).
-export function requireAuth(request: Request, env: Env): Response | null {
-  if (isAuthorized(request, env)) return null;
-  const code: AuthFailureCode = "invalid_token";
-  return json({ ok: false, error: "Unauthorized", code }, 401);
+export function requireAuth(request: Request, _env: Env): Response | null {
+  if (request.headers.get(VERIFIED_AUTH_HEADER) === "1") return null;
+  return json({ ok: false, error: "Unauthorized", code: "invalid_token" }, 401);
 }
 
 // Anchored so the whole value has to be an integer. parseInt stops at the first

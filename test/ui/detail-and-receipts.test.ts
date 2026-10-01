@@ -662,3 +662,11 @@ describe("a double-tapped link removal", () => {
     expect((ctx.calls as any[]).filter((c) => c.url.includes("/unlink")).length).toBe(1);
   });
 });
+
+ it("保存成功のレシートに索引待ちを表示する", () => {
+   const ctx = load();
+   const html = ctx.captureReceipt({ ok: true, semantic_unavailable: true, tags: [] }, []).innerHTML;
+   expect(html).toContain("stored to brain");
+   expect(html).toContain("searchable by keyword");
+   expect(ctx.captureReceipt({ ok: true }, []).innerHTML).not.toContain("waiting for recovery");
+ });

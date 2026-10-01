@@ -15,8 +15,8 @@
  * not one tool being wrong — it is two tools disagreeing.
  */
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { Client } from "@modelcontextprotocol/client";
+import { InMemoryTransport } from "@modelcontextprotocol/client";
 import { buildMcpServer } from "../../src/mcp/server";
 import { makeSqliteD1, type SqliteD1 } from "../helpers/sqlite-d1";
 import { makeTestEnv, makeMemoryKV } from "../helpers/make-env";
@@ -60,7 +60,7 @@ async function headersFor(identity: Identity | undefined, id: string, query: str
 }
 
 /** Strip the parts only recall prints, leaving the shared header. */
-const core = (s: string) => s.replace(/^\d+\.\s*/, "").replace(/\]\s*\(\d+% match\).*$/, "]").trim();
+const core = (s: string) => s.replace(/^\d+\.\s*/, "").replace(/\]\s*\(relative score: [\d.]+\).*$/, "]").trim();
 
 function seed(id: string, workspaceId: string, actorId: string, content: string, tags: string[], source = "api") {
   const now = Date.now() - 3600_000;
@@ -177,9 +177,13 @@ describe("a personal brain: nothing is badged", () => {
  * not the other is a client that has to special-case which endpoint it asked.
  */
 describe("GET /list and GET /recall describe a memory the same way", () => {
-  const call = (path: string, token: string) =>
+  const call = (path: string, token: string, body?: unknown) =>
     worker.fetch(
-      new Request(`http://localhost${path}`, { headers: { Authorization: `Bearer ${token}` } }),
+      new Request(`http://localhost${path}`, {
+        method: body === undefined ? "GET" : "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+        body: body === undefined ? undefined : JSON.stringify(body),
+      }),
       env,
       ctx,
     );
@@ -212,7 +216,11 @@ describe("GET /list and GET /recall describe a memory the same way", () => {
 
     const listed = (await jsonOf(await call("/list?n=50", "test-token")))
       .find((r: any) => r.id === "their-shared");
-    const recalled = (await jsonOf(await call("/recall?query=on-call%20rotates&topK=10&synthesize=false", "test-token")))
+    const recalled = (await jsonOf(await call("/recall", "test-token", {
+      query: "on-call rotates",
+      topK: 10,
+      synthesize: false,
+    })))
       .results.find((r: any) => r.id === "their-shared");
 
     expect(listed.workspace).toBe("company");

@@ -3,8 +3,8 @@
  * on remember / POST /capture and update / POST /update (spec 14 5.4, P5, P6).
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { Client } from "@modelcontextprotocol/client";
+import { InMemoryTransport } from "@modelcontextprotocol/client";
 import worker from "../../src/index";
 import { buildMcpServer } from "../../src/mcp/server";
 import { req } from "../helpers/make-request";
@@ -28,8 +28,8 @@ let decision = `{"contradicts": false}`;
 
 function ai() {
   return {
-    run: vi.fn(async (model: string) => model.startsWith("@cf/baai/bge")
-      ? { data: [new Array(384).fill(0.1)] }
+    run: vi.fn(async (model: string) => model === "@cf/google/embeddinggemma-300m"
+      ? { data: [new Array(768).fill(0.1)] }
       : new ReadableStream({ start(c) {
         c.enqueue(new TextEncoder().encode(`data: {"response":${JSON.stringify(decision)}}\n\n`));
         c.enqueue(new TextEncoder().encode("data: [DONE]\n\n")); c.close();
@@ -42,10 +42,10 @@ beforeEach(async () => {
   matches = [];
   decision = `{"contradicts": false}`;
   sqlite = makeSqliteD1();
-  env = makeTestEnv(undefined, {
+  env = sqlite.admitEnv(makeTestEnv(undefined, {
     DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV(), AI: ai(),
     VECTORIZE: makeVectorizeMock({ query: vi.fn(async () => ({ matches: matches.map(m => ({ ...m, metadata: { parentId: m.id } })) })) as any }),
-  });
+  }));
   await initializeDatabase(env);
   await ensureTenantBootstrap(env);
   owner = (await resolveIdentityFromToken("test-token", env))!;
@@ -181,7 +181,7 @@ describe("update and POST /update", () => {
     await mcp("update", { id: "a", valid_until: "2026-05" });
     const r = await rest("/update", { id: "b", valid_until: "2026-05" });
     expect(r.body).toMatchObject({ ok: true, id: "b", validity: { valid_until: Date.UTC(2026, 4, 1), propagated: [] } });
-    const strip = (x: any) => ({ ...x, id: undefined, content: undefined });
+    const strip = (x: any) => { const { write_marker, ...row } = x; expect(write_marker).toEqual(expect.any(String)); return { ...row, id: undefined, content: undefined }; };
     expect(strip(await row("a"))).toEqual(strip(await row("b")));
     const [va] = await versions("a");
     const [vb] = await versions("b");
@@ -223,10 +223,10 @@ describe("budget", () => {
     await seed("austin", { createdAt: Date.UTC(2026, 7, 1), validFrom: Date.UTC(2026, 5, 1) });
     await sqlite.db.prepare(`INSERT INTO edges (id, source_id, target_id, type, weight, provenance, metadata, created_at, updated_at, workspace_id) VALUES ('s', 'austin', 'denver', 'supersedes', 1, 'system', '{}', 1, 1, ?)`).bind(ws).run();
     const change = { actorId: owner.userId, channel: "rest" as const };
-    sqlite.issued.length = 0;
+    sqlite.executions.length = 0;
     const r = await updateEntryValidity(env, "austin", { from: Date.UTC(2026, 4, 1) }, change, DEFAULTS, ws);
     expect(r).toMatchObject({ status: "updated", propagated: ["denver"] });
-    expect(sqlite.issued.length, sqlite.issued.join("\n")).toBe(3);
-    expect(sqlite.issued.filter(s => s === "BATCH")).toHaveLength(2);
+    expect(sqlite.executions.length, sqlite.executions.join("\n")).toBe(3);
+    expect(sqlite.executions.filter(s => s === "BATCH")).toHaveLength(2);
   });
 });

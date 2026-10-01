@@ -16,7 +16,7 @@ afterEach(() => { sqlite.close(); setDbReady(false); });
 
 it("hides a private event recorded in the same millisecond as the share event", async () => {
   resetDatabaseInit();
-  const env = makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV() });
+  const env = sqlite.admitEnv(makeTestEnv(undefined, { DB: sqlite.db as unknown as Env["DB"], OAUTH_KV: makeMemoryKV() }));
   await initializeDatabase(env);
   setDbReady(true);
   await ensureTenantBootstrap(env);
@@ -37,7 +37,7 @@ it("hides a private event recorded in the same millisecond as the share event", 
   const history = await readEntryHistory(env, bobIdentity, "shared-entry");
   const events = history?.history.items.filter((i: any) => i.kind === "event") ?? [];
   expect.soft(events.map((e: any) => e.event)).toEqual(["shared"]);
-  const response = await worker.fetch(req("GET", "/entry?id=shared-entry", { token: bob.token }), env, { waitUntil() {} } as unknown as ExecutionContext);
+  const response = await worker.fetch(req("POST", "/entry?id=shared-entry", { token: bob.token }), env, { waitUntil() {} } as unknown as ExecutionContext);
   const json = await response.json() as any;
   expect.soft(JSON.stringify(json)).not.toContain("private-era");
 });
