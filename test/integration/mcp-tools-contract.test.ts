@@ -643,9 +643,18 @@ describe("tool definitions have a single source of truth", () => {
 describe("README's memory-tools table matches the server", () => {
   const README = resolve(import.meta.dirname, "../../README.md");
 
-  it("names every tool the MCP server exposes, and no others", () => {
+  // 見出しの翻訳に依存せず、公開リンクと同じ固定anchorで表の範囲を検査する。
+  function memoryToolsTable() {
     const readme = readFileSync(README, "utf8");
-    const table = readme.slice(readme.indexOf("### Memory tools"));
+    const start = readme.indexOf('<a id="memory-tools"></a>');
+    const end = readme.indexOf('<a id="projects"></a>');
+    expect(start).toBeGreaterThanOrEqual(0);
+    expect(end).toBeGreaterThan(start);
+    return readme.slice(start, end);
+  }
+
+  it("names every tool the MCP server exposes, and no others", () => {
+    const table = memoryToolsTable();
     const documented = [...table.matchAll(/^\| `([a-z_]+)`\s*\|/gm)].map(m => m[1]);
 
     expect(documented.length).toBeGreaterThan(0);
@@ -655,8 +664,7 @@ describe("README's memory-tools table matches the server", () => {
   // Track 2 D4 (T-0089.6.10, spec 14 7.5): the recall, remember and update rows name
   // as_of/validity, and a line under the table explains what that buys the reader.
   it("names as_of on recall and validity on remember and update, with a line on time under the table", () => {
-    const readme = readFileSync(README, "utf8");
-    const table = readme.slice(readme.indexOf("### Memory tools"), readme.indexOf("### Projects"));
+    const table = memoryToolsTable();
     const rowFor = (tool: string) => table.match(new RegExp(`^\\| \`${tool}\`.*$`, "m"))?.[0] ?? "";
 
     expect(rowFor("recall")).toMatch(/as_of|past date/i);

@@ -39,6 +39,46 @@ Workers・Durable Objects・Workers AI・D1・KV・Vectorize・R2の利用枠は
 
 一般的な接続の問題は[Connect to AI Clients → Troubleshooting](https://github.com/rahilp/second-brain-cloudflare/wiki/Connect-to-AI-Clients#troubleshooting)も参照できます（Opera warnings、Cursor OAuth、Claude Code tool visibility）。endpointは上のfork用の表を使ってください。
 
+<a id="memory-tools"></a>
+
+### 記憶ツール
+
+| ツール | 用途 |
+| --- | --- |
+| `remember` | 意見・決定・好み・文脈を保存します。事実が成立した日を`valid_from`、終了した日を`valid_until`で指定できます。 |
+| `append` | 既存の記憶へ時刻付きの追記を加えます。 |
+| `rollover` | 長くなった追記記録を、原文を残して短い現在状態の記憶へ継続します。 |
+| `update` | 記憶の内容を更新します。事実が終了した日を`valid_until`で指定できます。 |
+| `recall` | 意味による検索を行います。`as_of`で過去の日付に有効だった事実を検索できます。 |
+| `brief` | 期限・未完了の約束・古くなった記憶・未確認の洞察を確認します。 |
+| `resolve` | 追跡中の作業・日付・洞察・古くなった事実を整理します。 |
+| `digest` | プロジェクトやタグについて、既存の自動要約を読みます。 |
+| `history` | 記憶の変更と、それぞれの変更前の本文を読みます。 |
+| `list_recent` | 最近保存された記憶を一覧表示します。 |
+| `list_projects` | 読取り可能なプロジェクトを一覧表示します。 |
+| `list_teams` | 所属する共有チームの名前とworkspace IDを一覧表示します。 |
+| `get` | IDを指定して記憶を読みます。 |
+| `forget` | 記憶をゴミ箱へ移します。`undo`で復元できます。 |
+| `undo` | 記憶の直前の変更を取り消すか、ゴミ箱から復元します。 |
+| `set_status` | 記憶を`canonical`・`draft`・`deprecated`に設定します。 |
+| `set_memory_tier` | 手動の保存区分を`hot`・`warm`・`cold`へ変更します。`cold`も検索できます。 |
+| `pin_memory` | 利用者が確認した現在の目標や制約をHot contextへ固定します。 |
+| `unpin_memory` | 手動の固定を解除します。保存区分は変えません。 |
+| `get_hot_context` | 手動でhotにした記憶や固定した記憶を、上限内で読みます。 |
+| `get_prompt_capsule` | 認証済みMCPから、決定的なPrompt Capsuleと強いETagを読みます。 |
+| `link` | 二つの記憶に明示的な関係を作ります。 |
+| `unlink` | 記憶の関係を削除します。 |
+| `connections` | 指定した記憶につながる記憶を一覧表示します。 |
+| `share` | 個人領域と共有領域の間で記憶を移します。 |
+
+事実の有効期間と変更履歴を区別します。`as_of`は過去に有効だった事実を検索し、新しい事実に置き換わった原文は履歴として残します。Team構成で領域を指定する場合は、`workspace=personal`が個人領域、`workspace=company`が共有領域です。常に本人が読取り可能な範囲を検索します。
+
+<a id="projects"></a>
+
+### プロジェクト
+
+プロジェクトは記憶をまとめる単位です。`list_projects`で利用可能な一覧を読み、対応する検索・一覧・要約へプロジェクトを指定できます。チームへの所属だけでは、別の利用者の個人領域は読めません。
+
 ## 開発・更新
 
 ```sh
