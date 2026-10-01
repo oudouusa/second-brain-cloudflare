@@ -30,7 +30,7 @@ profile名とWorker名を自身の値に置き換え、アカウントが配備�
 npx --yes wrangler@4.146.0 d1 create "${sb_worker_name}-db" --profile "$sb_cf_profile" --config wrangler.personal.jsonc
 npx --yes wrangler@4.146.0 kv namespace create OAUTH_KV --profile "$sb_cf_profile" --config wrangler.personal.jsonc
 npx --yes wrangler@4.146.0 vectorize create "${sb_worker_name}-eg128" --dimensions 128 --metric cosine --profile "$sb_cf_profile"
-npx --yes wrangler@4.146.0 vectorize create-metadata-index "${sb_worker_name}-eg128" --property-name parent_id --type string --profile "$sb_cf_profile"
+npx --yes wrangler@4.146.0 vectorize create-metadata-index "${sb_worker_name}-eg128" --property-name parentId --type string --profile "$sb_cf_profile"
 npx --yes wrangler@4.146.0 vectorize create-metadata-index "${sb_worker_name}-eg128" --property-name workspace_id --type string --profile "$sb_cf_profile"
 npx --yes wrangler@4.146.0 r2 bucket create "${sb_worker_name}-archive" --profile "$sb_cf_profile"
 ```
