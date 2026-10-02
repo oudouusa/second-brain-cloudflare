@@ -117,7 +117,7 @@ in `internal.diagnostics.ftsUsed` and `ftsRoute`:
   query left with no plan goes straight to LIKE without an FTS batch. Common
   words the plan leaves out still weigh in fusion. Both tiers run in the same
   `DB.batch` as the liveness check, so it costs no extra subrequest.
-  forkでは単語クエリもdfを計算する。未集計の語がある場合は上流のfull ORへ戻る。
+  The fork also computes df for single-term queries. If a term lacks counts, fall back to upstream full OR.
 - **Short-token df**: the index cannot count a short token and the exact LIKE
   count reads the whole partition, so distillation estimates its df from the
   newest `FTS_SHORT_TOKEN_SAMPLE` (200) readable rows, Laplace-smoothed
@@ -126,10 +126,11 @@ in `internal.diagnostics.ftsUsed` and `ftsRoute`:
   The sample sees only recent rows, so it can be wrong about a corpus whose
   recent rows differ from the rest; that is why `rankAndRebuild` lets a short
   token fill only the slots the counted terms leave and never outrank one.
-- **LIKE経路**: 通常recallはforkの`keywordSearchLexical`を使う。
-  日本語raw／NFKC probe、非bigram単語一致優先、追記の局所passage、縮退時の
-  canonical救済とbind予算を保持する。FTS適格性・準備・liveness・SQL失敗時の
-  fallbackを共有する。上流の稀語窓helperは単独router試験用の呼出しも維持する。
+- **LIKE path**: Normal recall uses the fork's `keywordSearchLexical`.
+  Retain Japanese raw/NFKC probes, non-bigram word-match priority, local append
+  passages, degraded-mode canonical rescue, and bind budgets. Share FTS eligibility,
+  readiness, liveness, and SQL-failure fallback. The upstream rare-term-window helper
+  also remains callable for standalone router tests.
 
 Two gates decide whether the FTS arm runs at all. `ftsReady` (`recall/fts.ts`)
 reads the KV flag `fts:ready` and caches the answer in both directions for
@@ -209,10 +210,11 @@ MCP change.
 
 ### Candidate rows carry match levels, not text (T-0088)
 
-以下の計数・品質測定は上流BGE corpusの記録であり、forkの本番測定ではない。
-forkのFTS経路では本文なしmatch levelsを採用する。LIKE互換経路は局所passageと
-日本語の照合に本文を使う。上限は128件、Gemma128固定。詳しい採否は
-`docs/fork/UPSTREAM_SYNC.md` の3.7.0節を参照する。
+The counts and quality measurements below describe the upstream BGE corpus, not
+production measurements of this fork. The fork FTS path uses content-free match
+levels; the LIKE compatibility path reads content for local passages and Japanese
+matching. The cap is 128 candidates with fixed Gemma128. See
+`docs/fork/ARCHITECTURE.md` for the current ownership and search boundaries.
 
 
 The keyword arm used to select every candidate note in full (up to `KEYWORD_CANDIDATE_LIMIT` = 500 rows) so the Worker could weigh

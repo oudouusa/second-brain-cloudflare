@@ -26,11 +26,12 @@ verifier adds a second fail-closed layer before evidence is shared or committed:
 - source Capsule hashes, completeness, endpoint hashes, and ETag hashes are
   preserved in the safe manifest.
 
-`worker-mcp-oauth` は、認証済みMCPの `get_prompt_capsule` から取得し、同じ
-REST表現のstrong ETagまで再計算した本番Worker Capsuleを表します。
-`worker-access` はDashboard Access API、`worker` は従来のBearer経路です。
-いずれもlive sourceですが、proxy-only認定は `worker-mcp-oauth` または
-後方互換の `worker-access` だけを受理し、manifestへ実際の認証境界を記録します。
+`worker-mcp-oauth` denotes a live production Worker Capsule fetched through
+authenticated MCP `get_prompt_capsule`, with the strong ETag of the equivalent
+REST representation recomputed. `worker-access` uses the Dashboard Access API;
+`worker` is the legacy Bearer path. All are live sources, but proxy-only
+qualification accepts only `worker-mcp-oauth` or backward-compatible
+`worker-access`, recording the actual authentication boundary in the manifest.
 
 The output contains hashes and aggregate metrics only. It does not copy arbitrary
 unknown fields from the input.
@@ -133,14 +134,14 @@ fails closed, so evidence from another compatible server cannot certify the
 intended CLIProxyAPI route. A successful response without cache usage evidence
 does not pass.
 
-公式OpenAI API keyを運用しない構成では、`qualify.mjs --mode proxy-only` を使います。
-このモードはCLIProxyAPI経路だけを検証し、direct経路を成功扱いせず
-`not_applicable` として記録します。またCapsule sourceはMCP Managed OAuth経路、
-proxy transportは期待した完全一致fingerprintであることを要求します。
-CLIProxyAPIがwrite counterを公開しない場合でも、唯一のstrict gate failureが
-`initial_cache_write_missing`で、後続`cached_tokens`と他の全条件が合格していれば、
-別schema側で`cache-read-observed`として認定します。元のstrict evidenceは
-`verified: false`のまま保持し、未観測writeを改変しません。
+Without an official OpenAI API key, use `qualify.mjs --mode proxy-only`. It
+qualifies only CLIProxyAPI and records direct access as `not_applicable`, not
+successful. It requires the MCP Managed OAuth Capsule source and an exactly
+matching expected proxy-transport fingerprint. If CLIProxyAPI exposes no write
+counter, but `initial_cache_write_missing` is the sole strict-gate failure and
+later `cached_tokens` plus all other conditions pass, the separate schema may
+qualify `cache-read-observed`. Original strict evidence remains `verified: false`;
+unobserved writes are not rewritten as observed.
 
 ## Stdin and exit codes
 

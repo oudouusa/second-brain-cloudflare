@@ -1,51 +1,51 @@
 # Recall benchmark v1
 
-実データを含まない固定corpusで、旧BGE 384 baselineとEmbeddingGemma MRL 128を同一条件で比較する。
+Compare the legacy BGE 384 baseline and EmbeddingGemma MRL 128 under identical conditions using a fixed corpus with no real data.
 
-- query: 60件（日本語30、日英混在15、識別子15）
-- must-pass: 20件
-- 指標: Recall@1、Recall@5、MRR、must-pass Top 5通過数
-- 結果: queryごとのrankとTop 5（scoreを含む）
-- 閾値corpus: exact duplicate、near duplicate、related、unrelatedを各10組
+- Queries: 60 (30 Japanese, 15 mixed Japanese/English, 15 identifiers).
+- Must-pass cases: 20.
+- Metrics: Recall@1, Recall@5, MRR, and must-pass Top-5 count.
+- Results: per-query rank and Top 5, including scores.
+- Threshold corpus: ten pairs each of exact duplicates, near duplicates, related, and unrelated documents.
 
-## 実行
+## Running
 
-corpus自体の検証にはCloudflare接続を使わない。
+Corpus validation does not access Cloudflare:
 
 ```bash
 npm run benchmark:validate
 ```
 
-実測時は別terminalで、専用account profileを明示してローカルbenchmark Workerを起動する。これはWorker、D1、KV、Vectorizeを作成せず、Workers AI bindingだけを利用する。
+For measurements, start the local benchmark Worker in another terminal with an explicit dedicated account profile. It uses only a Workers AI binding and does not create a Worker, D1, KV, or Vectorize resource.
 
 ```bash
-npx wrangler dev --config benchmarks/recall-v1/ai-dev.jsonc --profile second-brain-cf --port 8791
+npx --yes wrangler@4.146.0 dev --config benchmarks/recall-v1/ai-dev.jsonc --profile second-brain-cf --port 8791
 ```
 
-旧baselineを測定する。
+Measure the old baseline:
 
 ```bash
 npm run benchmark:bge
 ```
 
-EmbeddingGemma実装後の比較を測定する。
+Measure the EmbeddingGemma implementation for comparison:
 
 ```bash
 npm run benchmark:gemma
 ```
 
-Gemmaのdocument同士のscore分布からduplicate、graph、insight閾値を検証する。
+Check duplicate, graph, and insight thresholds against Gemma document-pair score distributions:
 
 ```bash
 npm run benchmark:thresholds
 ```
 
-hosted modelの入力長を日本語、英語、コードで確認する。
+Check hosted-model input lengths for Japanese, English, and code:
 
 ```bash
 npm run benchmark:input-limits
 ```
 
-`evaluate.mjs` はモデルの生出力次元、有限値、非ゼロnormを検査する。EmbeddingGemma profileだけは公式model cardに従い先頭128次元へtruncateした後にL2再正規化し、queryとdocumentへ別promptを適用する。
+`evaluate.mjs` checks raw output dimensions, finite values, and nonzero norms. Only the EmbeddingGemma profile truncates to the first 128 dimensions and L2-renormalizes according to its model card, with separate query/document prompts.
 
-corpusの`title`は評価用labelであり、現行production entryにはtitle列がないため、Gemmaのdocument入力はproductionと同じ`title: none`に固定する。実測値と採用閾値は`docs/fork/SEARCH_QUALITY.md`に記録する。
+Corpus `title` is an evaluation label. Production entries have no title column, so Gemma document input uses fixed `title: none`, matching production. Measurements and adopted thresholds are recorded in `docs/fork/SEARCH_QUALITY.md`.

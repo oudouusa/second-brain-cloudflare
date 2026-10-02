@@ -1,35 +1,35 @@
-# 検索品質と閾値調整
+# Search quality and threshold calibration
 
-## 実測条件
+## Measurement conditions
 
-- 実行日: 2026-08-26 JST
+- Run date: 2026-08-26 JST
 - Cloudflare account/profile: `second-brain-cf`
-- corpus: synthetic 60 queries（日本語30、日英混在15、識別子15）、must-pass 20
+- Corpus: 60 synthetic queries (30 Japanese, 15 mixed Japanese/English, 15 identifiers), including 20 must-pass cases
 - baseline: `@cf/baai/bge-small-en-v1.5` 384 dimensions
-- candidate: `@cf/google/embeddinggemma-300m` の先頭128 dimensionsをtruncate後L2再正規化
+- Candidate: `@cf/google/embeddinggemma-300m`, truncated to the first 128 dimensions and L2-renormalized
 - Gemma query prompt: `task: search result | query: ...`
 - Gemma document prompt: `title: none | text: ...`
 
-corpusの`title`は評価用labelであり、現行production entryにはtitle列がないためembeddingへ入れていない。Workers AI REST APIを専用accountで実行し、OAuth token、vector値、private memory本文は保存・出力していない。全queryのrank、Top 5とscoreは`benchmarks/recall-v1/results-*.json`へ保存した。
+Corpus `title` is an evaluation label and is excluded from embeddings because current production entries have no title column. Measurements used the Workers AI REST API through a dedicated account, without saving or printing OAuth tokens, vector values, or private memory content. Per-query rank, Top 5, and scores are in `benchmarks/recall-v1/results-*.json`.
 
-## Recall結果
+## Recall results
 
 | Profile / category | Recall@1 | Recall@5 | MRR |
 |---|---:|---:|---:|
 | BGE overall | 86.67% | 96.67% | 0.910758 |
 | Gemma 128 overall | 100% | 100% | 1.000000 |
-| BGE 日本語 | 73.33% | 93.33% | 0.821516 |
-| Gemma 128 日本語 | 100% | 100% | 1.000000 |
+| BGE Japanese | 73.33% | 93.33% | 0.821516 |
+| Gemma 128 Japanese | 100% | 100% | 1.000000 |
 | BGE mixed | 100% | 100% | 1.000000 |
 | Gemma 128 mixed | 100% | 100% | 1.000000 |
 | BGE identifier | 100% | 100% | 1.000000 |
 | Gemma 128 identifier | 100% | 100% | 1.000000 |
 
-Gemmaはmust-pass 20/20をTop 5へ入れた。日本語Recall@5は6.67 points改善し、mixedとidentifierは低下0 pointsで、M3の品質gateを満たした。Gemmaの正解Top 1 scoreは0.519723–0.853190で、0.60未満は3/60件だった。
+Gemma placed all 20/20 must-pass cases in the Top 5. Japanese Recall@5 improved by 6.67 percentage points, with no decline for mixed or identifier queries, satisfying the M3 quality gate. Correct Top-1 Gemma scores ranged from 0.519723 to 0.853190; 3/60 were below 0.60.
 
-## 閾値corpus
+## Threshold corpus
 
-検索queryとは別に、document同士をexact duplicate、near duplicate、related-but-distinct、unrelatedの各10組、計40組へ固定した。結果は`benchmarks/recall-v1/thresholds-embeddinggemma-mrl128-v1.json`へ保存した。
+Separately from search queries, 40 fixed document pairs cover ten each of exact duplicates, near duplicates, related-but-distinct pairs, and unrelated pairs. Results are in `benchmarks/recall-v1/thresholds-embeddinggemma-mrl128-v1.json`.
 
 | Class | min | median | max |
 |---|---:|---:|---:|
@@ -38,45 +38,45 @@ Gemmaはmust-pass 20/20をTop 5へ入れた。日本語Recall@5は6.67 points改
 | related | 0.329240 | 0.453827 | 0.594439 |
 | unrelated | 0.155909 | 0.228434 | 0.378484 |
 
-## 採用値
+## Adopted thresholds
 
-| 用途 | 旧値 | 採用値 | 実測上の挙動 |
+| Purpose | Previous | Adopted | Observed behavior |
 |---|---:|---:|---|
-| duplicate block | 0.95 | 0.98 | exact 10/10をblock、nearを誤blockしない |
-| duplicate flag | 0.85 | 0.80 | near 10/10をflag、related/unrelatedの誤flag 0/20 |
-| recall widen | 0.85 | 0.60 | 全件widenを避け、weak tail 3/60だけを拡張 |
-| graph auto-link | 0.78 | 0.42（具体topic tag一致）／0.70（不一致・tagなし） | 0.42はrelated 8/10、unrelated false positive 0/10の校正下限。production整合gateは後述 |
-| insight candidate | 0.80 | 0.82 | evolving-thought相当のnear 10/10、broad related/unrelated 0/20 |
+| duplicate block | 0.95 | 0.98 | Blocks 10/10 exact pairs without falsely blocking near duplicates |
+| duplicate flag | 0.85 | 0.80 | Flags 10/10 near pairs; 0/20 false flags for related/unrelated pairs |
+| recall widen | 0.85 | 0.60 | Expands only the weak tail of 3/60 rather than every query |
+| graph auto-link | 0.78 | 0.42 (shared specific topic tag) / 0.70 (no shared tag or no tags) | 0.42 is the calibrated floor: 8/10 related hits, 0/10 unrelated false positives. See the production consistency gate below. |
+| insight candidate | 0.80 | 0.82 | 10/10 evolving-thought-like near pairs; 0/20 broadly related/unrelated pairs |
 
-Insightは広い話題関連ではなく、30日以上離れた同一テーマの変化をLLM判定へ渡すpre-filterなので、near-duplicate帯をpositiveとして保守的に合わせた。丸めた採用値と実測JSONの対応はunit testで固定した。
+Insight candidates prefilter changes within the same topic at least 30 days apart for LLM judgment, rather than broad topical relationships. Calibration therefore conservatively treats near duplicates as positives. Unit tests pin the rounded adopted thresholds to measured JSON.
 
-## Production graph再検証（2026-08-28）
+## Production graph reassessment (2026-08-28)
 
-private本文を保存せず意味分類だけを集計した83-edge snapshotでは、明確に有用56、明確な誤接続22、弱い関連5だった。81件が自動推論、2件が明示edgeで、誤接続は主に意味の似た別project間で発生した。`0.70`以上の推論edge 31件は全件妥当だった一方、`0.6891`にも明確な誤接続があり、単純に閾値を上げるだけでは`0.42–0.69`にある同一projectの有用edgeも失う。
+An 83-edge snapshot aggregated only semantic classifications, without saving private text: 56 clearly useful, 22 clearly incorrect, and five weakly related. Of these, 81 were inferred and two explicit; most incorrect links connected semantically similar but different projects. All 31 inferred edges at or above `0.70` were valid, but a clear incorrect link existed at `0.6891`. Raising the threshold alone would also lose useful same-project edges in the `0.42–0.69` band.
 
-このためraw scoreだけでなく具体topic tagの共有をproject整合の証拠にする。AI instructionsがほぼ全entryへ付ける`personal`、`work`、`task`、`idea`、`context`、`claude-response`、`codex-response`は整合証拠に数えず、system lifecycle／pipeline tagも除外する。共有topicがあれば校正下限`0.42`、なければproduction clean bandの`0.70`を適用する。policyは`embeddinggemma-mrl128-v2`としてedge metadataへ記録し、夜間passが旧policy edgeを段階的に再計算できるようにした。
+Use shared specific topic tags as evidence of project consistency alongside raw scores. Generic instruction-assigned tags `personal`, `work`, `task`, `idea`, `context`, `claude-response`, and `codex-response` do not count; system lifecycle/pipeline tags are excluded too. Apply the calibrated `0.42` floor with a shared topic, otherwise the production clean-band threshold of `0.70`. Record policy `embeddinggemma-mrl128-v2` in edge metadata so nightly passes can gradually recompute old-policy edges.
 
-同日のproduction read-only SQL dry-runでは現行推論`relates_to` 96件の内訳が、`0.70`以上36件、`0.42–0.69`かつ具体topic共有29件、同bandでtopic共有なし31件、`0.42`未満0件だった。したがって初回nightly prune候補は31件、維持候補は65件である。SQL metadataは`changed_db=false`、`rows_written=0`で、本文・tag値・entry IDは端末へ出力していない。
+A production read-only SQL dry run that day classified 96 inferred `relates_to` edges: 36 at or above `0.70`, 29 in `0.42–0.69` sharing a specific topic, 31 in that band without one, and zero below `0.42`. That gave 31 initial nightly-prune candidates and 65 retain candidates. SQL metadata reported `changed_db=false`, `rows_written=0`; no content, tag values, or entry IDs were printed.
 
-2.5.0配備後はbounded nightly passを6回実行して段階移行を完了した。初回収束確認ではcurrent-policy inferred 61（shared-topic-tag 59、high-similarity 2）、legacy policy 0、explicit 6、dangling 0だった。2.5.1配備後の2026-08-28 17:38 JST確認では、通常の再計算後にentries 43、edges 64、current-policy inferred 58、legacy 0、explicit 6、dangling 0である。推論edge数はentry更新と夜間再計算で変動するが、旧policyへは戻らない。明示edgeは再計算・prune対象外のまま保持された。
+After 2.5.0 deployment, six bounded nightly passes completed the gradual migration. Initial convergence showed 61 current-policy inferred edges (59 shared-topic-tag, two high-similarity), zero legacy-policy, six explicit, and zero dangling. After 2.5.1 deployment, the 2026-08-28 17:38 JST check following normal recomputation showed 43 entries, 64 edges, 58 current-policy inferred, zero legacy, six explicit, and zero dangling. Inferred counts vary with entry updates and nightly recomputation without returning to the old policy. Explicit edges remained excluded from recomputation and pruning.
 
-## 読み取り時のgraph寄与
+## Graph contribution during reads
 
-`recall`はhopsを明示したrequestについて、`seedCount`、`expandedCount`、`eligibleCount`、`selectedCount`を返す。`expanded`はedge traversalが動いた件数、`eligible`はquery evidence gateを通った件数、`selected`は最終結果へ残ったgraph由来memory件数である。Workers Logsにはこの件数だけを保存し、queryやIDは保存しない。
+For requests explicitly specifying hops, `recall` returns `seedCount`, `expandedCount`, `eligibleCount`, and `selectedCount`. Expanded counts edge-traversal candidates, eligible counts those passing query-evidence gates, and selected counts graph-derived memories retained in final results. Workers Logs store only these counts, not queries or IDs.
 
-`connections`はedge typeをnode dedupe後に絞らず、source／target index scanの内側で絞る。同一pairの複数typeを保持し、directed edgeはstored source/targetと要求entryから見たdirectionを返す。cursor pagingは既定20、最大100、offset上限10,000で、無制限scanを許可しない。`DEFAULT_HOPS=0`はfalse positiveと余分なD1 readを避けるため維持し、why/how、因果、時系列ではclientが1–2へ上げる。
+`connections` filters edge types inside source/target index scans, not after node deduplication. It retains multiple types for the same pair; directed edges return stored source/target and direction relative to the requested entry. Cursor paging defaults to 20, caps at 100, and limits offset to 10,000, preventing unlimited scans. Keep `DEFAULT_HOPS=0` to avoid false positives and extra D1 reads; clients select 1–2 for why/how, causal, or chronological questions.
 
-2.5.1では、graph rootとして選んだ上位候補同士のedgeも1-hop evidenceへ含める。従来はroot集合を最初からvisitedに入れたため、直接検索の6位以下が強いedgeで上位rootへ接続されていても、そのedgeを再順位付けへ使えなかった。最終direct枠とrelated枠はIDでdedupeし、保護した上位direct結果は置換しない。
+In 2.5.1, edges between top candidates selected as graph roots also contribute one-hop evidence. Previously, premarking all roots visited prevented a direct-search result ranked sixth or lower from using a strong edge to a higher root for reranking. Final direct and related slots are deduplicated by ID; protected top direct results are not displaced.
 
-日本語の「なぜ／理由／原因」「前／後／経緯／履歴」「現時点／現在／最新」もintent分類する。明示またはsystem由来の`caused_by`、`follows`、`supersedes`は、causal／chronology intent、stored direction、質問方向、1-hop、weight 0.5以上がすべて一致する場合だけ構造証拠として利用できる。inferred edgeはこの例外を使わず、従来どおり本文のrare-term precisionとevidence-gain gateを通す。
+Intent classification also recognizes Japanese signals such as `なぜ／理由／原因` (why/reason/cause), `前／後／経緯／履歴` (before/after/background/history), and `現時点／現在／最新` (current/latest). Explicit or system-derived `caused_by`, `follows`, and `supersedes` edges qualify as structural evidence only when causal/chronology intent, stored direction, question direction, one-hop distance, and weight ≥0.5 all align. Inferred edges cannot use this exception; they retain content rare-term precision and evidence-gain gates.
 
-## Hosted入力長
+## Hosted input lengths
 
-日本語320/400/450/480/500/1000/1600文字、英語1600文字、コード1600文字をproductionと同じdocument promptで実行し、すべてHTTP 200・生768次元だった。共通prefixの後ろに異なるsuffixを置いた500/1000/1600文字の比較でも先頭128次元に差が出た。受理だけでなく後半差分がembeddingへ影響することを確認できたため、`CHUNK_MAX_CHARS=1600`を維持する。実測は`benchmarks/recall-v1/input-limits-embeddinggemma-mrl128-v1.json`に保存した。
+Japanese inputs of 320/400/450/480/500/1000/1600 characters, English at 1600, and code at 1600 all returned HTTP 200 and raw 768-dimensional vectors using the production document prompt. Comparisons with a shared prefix and different suffixes at 500/1000/1600 characters also differed in the first 128 dimensions. This shows that suffix changes affected embeddings, beyond mere input acceptance, supporting retention of `CHUNK_MAX_CHARS=1600`. Measurements are in `benchmarks/recall-v1/input-limits-embeddinggemma-mrl128-v1.json`.
 
-## 再現
+## Reproduction
 
-別terminalでREADME記載のAI binding Workerを`127.0.0.1:8791`へ起動し、次を実行する。
+In another terminal, start the AI-binding Worker described in the benchmark README at `127.0.0.1:8791`, then run:
 
 ```bash
 npm run benchmark:bge
@@ -85,7 +85,7 @@ npm run benchmark:thresholds
 npm run benchmark:input-limits
 ```
 
-corpusだけの検証は`npm run benchmark:validate`でCloudflare接続なしに実行できる。結果ファイルは生成日時だけが変動し、corpusとthreshold corpusのSHA-256を内包する。
+Use `npm run benchmark:validate` to validate the corpus without Cloudflare access. Result files contain corpus and threshold-corpus SHA-256 hashes; generation timestamps vary between runs.
 
 ## Tagged current-state retrieval (2026-09-13)
 

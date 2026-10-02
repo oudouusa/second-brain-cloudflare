@@ -3,7 +3,7 @@ name: Upstream Audit
 on:
   workflow_dispatch:
   schedule:
-    # 毎週月曜 06:17 JST。upstream が進んだら失敗として通知する。
+    # Every Monday at 06:17 JST. Fail when upstream has unintegrated changes.
     - cron: "17 21 * * 0"
 
 permissions:
@@ -22,9 +22,9 @@ jobs:
         with:
           fetch-depth: 0
           fetch-tags: true
-      - name: upstream remote を読み取り専用で設定
+      - name: Configure a read-only upstream remote
         run: |
           git remote add upstream https://github.com/rahilp/second-brain-cloudflare.git
           git config remote.upstream.pushurl DISABLED
-      - name: Team Edition upstream 追従性を監査
+      - name: Audit synchronization with upstream Team Edition
         run: npm run upstream:audit

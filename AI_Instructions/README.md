@@ -1,120 +1,76 @@
-# 指示の責任分担と更新
+# Instruction ownership and updates
 
-`../AGENTS.md` はこのリポジトリの開発用。目的・安全境界・検証・完了条件を扱う。
-ここにある client instructions は Second Brain 利用時の記憶方針であり、開発ルールではない。
-モデル名・段階ごとの固定手順・過去の進捗を常時指示へ積み上げない。
+`../AGENTS.md` governs repository development: goals, safety boundaries, verification, and completion. Client instructions in this directory govern memory use in Second Brain, not development. Do not accumulate model names, rigid phase-by-phase procedures, or past progress in permanent instructions.
 
-## 記憶方針の正本
+## Authoritative memory policy
 
-`MEMORY_POLICY.md` を編集し、`node scripts/render-ai-instructions.mjs --write` で
-4つの `*_INSTRUCTIONS.md` と `.cursor/rules/second-brain-memory.mdc` を更新する。
-これらはコピー先から別ファイルを開けなくても機能する自己完結した配布物。
-共通部分の手編集は避け、`--check`（引数なしでも同じ）でずれを検出する。
-既存Vitestが同じ検査を行うため、workflow・依存・runtime moduleは増やさない。
+Edit `MEMORY_POLICY.md`, then run `node scripts/render-ai-instructions.mjs --write` to update the four `*_INSTRUCTIONS.md` files and `.cursor/rules/second-brain-memory.mdc`. These are self-contained distributions that work even when the installed copy cannot open other files. Avoid manually editing shared portions; use `--check` (also the default) to detect drift. Existing Vitest checks cover the same contract, without new workflows, dependencies, or runtime modules.
 
-毎会話・毎提案の一律recallをやめ、不足する過去情報が答えを左右する場合に検索する。
-保存は既存の許可範囲内で、確定した決定・約束・再利用できる成果へ絞る。
-依頼された未確定案は提案として区別し、現在の訂正や検証済み記録を古い記憶より優先する。
-許可済み保存のたびに確認を挟む方式へ戻す変更ではない。
+Recall is conditional on missing prior context that could affect the answer, rather than mandatory for every conversation or suggestion. Within existing authorization, save settled decisions, commitments, and reusable outcomes selectively. Label requested tentative ideas as proposals, and prioritize current corrections and verified records over stale memories. This does not reinstate a confirmation prompt for every already-authorized save.
 
-会社への保存・共有には許可が必要で、未指定をサーバーの共有defaultへ任せず、通常は
-明示的personalとする。これはclientの判断方針の変更であり、サーバーの認可・default設定は
-変更しない。team数は固定せず実際のlist_teamsで判断する。除外・秘密情報・削除指示・
-履歴・tier・遅延tool discovery・不確かな書き込みの再送防止も各配布物に含める。
+Company storage and sharing require authorization. Normally specify personal explicitly rather than leaving an omitted workspace to a shared server default. This is a client decision policy; it does not change server authorization or defaults. Do not assume a fixed number of teams; use actual list_teams results. Each distribution also covers exclusions, secrets, deletion instructions, history, tiers, lazy tool discovery, and prevention of duplicate writes after uncertain results.
 
-## MCPが配布する説明との整合
+## Alignment with MCP-distributed descriptions
 
-clientファイルとは別に、`src/mcp/server.ts` の `recall` / `remember` の説明も条件付き利用へ
-揃える。毎会話/3〜4発言ごとの呼び出し、許可を前提にしない自動保存をここに残さない。
-ツール名・順序・入力schema・handlerは変更せず、説明2件だけを変更する。
-`tools/list` 全体のhashは意図的に更新する。説明2件を除いた全payloadには、変更前から
-固定した別hashを検査し、他のツールや引数まで変えていないことを確認する。
-この変更で旧tool-prefix cacheの再利用を保証しない。既存のcache判定に任せ、古い証拠を
-新しいhashの検証結果へ読み替えない。サーバーから新説明を受け取るには別途配備が必要。
+Separately from client files, the `recall` / `remember` descriptions in `src/mcp/server.ts` also use conditional guidance. Do not retain mandatory every-conversation/every-three-or-four-turn calls or automatic saves without authorization. That change modified only two descriptions, preserving tool names, ordering, input schemas, and handlers. The complete `tools/list` hash was intentionally updated. A separate hash, pinned before the change, checks the payload excluding those two descriptions, ensuring other tools and arguments remain unchanged.
 
-## 既存クライアントへの適用は別の明示操作
+The change does not guarantee reuse of old tool-prefix caches. Leave cache decisions to existing logic and do not relabel old evidence as verification of the new hash. Receiving new descriptions from the server requires a separate deployment.
 
-PR作成やmainへのmergeだけでは、すでに貼り付けたglobal指示は更新されない。
-Cursorがこのcheckoutのruleを読み込む場合は、そのruleの変更が適用され得る。
-`alwaysApply: true` は維持するが、本文は条件付き利用であり毎回のMCP呼び出しを要求しない。
+## Updating existing clients is a separate explicit operation
 
-**既存 `connect-ai-clients.sh/.ps1` は上流のraw URLから指示を取得する。**
-認証登録まで行うこれらのスクリプトを、フォーク方針だけの更新には使わない。
-この変更では接続スクリプト・`installer/`・OAuth設定を改造しない。
+Creating a PR or merging main does not update global instructions that were already pasted elsewhere. Cursor may apply a changed rule if it reads this checkout. Keep `alwaysApply: true`, but the content calls for conditional usage, not mandatory MCP calls on every turn.
 
-適用する場合は、承認済みのこのprivate cloneのrevisionを確認し、対象globalファイルを
-先にbackupする。既存 `scripts/instruction-block.mjs` を使えばローカル本文だけを更新できる。
-以下は手動実行例で、このPRの検証では実ホームを変更していない。
+**Existing `connect-ai-clients.sh/.ps1` scripts fetch instructions from upstream raw URLs.** They also register authentication, so do not use them solely to update fork policy. This change does not modify connection scripts, `installer/`, or OAuth settings.
+
+For an authorized installation, verify the approved clone revision and back up the target global file first. Existing `scripts/instruction-block.mjs` can update only the local instruction text. The following is a manual example; repository verification does not modify the real home directory.
 
 ```sh
-# リポジトリrootから。既存ファイルは実行前に自分のbackup先へ保存する。
+# Run from the repository root. Back up existing files to your own location first.
 mkdir -p "$HOME/.codex" "$HOME/.claude"
 node scripts/instruction-block.mjs "$HOME/.codex/AGENTS.md" < AI_Instructions/CODEX_INSTRUCTIONS.md
 node scripts/instruction-block.mjs "$HOME/.claude/CLAUDE.md" < AI_Instructions/CLAUDE_INSTRUCTIONS.md
 ```
 
-PowerShellでも既存helperにUTF-8本文を渡せる。UTF-8を指定し、適用後の内容を確認する。
-ChatGPTには `CHATGPT_INSTRUCTIONS.md` の全文を設定画面へ手動で貼り付ける。
-Cursorはglobal ruleかproject ruleのどちらを使うか決め、古い二重指示を残さず、確認した
-`.cursor/rules/second-brain-memory.mdc` の全文を配置する。上流URLを案内先に使わない。
+PowerShell can also pass UTF-8 content to the existing helper. Specify UTF-8 and inspect the result. For ChatGPT, manually paste the entire `CHATGPT_INSTRUCTIONS.md` into settings. For Cursor, choose a global or project rule and install the reviewed complete `.cursor/rules/second-brain-memory.mdc` without leaving duplicate old instructions. Do not point users to the upstream URL for fork policy.
 
-marker付きの旧blockは置換され、周囲の個人設定は残る。未マークの旧指示は終端を安全に
-識別できないと `appended-legacy-kept` になり、古い指示も残る。その場合は自動削除をせず、
-backupと差分を確認して手動整理する。`updated-legacy` でも取り残しがないか確認する。
-rootの開発用AGENTS.mdをglobalへコピーしない。権限・除外・認証設定を変更する作業ではない。
+Marked old blocks are replaced while surrounding personal settings remain. If the end of an unmarked legacy block cannot be safely identified, the result is `appended-legacy-kept` and old instructions remain too. Do not automatically delete them; inspect the backup and diff, then clean up manually. Also check `updated-legacy` for leftover content. Do not copy the root development AGENTS.md into global instructions. This is not a change to permissions, exclusions, or authentication settings.
 
-## 検証の解釈
+## Interpreting verification
 
-テストは共通方針の配布一致、必要な安全境界の記載、古い強制指示の混入、既存helperの
-更新互換性を検査する。文章内の語句の検査でLLMの行動を証明したとは扱わない。
-検索回数・保存量・品質・token利用量の改善率は未測定であり、文字数削減とは区別する。
+Tests check shared-policy distribution parity, required safety boundaries, absence of old mandatory guidance, and update compatibility of the existing helper. Phrase checks do not prove LLM behavior. Improvements in retrieval count, storage volume, quality, or token consumption have not been measured; they are distinct from shorter text.
 
-採用後に合成会話で確認する例（期待動作。モデル評価は未実行）:
+Synthetic conversations to check after adoption (expected behavior; model evaluation has not been run):
 
-| 場面 | 期待する判断 |
+| Scenario | Expected decision |
 | --- | --- |
-| 挨拶、与えた文章の言い換え | 不要なrecallやrememberをしない |
-| 続きの作業で以前の決定が不足 | 意図を含めてrecall、結果を再利用 |
-| 現在の訂正と古いメモリが矛盾 | 古い記憶を盲信せず訂正と出典を確認 |
-| アシスタントが案を提案しただけ | 自動で確定事項として保存しない |
-| 保存許可済みのプロジェクトで決定が確定 | 簡潔に保存し、毎回同意を聞かない |
-| off the record、対象project除外、credential | 他のwrite経路にも流さない |
-| 許可のないcompany保存、複数teamで曖昧 | 個人情報を共有せず必要な範囲を確認 |
-| 保存応答が不明、MCPの遅延読み込み | 二重書き込み・架空の成功・無限再試行をしない |
+| Greeting or rewriting supplied text | No unnecessary recall or remember |
+| Resumed work missing a prior decision | Recall with intent and reuse the result |
+| Current correction conflicts with old memory | Verify the correction and sources instead of trusting stale memory |
+| Assistant only proposes an idea | Do not automatically save it as settled |
+| A decision is settled in a project with storage authorization | Save concisely without asking for consent every time |
+| Off the record, excluded project, or credential | Do not route it through another write path |
+| Unauthorized company storage or ambiguous multiple teams | Do not share personal information; clarify the necessary scope |
+| Unknown write result or lazy MCP loading | No duplicate writes, fabricated success, or endless retries |
 
-## 合成会話の実行記録を検査する
+## Checking synthetic conversation traces
 
-上の8場面を `experiments/memory-policy/scenarios.json` に固定した。実際に検証する際は、
-モデルへ方針とconversationだけを渡し、ツールにはtoolResultsの合成応答を返す。
-allowed/required/review等の期待値はモデルの入力に混ぜない。実メモリ・本番MCPを接続しない。
+The eight scenarios above are fixed in `experiments/memory-policy/scenarios.json`. For a real evaluation, give the model only the policy and conversation, and return synthetic toolResults through the tools. Do not include expected allowed/required/review values in model input. Do not connect real memories or production MCP.
 
 ```sh
 node experiments/memory-policy/verify.mjs --template > /tmp/memory-policy-trace.json
-# 別途採取した実行記録を雛形へ正規化してから検査する。
+# Normalize separately collected execution records into the template before checking.
 node experiments/memory-policy/verify.mjs --input /tmp/memory-policy-trace.json
 ```
 
-空の雛形は合格しない。各recordにid、実際に観測したcalls、finalTextを記録する。
-callは `{ "tool": "get", "arguments": { "id": "maple-backup" }, "outcome": "ok" }` の形式。
-outcomeはok/error/unknownを区別し、結果不明を成功へ変換しない。ツールの実行試行を
-省略せず、拒否された呼び出しも記録する。クライアント固有discoveryの記録は別途保持し、
-このmemory-tool用配列へ架空のMCP名として混ぜない。
+An empty template does not pass. Each record needs id, actually observed calls, and finalText. Calls use the shape `{ "tool": "get", "arguments": { "id": "maple-backup" }, "outcome": "ok" }`. Distinguish ok/error/unknown; do not turn an unknown result into success. Retain all attempted calls, including rejected ones. Keep client-specific discovery records separately instead of inventing MCP tool names in the memory-tool array.
 
-検査器はNode標準機能だけでファイルを読み、network・model・MCP・設定更新を実行しない。
-8場面の欠落・重複、不要な呼び出し、無許可のwrite、personal未指定、二重write、必要な
-成功結果の欠落を検出する。必要な成功結果がない場合は場面が完了していないという判定で、
-それだけでモデルの不服従やサービス側の原因まで断定しない。方針とシナリオのSHA-256が
-一致しない古い記録は拒否し、失敗や未完了は終了コード1にする。
+The verifier reads files using only Node standard features. It performs no network/model/MCP calls or settings updates. It detects missing/duplicate scenarios, unnecessary calls, unauthorized writes, missing personal scope, duplicate writes, and missing required successful results. A missing required success means the scenario is incomplete; it does not alone establish model noncompliance or service fault. Traces with stale policy/scenario SHA-256 values are rejected. Failures or incomplete records exit with code 1.
 
-`evidenceKind: synthetic` は検査器の動作確認、`observed` は採取者による申告でmodel名も必須。
-ラベルを変えても出典を認証したことにはならず、provenanceVerifiedは常にfalse。
-toolChecksPassedは機械的な呼び出し条件だけで、answerQualityEvaluatedも常にfalse。
-回答内容・訂正の採用・提案と決定の区別・質問の必要性は、出力されたhumanReviewに沿って
-別に確認する。実行記録を作っただけでモデルの行動評価が完了したとは扱わない。
-出力は引数や回答本文を再掲載しないが、入力ファイルは引き続き非公開として扱う。
-今回は合成fixtureによる検査器テストまでで、実モデルの実行結果・費用削減は未測定。
+`evidenceKind: synthetic` exercises the verifier. `observed` is the collector's declaration and requires a model name. Changing the label does not authenticate provenance; provenanceVerified is always false. toolChecksPassed covers only mechanical call conditions, and answerQualityEvaluated is always false. Review answer content, adoption of corrections, proposal/decision distinctions, and question necessity separately using the emitted humanReview. Creating a trace alone does not complete model evaluation. Output does not repeat arguments or answer text, but input files still require private handling. Verification so far covers synthetic verifier fixtures, not actual model runs or cost savings.
 
-設計参考（2026-09-05確認。引用ではなく、このfork向けの適用判断）:
+Design references (checked 2026-09-05; applied judgments for this fork, not quotations):
+
 - OpenAI Codex best practices: https://developers.openai.com/codex/learn/best-practices
 - AGENTS.md guidance: https://developers.openai.com/codex/guides/agents-md
-短い開発指示とタスクの完了条件という考え方を採用。新しいSkills群や実行基盤は追加しない。
+
+This adopts concise development guidance and task completion conditions without adding a new skill collection or execution platform.

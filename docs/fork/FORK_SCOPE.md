@@ -1,41 +1,41 @@
-# フォークの所有権と境界
+# Fork ownership and boundaries
 
-このソースは[rahilp/second-brain-cloudflare](https://github.com/rahilp/second-brain-cloudflare)の履歴を維持した自己配備用フォークです。個人の配備記録や資格情報を公開履歴へ含めません。
+This self-hosted fork preserves the history of [rahilp/second-brain-cloudflare](https://github.com/rahilp/second-brain-cloudflare). Personal deployment records and credentials do not belong in public history.
 
-## 上流の基点
+## Upstream base
 
-- 初期基点：`99f1c1a2a005d8f835aef93c786cfe07f54780f3`。
-- 初期基点の補助タグ：`upstream-base-2026-08-23`。公開候補にもこの上流commitを指すタグを含めます。
-- 現在の監査先：`upstream/release/4.0.0`。現在の取り込みは`d550921a8c0ae25f6788ead3d8209f29fc4df6d6`。
-- 監視先：`upstream/main`。上流の正式release後に監査先を更新します。
+- Initial base: `99f1c1a2a005d8f835aef93c786cfe07f54780f3`.
+- Tag for that base: `upstream-base-2026-08-23`. Public candidates include this tag pointing to the upstream commit.
+- Current audit target: `upstream/release/4.0.0`. The integrated revision is `d550921a8c0ae25f6788ead3d8209f29fc4df6d6`.
+- Watch target: `upstream/main`. Update the audit target after the official upstream release.
 
-## 保持する契約
+## Contracts to preserve
 
-D1は記憶の正本、Vectorizeは派生索引です。固定EmbeddingGemma 128次元、write admission、CAS、before-image履歴、保留行の隔離、削除receipt、workspaceの分離、MCPと夜間処理のCPU境界を保持します。
+D1 is authoritative for memories; Vectorize is a derived index. Preserve fixed 128-dimensional EmbeddingGemma, write admission, CAS, before-image history, held-row isolation, deletion receipts, workspace isolation, and the CPU boundaries for MCP and nightly work.
 
-新しいagent frameworkや検索engineへ置き換えません。上流の有効な実装へ委譲し、forkの安全要件と上流の共通処理を分けます。具体的なmoduleとbindingは[ARCHITECTURE.md](ARCHITECTURE.md)を参照してください。
+Do not replace the system with another agent framework or search engine. Delegate to active upstream implementations and separate fork safety requirements from common upstream work. See [ARCHITECTURE.md](ARCHITECTURE.md) for modules and bindings.
 
-## 上流に委ねる部分
+## Upstream-owned components
 
-`scripts/audit-upstream-sync.mjs`の`UPSTREAM_OWNED_PATHS`にある21ファイルは、監査先の上流とbyte単位で一致させます。tokenizer、Prompt Capsule、FTS保守、reranker、projectの解決などを独自に書き換えません。
+The 21 files listed in `UPSTREAM_OWNED_PATHS` in `scripts/audit-upstream-sync.mjs` must be byte-identical to the audit target. Do not independently rewrite the tokenizer, Prompt Capsule, FTS maintenance, reranker, or project resolution.
 
-`installer/`、`package-lock.json`、dependencies、devDependencies、overrides、install lifecycle scriptsも上流と一致させます。公開準備のためにこの監査を弱めません。依存の指摘は[DEPENDENCY_SECURITY.md](DEPENDENCY_SECURITY.md)の手順で確認し、上流と揃った修正を優先します。
+Keep `installer/`, `package-lock.json`, dependencies, devDependencies, overrides, and install lifecycle scripts aligned with upstream as well. Do not weaken this audit for publication. Review dependency findings using [DEPENDENCY_SECURITY.md](DEPENDENCY_SECURITY.md) and prefer fixes aligned with upstream.
 
-## forkが持つ部分
+## Fork-owned components
 
-- 固定Gemma128のprofileとVectorize世代、埋込み枯渇時の有限な縮退・再索引。
-- CJK・全角識別子の検索補正。通常の上流検索経路を使い、必要な互換経路だけを追加する。
-- R2の記憶backup/restore、論理tier、更新履歴と書込み保護。
-- Cloudflare Accessと所有者管理操作の認証、MCP/REST/夜間処理の既存DOへの移送。
-- 任意のChatGPT Responses接続と、所有者個人のworkspaceへの限定。
-- 日本語の週次洞察、原文引用と保存JSONの検証、有限再試行。
+- The fixed Gemma128 profile, Vectorize generations, and bounded degradation and reindexing when embeddings are unavailable.
+- Search adjustments for CJK text and full-width identifiers, using normal upstream search paths with only the necessary compatibility paths added.
+- R2 memory backup/restore, logical tiers, version history, and write protection.
+- Cloudflare Access, authentication for owner administration, and dispatch of MCP, REST, and nightly work to the existing DO.
+- Optional ChatGPT Responses connectivity limited to the owner's personal workspace.
+- Japanese weekly insights, source-quotation and stored-JSON validation, and bounded retries.
 
-ChatGPTは既定OFFです。所有者が有効化した場合も、Team・member・別admin・混在・範囲不明に所有者のプランを使わせません。失敗した選択済み処理からWorkers AIへ自動fallbackしません。VPS、CLIProxy、VPC service bindingは使用しません。
+ChatGPT is off by default. Even when enabled by the owner, the owner's plan is not available to Team, member, other-admin, mixed, or unknown scopes. A failure in a selected operation does not automatically fall back to Workers AI. VPS, CLIProxy, and VPC service bindings are not used.
 
-CPUをDOへ移すことは、総CPU、待ち時間、料金の削減を保証するものではありません。既存DOのclass/bindingを維持し、常設購読や別の状態DBを増やしません。
+Moving CPU work to a DO does not guarantee lower total CPU, latency, or cost. Retain the existing DO class and binding without adding persistent subscriptions or another state database.
 
-## 更新時の検証
+## Verification during updates
 
-[UPSTREAM_SYNC.md](UPSTREAM_SYNC.md)の境界監査を先に実行します。上流が変更した移動元について、監査が示す移動先と関連テストを照合します。CIは型、scope、coverage、CPU予算、夜間SQL、benchmark、build/startupを維持します。
+Run the boundary audit in [UPSTREAM_SYNC.md](UPSTREAM_SYNC.md) first. For upstream changes to moved code, compare the source and destination identified by the audit and run the related tests. CI retains type, scope, coverage, CPU budget, nightly SQL, benchmark, build, and startup checks.
 
-運用するWorkerへの配備、記憶の更新、GitHubでの公開はそれぞれ対象と権限を明示して実施します。ソースのmergeだけで全利用者へ自動配備される仕組みは設けません。
+Worker deployment, memory mutation, and GitHub publication each require an explicit target and authorization. Merging source does not automatically deploy to every user's account.

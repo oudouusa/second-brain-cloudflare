@@ -21,10 +21,11 @@ writes and reads are measured on that exact path.
 
 ## Capsule definitions
 
-3.1.0の上流実装を取り込んだ同期branchでは、schema v5への自動移行で
-`prompt_capsule_revisions`・専用index・4つの失効triggerを追加する。
-本文は引き続きD1の通常entryであり、KVはrevision付きの派生キャッシュとしてのみ使う。
-既存v4からの更新時にタグを書き換える処理はない。Capsuleの定義には次の3タグを使う：
+The synchronization branch integrating upstream 3.1.0 adds
+`prompt_capsule_revisions`, a dedicated index, and four invalidation triggers through
+the automatic schema-v5 migration. Content remains in ordinary D1 entries; KV is
+only a revisioned derived cache. Upgrading from v4 does not rewrite tags. Capsule
+definitions use the following three tags:
 
 ```text
 status:canonical
@@ -86,10 +87,11 @@ budget, that slot and the following slots are omitted. Empty responses have
 make the result incomplete. See the root README and upstream payload builder for
 the current source contract. A consumer must separately check required slots.
 
-`update`は本文の旧版を履歴へ残す。tags省略なら定義を維持する。
-スロットを移す場合は新しい `capsule:` と `capsule-slot:` の両方を指定する。
-新規定義は明示的にcanonicalにするまで公開されず、自動分類では昇格しない。
-REST/MCPの本文・入力tagsはNULを拒否する。import/旧データには読取時防御を適用する。
+`update` preserves the previous content in history. Omitting tags retains the
+definition. To move slots, specify both the new `capsule:` and `capsule-slot:` tags.
+New definitions are not published until explicitly made canonical; automatic
+classification does not promote them. REST/MCP content and input tags reject NUL.
+Imported and legacy data receive read-time protection.
 
 ## REST API
 
@@ -223,13 +225,15 @@ throws away reusable earlier prefixes.
 1. **Capsule-ready**: serializer tests prove fixed ordering, normalization,
    metadata exclusion, and whole-section omission; REST tests prove scope,
    ETag, HEAD, and 304 behavior.
-2. **Direct cache-verified**: 公式Responses APIを運用する構成では、suffixだけを
-   変えたときに初回 `cache_write_tokens > 0`、後続 `cached_tokens > 0` を確認する。
-3. **Proxy cache-verified**: CLIProxyAPIを唯一のOpenAI経路にする構成では、
-   MCP Managed OAuth経由のlive Capsuleと完全一致するproxy origin fingerprintを
-   使い、後続 `cached_tokens > 0` を実測する。write counterが返る場合はwrite/readを
-   両方確認し、返らない場合は `cache-read-observed` としてwrite未観測を明記する。
-   direct経路は `not_applicable` とし、成功したものとして扱わない。
+2. **Direct cache-verified**: For deployments using the official Responses API,
+   change only the suffix and verify `cache_write_tokens > 0` on the first call
+   and `cached_tokens > 0` on later calls.
+3. **Proxy cache-verified**: In historical configurations using CLIProxyAPI as the
+   only OpenAI path, use a proxy-origin fingerprint exactly matching the live
+   Capsule obtained through MCP Managed OAuth and measure later `cached_tokens > 0`.
+   If a write counter is returned, verify both writes and reads. Otherwise label
+   it `cache-read-observed` and explicitly state that writes were not observed.
+   Mark the direct path `not_applicable`, not successful.
 
 The repository includes `experiments/prompt-cache/ab.mjs` for the direct A/B
 measurement. It never logs prompt text.
@@ -237,15 +241,16 @@ measurement. It never logs prompt text.
 `source-revalidate.mjs --require-304` proves the deployed 200 -> 304 strong-ETag
 contract. `verify.mjs` is the single canonical `prompt-cache-evidence.v1`
 verifier; its proxy gate requires an exact fingerprint of the intended route.
-`qualify.mjs --mode compare` はdirect検証後にproxy検証を実行し、model、
-breakpoint数、Worker Capsule source descriptorの完全一致を比較してから
-`prompt-cache-qualification.v1` を出力する。公式OpenAI API keyを運用しない場合は
-`qualify.mjs --mode proxy-only` を使い、`prompt-cache-proxy-qualification.v1` を
-出力する。このモードはdirect証拠を要求せず、CLIProxyAPI経路だけを認定する。
+`qualify.mjs --mode compare` verifies direct access before proxy access and checks
+exact agreement of the model, breakpoint count, and Worker Capsule source descriptor
+before emitting `prompt-cache-qualification.v1`. Without an official OpenAI API key,
+use `qualify.mjs --mode proxy-only`, which emits
+`prompt-cache-proxy-qualification.v1`. That mode requires no direct evidence and
+qualifies only the CLIProxyAPI path.
 
-CLIProxyAPIのCodex変換はunsupportedな明示breakpoint fieldやwrite counterを
-返さない場合がある。そのため認定manifestは、write/readを両方観測した状態と、
-readだけを観測した状態を `cache_proof.basis` で区別する。
+CLIProxyAPI Codex conversion may not return unsupported explicit-breakpoint fields
+or write counters. The qualification manifest therefore distinguishes observed
+writes and reads from observed reads alone through `cache_proof.basis`.
 
 Official references:
 

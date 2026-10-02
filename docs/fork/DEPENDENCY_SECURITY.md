@@ -1,70 +1,41 @@
-# 依存関係のセキュリティ監査
+# Dependency security audit
 
-対象はrootのWorker用 `package.json` / `package-lock.json`。installer、OS、外部CLI proxyや
-実環境の設定は対象外。上流とdependencyを揃える既存の境界を維持し、監査のために
-package/lock、override、runtime、bindingや本番配備を変更しない。
+The scope is the root Worker's `package.json` / `package-lock.json`. Installer, OS, external CLI proxies, and live-environment settings are excluded. Preserve the existing upstream dependency boundary: the audit does not modify package/lock files, overrides, runtime, bindings, or production deployments.
 
-## 実行と証拠
+## Execution and evidence
 
-Node 22とnpmがあるcheckoutで実行する。node_modulesのinstallは不要。
+Run in a checkout with Node 22 and npm. Installing node_modules is unnecessary.
 
 ```bash
 node --test experiments/dependency-audit/*.test.mjs
 node scripts/audit-dependencies.mjs --output /tmp/second-brain-dependency-audit
 ```
 
-既定の終了コードは、完全な報告で検出0件なら0、検出ありなら1、監査未完了なら2。
-`--report-only` は検出ありの終了コードだけを0にする。通信失敗、タイムアウト、未対応のJSON、
-件数不整合、依存ファイルの変更は2のまま。`clean` はその時点のnpm監査で検出0件という意味で、
-未知の脆弱性がないことや本番で安全に実行できることの証明ではない。
+Default exit codes are 0 for a complete report with no findings, 1 for findings, and 2 for an incomplete audit. `--report-only` changes only the findings exit code to 0. Network failures, timeouts, unsupported JSON, inconsistent counts, and dependency-file changes still return 2. `clean` means that npm audit reported no findings at that time; it does not prove the absence of unknown vulnerabilities or safe production execution.
 
-全依存と `--omit=dev` の本番依存を、固定のnpm registryへ順番に問い合わせる。
-監査対象を変える旧npm設定 `production`・`also`・`dev` も呼出ごとにCLIで固定する。
-環境変数やプロジェクト・利用者・グローバルの `.npmrc` に `production=false` 等があっても、
-本番側に開発依存を混ぜず、全依存側は開発依存を含める。optional・peerは両側に含める。
-既存のnpm設定ファイルや通信・認証設定は書き換えない。
-`--package-lock-only --ignore-scripts` を指定し、install/fix/forceは一切実行しない。
-各呼出は60秒・出力2 MiBで制限し、registry要求の再試行はしない。
-registryへは通常のnpm auditと同じく依存名・バージョン情報が送られる。
-前後のpackage/lockのSHA-256を比較し、変化を検出しても勝手に元へ書き戻さない。
+Query a fixed npm registry sequentially for the full dependency graph and production dependencies with `--omit=dev`. Pin legacy npm options `production`, `also`, and `dev` on each CLI invocation as well. Environment variables or project/user/global `.npmrc` settings such as `production=false` must not add development dependencies to the production audit or omit them from the full audit. Include optional and peer dependencies in both. Do not rewrite npm, network, or authentication settings. Use `--package-lock-only --ignore-scripts`; never run install/fix/force. Each invocation is limited to 60 seconds and 2 MiB of output, without registry-request retries. As with ordinary npm audit, dependency names and versions are sent to the registry. Compare package/lock SHA-256 hashes before and after; even if a change is detected, do not automatically restore files.
 
-出力は `audit.json` と `audit.md`。取得時刻、両依存ファイルのSHA-256、全依存/本番依存の
-重大度別件数、パッケージ名、実際のlockfile内バージョン・path、直接/間接依存、advisoryと
-npmが報告した修正候補を保持する。npmのstderrや例外本文は認証情報を含み得るため出力しない。
-JSONをログへ出す際は単一行とし、Markdown中のadvisory文字列もエスケープする。
+Outputs are `audit.json` and `audit.md`. They retain retrieval time, both dependency-file hashes, severity counts for full/production graphs, package names, actual lockfile versions and paths, direct/transitive status, advisories, and npm's suggested fixes. Do not print npm stderr or exception bodies, which may contain authentication information. JSON logs use a single line; advisory strings in Markdown are escaped too.
 
-## 読み方と対処
+## Interpretation and remediation
 
-件数は **影響するパッケージのグループ数** であり、独立したadvisory数ではない。
-同じadvisoryが間接依存の複数グループに現れることがある。
-`production-graph` は本番依存の監査に含まれたlockfile pathを示す。パッケージ名だけで判定せず、
-同名パッケージの開発用コピーは `full-graph-only` と分ける。これはWorkerのbundleに実際に
-含まれること、脆弱な関数に到達できること、攻撃可能な入力が存在することの証明ではない。
-逆に `full-graph-only` も「無視してよい」の意味ではない。CIや開発端末の処理も確認する。
+Counts represent **groups of affected packages**, not independent advisories. One advisory can appear in multiple transitive-dependency groups. `production-graph` identifies lockfile paths included in the production audit. Classification uses paths, not just package names, so a development-only copy of the same package is separately marked `full-graph-only`. This does not prove inclusion in the Worker bundle, reachability of a vulnerable function, or attacker-controlled input. Conversely, `full-graph-only` does not mean a finding can be ignored; inspect CI and development-machine usage too.
 
-対応時は、advisoryの条件と利用箇所、固定済みバージョンを確認し、上流での修正状況と照合する。
-上流と同じ依存へ同期できる更新を優先する。`fixAvailable` はnpmの提案であり、更新が本番で
-互換性を持つ保証ではない。とくにmajor更新や `npm audit fix --force` を自動採用しない。
-個別の保留理由・確認日・上流の追跡先は該当PR/Issueへ記録し、未確認を安全性の認定にしない。
+Check advisory conditions, usage sites, and fixed versions against upstream remediation. Prefer updates that keep dependencies aligned with upstream. `fixAvailable` is npm's suggestion, not a production-compatibility guarantee. Do not automatically adopt major updates or `npm audit fix --force`. Record individual deferral reasons, review dates, and upstream tracking links in the relevant PR/issue. Lack of investigation is not a finding of safety.
 
-## 公開候補での評価（2026-10-02）
+## Public-candidate assessment (2026-10-02)
 
-上流4.0.0取り込み先`d550921a8c0ae25f6788ead3d8209f29fc4df6d6`と同じlockfileを維持しています。
-この時点のnpm監査は、全依存でhigh 4・moderate 6、本番依存でmoderate 4を検出しました。
-未解決の指摘があり、依存全体を`clean`と評価しません。
+The lockfile remains identical to upstream 4.0.0 integration revision `d550921a8c0ae25f6788ead3d8209f29fc4df6d6`. At this point npm audit found 4 high and 6 moderate groups in the full graph, and 4 moderate groups in production dependencies. Findings remain unresolved; the overall dependency graph is not `clean`.
 
-| 指摘のある依存 | 実行範囲と確認結果 | 当面の対処 |
-|---|---|---|
-| fast-uri 3.1.7、hono 4.13.0、ip-address 10.4.0、qs 6.15.2 | lockfileの本番依存。ただしWrangler 4.146.0のdry-runで生成したWorkerのmetafileには、これらの入力ファイルは0件 | 本番bundleへの混入と上流の更新を追跡する。Node用SDK等へ利用範囲を広げる前に再評価する |
-| undici 7.29.0、sharp 0.35.2、miniflare 4.20260722.0、wrangler 4.114.0 | 上流lockfileに残る開発用CLIの依存。Worker bundleには含まれない | 配備・起動・開発用のCLIは固定した`npx --yes wrangler@4.146.0`を使用する。古い裸の`wrangler`や`npx --no-install wrangler`を使わない |
-| vitest 4.1.10、@vitest/mocker 4.1.10 | ローカル・CIの試験用。Worker bundleには含まれない。対象advisoryはbrowser modeのredirect mockによるファイル読取 | 現在の試験設定でbrowser modeを使わない。公開ネットワークへ試験サーバーを開かず、未確認コードを実資格情報のある端末で動かさない。上流と同じ修正版への更新を追跡する |
+| Dependencies with findings | Execution scope and checks | Interim handling |
+| --- | --- | --- |
+| fast-uri 3.1.7, hono 4.13.0, ip-address 10.4.0, qs 6.15.2 | Production dependencies in the lockfile, but zero matching input files in the Worker metafile generated by a Wrangler 4.146.0 dry run | Track bundle inclusion and upstream updates. Reassess before expanding usage, for example to Node SDKs. |
+| undici 7.29.0, sharp 0.35.2, miniflare 4.20260722.0, wrangler 4.114.0 | Development CLI dependencies retained in the upstream lockfile; absent from the Worker bundle | Use pinned `npx --yes wrangler@4.146.0` for deployment, startup, and development CLI operations. Avoid the old bare `wrangler` or `npx --no-install wrangler`. |
+| vitest 4.1.10, @vitest/mocker 4.1.10 | Local/CI tests; absent from the Worker bundle. The relevant advisory concerns file reads through redirect mocks in browser mode. | Keep browser mode disabled in the current test configuration. Do not expose test servers on public networks or run unreviewed code on machines holding real credentials. Track an upstream-aligned fixed version. |
 
-新しいWranglerはrootのlockfileとは別のnpm実行領域に取得します。この4.146.0の依存領域も
-同じ監査スクリプトで確認し、全依存・本番依存とも検出0件でした。rootに残る指摘を
-新しいCLIの結果で消し込むことはしません。rootのVitest・Miniflareによる試験は引き続き
-上流lockfileを使うため、開発環境の残存リスクとして扱います。
+The newer Wrangler is fetched into a separate npm execution directory outside the root lockfile. That 4.146.0 dependency directory was checked with the same audit script and had zero findings in both full and production graphs. Its result does not erase findings in the root graph. Root Vitest/Miniflare tests still use the upstream lockfile, so remaining development-environment risks persist.
 
-bundlingの確認は次で再現できます。出力はGitへ追加せず、対象SHAと生成時刻を運用者が記録します。
+Reproduce the bundle check as follows. Keep outputs out of Git and record the target SHA and generation time in operator-controlled storage.
 
 ```sh
 npx --yes wrangler@4.146.0 deploy --dry-run --metafile /tmp/second-brain-worker-metafile.json
@@ -77,27 +48,12 @@ for name in ['fast-uri', 'hono', 'ip-address', 'qs', 'undici', 'sharp', 'minifla
 PY_BUNDLE
 ```
 
-根拠となるadvisoryはnpm監査出力に全件保持します。代表的な一次情報は
-[fast-uri](https://github.com/advisories/GHSA-hrr3-gc8f-f4qj)、
-[Hono](https://github.com/advisories/GHSA-g6gw-c38x-mqfc)、
-[ip-address](https://github.com/advisories/GHSA-j6r3-76f7-8jcv)、
-[qs](https://github.com/advisories/GHSA-4mjr-xmp4-gh2g)、
-[sharp](https://github.com/advisories/GHSA-rgj7-g3m4-5g8c)、
-[Undici](https://github.com/advisories/GHSA-w293-vg96-wgc3)、
-[Vitest](https://github.com/advisories/GHSA-82fw-gwwq-j7x9)です。
-この評価は現在のbundle・試験設定に限定します。依存・import・設定を変えた場合や
-新しいadvisoryが出た場合は再評価し、上流の修正に合わせてlockfileごと更新します。
+The npm audit output retains all supporting advisories. Representative primary sources include [fast-uri](https://github.com/advisories/GHSA-hrr3-gc8f-f4qj), [Hono](https://github.com/advisories/GHSA-g6gw-c38x-mqfc), [ip-address](https://github.com/advisories/GHSA-j6r3-76f7-8jcv), [qs](https://github.com/advisories/GHSA-4mjr-xmp4-gh2g), [sharp](https://github.com/advisories/GHSA-rgj7-g3m4-5g8c), [Undici](https://github.com/advisories/GHSA-w293-vg96-wgc3), and [Vitest](https://github.com/advisories/GHSA-82fw-gwwq-j7x9). This assessment applies only to the stated bundle and test configuration. Reassess when dependencies, imports, settings, or advisories change, and update the lockfile together with upstream fixes.
 
-## CIでの扱い
+## CI behavior
 
-既存Worker CIの必須 `worker` に外部通信なしの監査回帰試験を追加する。
-既存のfork境界、型、scope、coverage、benchmark、build/startupのgateは維持する。
-別job `Dependency audit (report only)` が実registryを読み、Job SummaryとJSONログへ保存する。
-このjobは `contents: read` のみで、checkoutの資格情報を保持しない。新しいcronは追加しない。
+The existing required `worker` job runs audit regression tests without external communication. Existing fork-boundary, type, scope, coverage, benchmark, build, and startup gates remain. A separate `Dependency audit (report only)` job queries the live registry and writes a Job Summary and JSON logs. It has only `contents: read`, does not persist checkout credentials, and adds no new cron schedule.
 
-既存の脆弱性を件数だけで一括更新・例外登録しないため、導入時は検出ありをreport-onlyにする。
-**このjobが緑でも `status: findings` は未解決である。** 監査サービス等の障害は赤になり、
-既存worker jobの実行は妨げない。branch保護やrequired checksをこの変更から操作しない。
-毎回の結果は動的なregistryに依存するため、過去CIの件数を新しいSHAの証拠として使わない。
+Findings are initially report-only to avoid mass updates or exceptions based solely on counts. **A green job with `status: findings` still has unresolved findings.** Audit-service failures make that job red without preventing the existing worker job from running. This change does not alter branch protection or required checks. Results depend on a dynamic registry; do not use counts from old CI runs as evidence for a new SHA.
 
-npm audit仕様: https://docs.npmjs.com/cli/v10/commands/npm-audit/
+npm audit specification: https://docs.npmjs.com/cli/v10/commands/npm-audit/

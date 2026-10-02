@@ -1,12 +1,12 @@
-# 自己配備と更新
+# Self-hosting and updates
 
-この手順は新しい空の配備向けです。既存の記憶DBや異なる次元のindexへ、新規導入の設定をそのまま上書きしません。実資産ID・秘密情報・配備結果は各所有者の保管場所へ保存します。
+This guide targets a new, empty deployment. Do not overwrite an existing memory database or an index with different dimensions using new-install settings. Keep real resource IDs, secrets, and deployment results in owner-controlled storage.
 
-## 前提と設定の分離
+## Prerequisites and separate configuration
 
-Node 22以上、npm、Git、Python 3、Cloudflareアカウントが必要です。D1、KV、Vectorize、Workers AI、SQLite-backed Durable Objectsを利用します。R2 backupを使う場合はR2も有効にします。Cloudflare Accessで所有者のdashboardを保護します。各サービスの枠と料金は個別で、無料枠内での運用は保証しません。
+You need Node 22 or later, npm, Git, Python 3, and a Cloudflare account. The deployment uses D1, KV, Vectorize, Workers AI, and SQLite-backed Durable Objects. Enable R2 if you want R2 backups. Protect the owner dashboard with Cloudflare Access. Each service has separate allowances and pricing; operation within free allowances is not guaranteed.
 
-このforkの配備・build用scriptはWrangler 4.146.0を明示取得します。上流との一致を守るため、package/lock内のWranglerとは分けています。`npx wrangler`のような版指定なしの呼出しを、配備用の例へ置き換えないでください。
+Deployment and build scripts explicitly fetch Wrangler 4.146.0. This is separate from the Wrangler version in package/lock files, which remain aligned with upstream. Do not replace the pinned deployment commands with unversioned calls such as `npx wrangler`.
 
 ```sh
 npm ci --legacy-peer-deps
@@ -19,12 +19,12 @@ npx --yes wrangler@4.146.0 login --profile "$sb_cf_profile"
 npx --yes wrangler@4.146.0 whoami --profile "$sb_cf_profile" --json
 ```
 
-profile名とWorker名を自身の値に置き換え、アカウントが配備先と一致することを確認します。`wrangler.personal.jsonc`は`.gitignore`で保護します。Worker名と後述の資源名をこのファイルで揃えます。
+Replace the profile and Worker names with your own values and verify that the account matches your deployment target. `.gitignore` protects `wrangler.personal.jsonc`. Set the Worker name and resource names below consistently in that file.
 
-共通設定は実資産IDを持ちません。WranglerにはD1/KV等の自動作成機能がありますが、この手順では対象を明確にするため先に資源を作成し、自身のIDを実配備設定へ記録します。自動作成を使う場合も、共通設定のコピーへ配備して、生成されたIDを公開Gitへ入れないでください。
-[Wranglerの自動作成](https://developers.cloudflare.com/workers/wrangler/configuration/#automatic-provisioning)
+The shared configuration contains no real resource IDs. Wrangler can provision D1, KV, and other resources automatically, but this guide creates them first to make the target explicit and records your IDs in the deployment configuration. If you use automatic provisioning, deploy from a copy of the shared configuration and keep generated IDs out of public Git history.
+[Wrangler automatic provisioning](https://developers.cloudflare.com/workers/wrangler/configuration/#automatic-provisioning)
 
-## 空の資源を作る
+## Create empty resources
 
 ```sh
 npx --yes wrangler@4.146.0 d1 create "${sb_worker_name}-db" --profile "$sb_cf_profile" --config wrangler.personal.jsonc
@@ -35,37 +35,37 @@ npx --yes wrangler@4.146.0 vectorize create-metadata-index "${sb_worker_name}-eg
 npx --yes wrangler@4.146.0 r2 bucket create "${sb_worker_name}-archive" --profile "$sb_cf_profile"
 ```
 
-返されたIDと実際の名前を`wrangler.personal.jsonc`へ記録します。
+Record the returned IDs and actual names in `wrangler.personal.jsonc`.
 
-| 設定 | 自身の値 |
+| Setting | Your value |
 | --- | --- |
-| `name` | 一意なWorker名 |
-| `d1_databases[0].database_name` / `database_id` | 作成したD1の名前・ID |
-| `kv_namespaces[0].id` | 作成したKVのID |
-| `vectorize[0].index_name` | 作成した128次元indexの名前 |
-| `r2_buckets[0].bucket_name` | 自身のprivate bucket名 |
+| `name` | A unique Worker name |
+| `d1_databases[0].database_name` / `database_id` | Name and ID of your D1 database |
+| `kv_namespaces[0].id` | ID of your KV namespace |
+| `vectorize[0].index_name` | Name of your 128-dimensional index |
+| `r2_buckets[0].bucket_name` | Name of your private bucket |
 
-binding名は`DB`、`OAUTH_KV`、`VECTORIZE`、`AI`、`ARCHIVE`、`MCP_EXECUTOR`のままです。`McpExecutor`のSQLite migration、compatibility flags、assetsのrouting、cronの5本は共通設定を引き継ぎます。ChatGPTの2つの選択設定は空のままにします。
+Keep the binding names `DB`, `OAUTH_KV`, `VECTORIZE`, `AI`, `ARCHIVE`, and `MCP_EXECUTOR`. Retain the shared configuration's SQLite migration for `McpExecutor`, compatibility flags, asset routing, and five cron schedules. Leave both ChatGPT selection settings empty.
 
-R2を利用しない構成では`r2_buckets`を外せます。その場合、backup APIは503を返し、R2による復旧機能は使えません。Vectorizeのmetadata indexは最初のvector書込み前に作成してください。既存indexへ後から追加する場合は[チーム統合の手順](../team-integration.md)で再upsertの要否を確認します。
+You can remove `r2_buckets` if you do not use R2. In that case, backup APIs return 503 and R2 recovery is unavailable. Create Vectorize metadata indexes before the first vector write. When adding them to an existing index, consult the [Team integration guide](../team-integration.md) to determine whether re-upsert is needed.
 
-## 所有者限定のCloudflare Access
+## Owner-only Cloudflare Access
 
-Cloudflare Zero Trustで、自身のteam domain、所有者メールだけを許可するpolicy、2つのSelf-hosted HTTP applicationを用意します。Workerの配備先hostnameを使います。
+In Cloudflare Zero Trust, set up your team domain, a policy allowing only the owner's email, and two self-hosted HTTP applications. Use the hostname where the Worker will be deployed.
 
-| アプリ | 保護するpath | Worker側のaudience設定 |
+| Application | Protected paths | Worker audience setting |
 | --- | --- | --- |
-| dashboard用 | `/dashboard`とその配下 | `DASHBOARD_ACCESS_AUD` |
-| Access対応MCP用 | `/mcp` | `ACCESS_AUD` |
+| Dashboard | `/dashboard` and its descendants | `DASHBOARD_ACCESS_AUD` |
+| Access-protected MCP | `/mcp` | `ACCESS_AUD` |
 
-各アプリのApplication Audience (AUD) tagを取得します。`ACCESS_TEAM_DOMAIN`は`https://YOUR-TEAM.cloudflareaccess.com`、`ACCESS_ALLOWED_EMAIL`は所有者自身のメールです。dashboard用のappでAPIとHTMLが同じaudienceになるように設定します。
+Obtain each application's Application Audience (AUD) tag. Set `ACCESS_TEAM_DOMAIN` to `https://YOUR-TEAM.cloudflareaccess.com` and `ACCESS_ALLOWED_EMAIL` to the owner's email. Configure the dashboard application so its API and HTML use the same audience.
 
-hostname全体を一つのAccessアプリで覆わないでください。`/oauth-mcp`、`/oauth/authorize`、`/oauth/token`、`/oauth/register`とREST APIはWorker自身の認証を使い、MCPのOAuth challengeがブラウザ向けAccessページへ置き換わらないようにします。WorkerはdashboardのJWT署名・issuer・audience・期限・所有者メールも検証します。Access設定が欠けるとdashboardは503になり、公開されません。
-[AccessのHTTPアプリ設定](https://developers.cloudflare.com/cloudflare-one/access-controls/applications/http-apps/)
+Do not cover the entire hostname with a single Access application. `/oauth-mcp`, `/oauth/authorize`, `/oauth/token`, `/oauth/register`, and REST APIs use Worker authentication; their MCP OAuth challenge must not be replaced with a browser-facing Access page. The Worker also validates the dashboard JWT signature, issuer, audience, expiry, and owner email. Missing Access configuration makes the dashboard return 503 rather than exposing it.
+[Access HTTP application configuration](https://developers.cloudflare.com/cloudflare-one/access-controls/applications/http-apps/)
 
-## 秘密情報を設定する
+## Configure secrets
 
-所有者tokenはランダムに生成し、Git対象外のmode 0600ファイルへ保存します。以下は初回導入用で、既存tokenがある場合は停止します。複数配備では配備ごとに保存先を分けます。tokenは画面に表示しません。
+Generate a random owner token and store it in a mode-0600 file outside Git. The following is for first-time setup and stops if an owner token already exists. Use separate storage locations for separate deployments. The token is not printed.
 
 ```sh
 set -eu
@@ -82,7 +82,7 @@ os.chmod(folder / 'owner-token', 0o600)
 values = {'AUTH_TOKEN': (folder / 'owner-token').read_text().strip()}
 for name in ['ACCESS_TEAM_DOMAIN', 'ACCESS_AUD', 'DASHBOARD_ACCESS_AUD', 'ACCESS_ALLOWED_EMAIL']:
     values[name] = getpass.getpass(name + ': ').strip()
-    if not values[name]: raise SystemExit('設定値が空です')
+    if not values[name]: raise SystemExit('A configuration value is empty')
 file = folder / 'secrets.json'
 file.write_text(json.dumps(values))
 os.chmod(file, 0o600)
@@ -90,19 +90,19 @@ PY_SECRET
 npx --yes wrangler@4.146.0 secret bulk "$HOME/.config/second-brain-cf/secrets.json" --profile "$sb_cf_profile" --config wrangler.personal.jsonc
 ```
 
-初回にWorkerの作成を求められたら、設定のWorker名とアカウントを確認します。secretはこのWorkerに属する値です。`AUTH_TOKEN`をURL、shell引数、公開Issue、GitHub Actionsの通常ログへ入れません。
-[Wranglerの秘密情報](https://developers.cloudflare.com/workers/configuration/secrets/)
+If prompted to create a Worker on first use, verify the configured Worker name and account. Secrets belong to this Worker. Do not put `AUTH_TOKEN` in URLs, shell arguments, public issues, or normal GitHub Actions logs.
+[Wrangler secrets](https://developers.cloudflare.com/workers/configuration/secrets/)
 
-ChatGPTを使わない構成では`CHATGPT_CREDENTIAL_KEY`は不要です。上流の必須secretに追加しません。
+`CHATGPT_CREDENTIAL_KEY` is unnecessary when ChatGPT is not used. Do not add it to upstream's required secrets.
 
-## build・配備・初期化
+## Build, deploy, and initialize
 
 ```sh
 npx --yes wrangler@4.146.0 deploy --dry-run --profile "$sb_cf_profile" --config wrangler.personal.jsonc
 npx --yes wrangler@4.146.0 deploy --profile "$sb_cf_profile" --config wrangler.personal.jsonc
 ```
 
-配備されたURLを確認して、所有者tokenで`/health`へアクセスします。curlの設定ファイルを使い、tokenそのものを引数へ出さない例です。
+Check the deployed URL and call `/health` with the owner token. This example uses a curl configuration file so the token itself is not passed as an argument.
 
 ```sh
 python3 - <<'PY_CURL'
@@ -118,22 +118,22 @@ sb_worker_url=https://YOUR-WORKER-URL
 curl --fail --silent --show-error --config "$HOME/.config/second-brain-cf/curl-owner.conf" "$sb_worker_url/health"
 ```
 
-認証済みhealthは順序付きruntime migrationをawaitしてから返します。`database.status=reachable`を確認します。`ok`とVectorize/AIの状態も別に確認してください。埋込みのない空DBは正常で、AI状態は受動的な観測です。DB到達だけで検索や生成の品質を合格にしません。
+Authenticated health waits for ordered runtime migrations before returning. Check `database.status=reachable`. Also inspect `ok` and the Vectorize/AI status separately. An empty database with no embeddings is valid; AI status is a passive observation. Database reachability alone does not establish search or generation quality.
 
-`db/schema.sql`を既存remote DBへ直接適用しません。単純な`CREATE TABLE IF NOT EXISTS`だけでは必要な列やtriggerを更新できないためです。
+Do not apply `db/schema.sql` directly to an existing remote database. `CREATE TABLE IF NOT EXISTS` alone cannot update the required columns and triggers.
 
-次に、認証なしのRESTが拒否されること、他のメールでdashboardに入れないこと、所有者がdashboardに入れることを確認します。MCPはOAuthなら`/oauth-mcp`、static tokenなら`/mcp`を使います。最初は機微でない合成記憶で保存・検索・削除を確認します。[SMOKE_MATRIX.md](SMOKE_MATRIX.md)の順序を利用できます。
+Next, verify that unauthenticated REST requests are rejected, other email addresses cannot enter the dashboard, and the owner can. Use `/oauth-mcp` for OAuth MCP and `/mcp` for static-token MCP. Start by testing storage, search, and deletion with non-sensitive synthetic memories. Follow [SMOKE_MATRIX.md](SMOKE_MATRIX.md).
 
-## 更新前の保全と更新後の確認
+## Safeguards before updates and checks afterward
 
-更新時は実配備に使っているconfigとprofileを明示します。共通設定の`CHATGPT_OPERATIONS`と`CHATGPT_OWNER_WORKSPACE_ID`は空なので、共通設定で有効な配備を上書きすると直接生成がOFFになります。`--keep-vars`でもconfigに明示した値は反映されます。
+Explicitly select the configuration and profile used by the real deployment. The shared configuration leaves `CHATGPT_OPERATIONS` and `CHATGPT_OWNER_WORKSPACE_ID` empty; deploying it over an enabled installation disables direct generation. Explicit configuration values still apply with `--keep-vars`.
 
-更新前に現在のWorker version、D1 Time Travelの復元地点、config、schema version、件数、比較用の記憶内容hashを所有者の保管場所へ記録します。秘密情報や本文を公開Gitへ入れません。
+Before updating, record the current Worker version, D1 Time Travel recovery point, configuration, schema version, counts, and memory-content hashes for comparison in owner-controlled storage. Keep secrets and content out of public Git history.
 
-FTS5の仮想テーブルがあるD1では全体のSQL exportが使えない場合があります。Time Travelと、必要な実テーブルだけのSQL exportを組み合わせます。`entries_fts`・`entry_counts`などの派生表、ChatGPTの`chatgpt_session`と`chatgpt_host`は記憶backupへ含めません。別Workerへ復元した場合は、そのWorkerのhostで再認証します。Time Travelで更新済みrefresh tokenを巻き戻した場合も再認証が必要です。
+A full SQL export may be unavailable for D1 databases containing FTS5 virtual tables. Combine Time Travel with SQL exports of only the required real tables. Exclude derived tables such as `entries_fts` and `entry_counts`, and ChatGPT tables `chatgpt_session` and `chatgpt_host`, from memory backups. After restoring to another Worker, authenticate again for that Worker's host. Reauthentication is also required if Time Travel rolls back a rotated refresh token.
 
-更新後は`/health`、schema、件数とhash、認証拒否、workspace分離、必要な生成経路を確認します。version rollbackとD1復元は別操作です。各操作の復元対象と、更新された記憶を巻き戻す範囲を確認して実施します。
+After updating, check `/health`, schema, counts and hashes, authentication rejection, workspace isolation, and the required generation paths. Version rollback and D1 restore are separate operations. Confirm each operation's recovery target and the extent to which it rolls back updated memories.
 
-## 任意のChatGPT接続
+## Optional ChatGPT connection
 
-[CHATGPT_DIRECT.md](CHATGPT_DIRECT.md)の所有者限定の手順を使います。接続後に表示する有効化候補を`wrangler.personal.jsonc`へ記録し、明示的に配備します。未選択の処理はWorkers AIのままです。ChatGPTの使用量とCloudflare各サービスの使用量は別に確認します。
+Use the owner-only procedure in [CHATGPT_DIRECT.md](CHATGPT_DIRECT.md). Record the suggested enablement settings shown after connection in `wrangler.personal.jsonc`, then deploy explicitly. Unselected operations continue to use Workers AI. Track ChatGPT usage separately from Cloudflare service usage.

@@ -1,8 +1,8 @@
-# 上流との同期手順
+# Upstream synchronization
 
-## 監査先
+## Audit targets
 
-現在の監査先は未releaseの`upstream/release/4.0.0`、監視先は`upstream/main`です。初期基点は`upstream-base-2026-08-23`で、上流commit `99f1c1a2a005d8f835aef93c786cfe07f54780f3`を指します。上流の正式release後は、取り込みと検証を行ってから監査先を切り替えます。
+The current audit target is the unreleased `upstream/release/4.0.0`; the watch target is `upstream/main`. The initial base tag, `upstream-base-2026-08-23`, points to upstream commit `99f1c1a2a005d8f835aef93c786cfe07f54780f3`. After the official upstream release, integrate and verify it before switching the audit target.
 
 ```sh
 git remote add upstream https://github.com/rahilp/second-brain-cloudflare.git
@@ -11,35 +11,35 @@ npm run upstream:audit:boundary
 npm run upstream:audit
 ```
 
-upstream remoteが既にある場合は追加を省略し、URLとpushurlを確認してください。公開cloneでは上記の補助タグも取得してください。GitHub CIはtagsを取得します。
+If the upstream remote already exists, skip adding it and verify its URL and push URL. Fetch the base tag in public clones as well. GitHub CI fetches tags.
 
-`upstream:audit:boundary`は境界をhard gateにし、新着commitとmerge競合を報告します。`upstream:audit`は未統合commitと競合も失敗にします。定期workflowは週1回で、依存更新や本番配備を自動実行しません。
+`upstream:audit:boundary` enforces ownership boundaries and reports new commits and merge conflicts. `upstream:audit` also fails on unintegrated commits and conflicts. The scheduled workflow runs weekly; it does not automatically update dependencies or deploy to production.
 
-## 同期の進め方
+## Update sequence
 
-1. 作業ツリー、PR、配備候補を確認し、独立したブランチを作る。
-2. 上流履歴をmergeする。privateの運用記録や資格情報を公開用ブランチへ混ぜない。
-3. 上流所有21ファイル、依存・lockfile、installerの一致と、新規moduleのallowlistを検査する。
-4. 監査が示す移動元・移動先を照合し、下の契約を保つ。
-5. 変更に関係する試験を実行し、最終SHAのWorker CIが成功してからmergeする。
-6. 各所有者の配備はGit対象外のconfigを明示し、復元地点と確認結果を別の保管場所へ記録する。
+1. Check the working tree, PRs, and deployment candidates; create an isolated branch.
+2. Merge upstream history. Keep private operation records and credentials out of the public branch.
+3. Check the 21 upstream-owned files, dependencies, lockfile, installer, and the allowlist for new modules.
+4. Compare moved sources and destinations identified by the audit, preserving the contracts below.
+5. Run the relevant tests and require successful Worker CI for the final SHA before merging.
+6. For each owner's deployment, explicitly select the ignored configuration and record recovery points and verification results in separate owner-controlled storage.
 
-## 移動元と保存契約
+## Moved code and preservation contracts
 
-| 上流の変更箇所 | forkで照合する部分 |
+| Upstream change area | Fork checks |
 | --- | --- |
-| capture・lifecycle・import・履歴 | admission、CAS、before-image、held、削除receipt、pending index、復元のactor/workspace |
-| schema・db初期化 | fork write-protection DDLと適用順、旧schemaからのupgrade、FTS guard、entry count |
-| 検索・tokenize・reranker | CJK補正、bind上限、LIMIT前の適格性、query cacheのscope、障害時の救済 |
-| 生成のpromptと保存 | ChatGPT操作ごとの範囲、JSON検査、引用、完了状態、非fallback、有限の再試行 |
-| routes・MCP・HTTP body | 入口の認証、実byte上限、DO内の再認可、有限応答、stream終端とadmissionの解放 |
-| scheduled・insight・digest | cronの5本、巡回のSQL予算、保存上限、保守で予算を使った場合の停止 |
-| backup・export・restore | 記憶だけの形式、時系列cursor、scope、復元中のwrite lock、資格情報の除外 |
+| Capture, lifecycle, import, history | Admission, CAS, before-images, held rows, deletion receipts, pending index, restore actor/workspace |
+| Schema and DB initialization | Fork write-protection DDL and ordering, upgrades from old schemas, FTS guards, entry counts |
+| Search, tokenization, reranking | CJK adjustments, bind limits, eligibility before LIMIT, query-cache scope, failure recovery |
+| Generation prompts and persistence | Per-operation ChatGPT scope, JSON validation, quotations, completion status, no fallback, bounded retries |
+| Routes, MCP, HTTP bodies | Entry authentication, actual byte limits, reauthorization inside the DO, bounded responses, stream termination, admission release |
+| Scheduled work, insights, digests | Five cron schedules, rotation SQL budgets, persistence limits, stopping when maintenance consumes the budget |
+| Backup, export, restore | Memory-only format, temporal cursors, scope, restore write locks, credential exclusion |
 
-詳細な移動対応は`scripts/audit-upstream-sync.mjs`の`movedImplementationReviews`にあります。候補の提示は意味的な互換性の証明ではないため、関連する回帰試験と照合します。
+Detailed move mappings are in `movedImplementationReviews` in `scripts/audit-upstream-sync.mjs`. A suggested mapping is not proof of semantic compatibility; verify it against the relevant regression tests.
 
-## 公開用の境界
+## Publication boundary
 
-公開候補は上流commitを親にして、監査済みのfork差分を載せます。上流の履歴を保持し、private mainや私的な枝を親にしません。公開リポジトリへprivate originをmirror pushしません。
+Public candidates use an upstream commit as their parent and add audited fork changes. Preserve upstream history without making private main or private branches ancestors. Do not mirror-push a private origin to the public repository.
 
-上流への[ChatGPT接続の提案](https://github.com/rahilp/second-brain-cloudflare/issues/384)は、既定OFFの所有者限定dashboard回答を初期範囲にしています。このfork全体や他の生成処理の移植を求める提案とは区別します。
+The upstream [ChatGPT connection proposal](https://github.com/rahilp/second-brain-cloudflare/issues/384) initially covers owner-only dashboard answers, off by default. It does not propose transplanting this entire fork or its other generation operations.

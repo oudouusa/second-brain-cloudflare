@@ -2,9 +2,7 @@
 
 ## Verdict
 
-CLIProxyAPIからCodex OAuthへ送った20回の連続Responses requestで、実キャッシュreadを
-再現できた。後続19回のうち16回で`cached_tokens > 0`を観測し、事前に固定した
-80%の合格閾値を超えた。
+Observed cache reads were reproduced across 20 consecutive Responses requests through CLIProxyAPI and Codex OAuth. Sixteen of the later 19 requests reported `cached_tokens > 0`, exceeding the predeclared 80% acceptance threshold.
 
 Canonical evidence:
 [`2026-09-03-cliproxy-cache-live-v1.json`](./2026-09-03-cliproxy-cache-live-v1.json)
@@ -19,9 +17,7 @@ warm-input cache ratio:  28,672 / 36,461 = 78.64%
 cached tokens per hit:   1,792
 ```
 
-Capsuleは本番WorkerからMCP Managed OAuthで取得し、推論は固定されたCLIProxyAPI
-transportを経由した。公式OpenAI API keyとSecond Brain static bearerは使用して
-いない。Core Capsuleは8,727文字、complete、全requestでbyte-identicalだった。
+The Capsule was fetched from the production Worker through MCP Managed OAuth; inference used a fixed CLIProxyAPI transport. No official OpenAI API key or Second Brain static bearer was used. The Core Capsule was complete, 8,727 characters long, and byte-identical across all requests.
 
 ## Latency observation
 
@@ -31,34 +27,30 @@ transportを経由した。公式OpenAI API keyとSecond Brain static bearerは�
 | Later cache hits | 16 | 1,244 ms | 1,392.06 ms | 1,911 ms |
 | Later cache misses | 3 | 1,332 ms | 1,630.67 ms | 2,440 ms |
 
-hitのmean latencyはmissより約14.6%短かった。ただしmissが3件しかなく、
-non-streaming response全体の時間には生成・ネットワーク・proxy処理も含まれる。
-したがって、cacheによるlatency改善の因果証拠とは認定しない。
+
+Mean latency for hits was about 14.6% lower than for misses. However, only three misses were observed, and complete non-streaming response time includes generation, network, and proxy processing. This does not establish that caching caused a latency improvement.
 
 ## Claim boundary
 
-- `cache-read-observed`: 認定済み
-- initial cache write: 未観測
-- 全sample中のcache write: 20 responseすべてcounterは0で、未観測
-- OpenAI公式Responses APIとの等価性: 未検証
-- providerの料金割引: 未検証
-- API費用推計: 未算出
+- `cache-read-observed`: qualified.
+- Initial cache write: unobserved.
+- Cache write across all samples: unobserved; every one of the 20 responses reported zero.
+- Equivalence with the official OpenAI Responses API: unverified.
+- Provider pricing discount: unverified.
+- API cost estimate: not calculated.
 
-`cached_tokens`はCLIProxyAPI/Codex OAuth経路で返されたusage counterであり、
-OpenAI Platformの請求書ではない。この結果が証明するのは、安定したCore Capsuleの
-うち1,792 tokensが高い頻度で再利用されたことまでである。
+`cached_tokens` is a usage counter returned through CLIProxyAPI/Codex OAuth, not an OpenAI Platform invoice. This result establishes only frequent reuse of 1,792 tokens from a stable Core Capsule.
 
 ## Reproduction contract
 
-測定は`qualify.mjs --mode proxy-only --output measurement`を使い、次を要求した。
+The measurement used `qualify.mjs --mode proxy-only --output measurement`, requiring:
 
-- MCP Managed OAuthで取得したcompleteな本番Capsule
-- scheme、host、port、base pathを含むCLIProxy transport hashの完全一致
-- 20回すべてHTTP成功
-- runごとに異なるsuffix
-- 同じcache keyとCore hash
-- 後続cache hit率80%以上
-- 全requestのinput、cached、output、total tokenとlatency counter
+- A complete production Capsule fetched through MCP Managed OAuth.
+- An exact CLIProxy transport hash including scheme, host, port, and base path.
+- HTTP success for all 20 requests.
+- A different suffix for each run.
+- Stable cache key and Core hash.
+- At least 80% later cache hits.
+- Input, cached, output, total-token, and latency counters for every request.
 
-本文、モデル出力、Worker URL、OAuth token、proxy key、生ETag、生JSONLは保存して
-いない。
+Content, model output, Worker URL, OAuth tokens, proxy key, raw ETag, and raw JSONL were not retained.
