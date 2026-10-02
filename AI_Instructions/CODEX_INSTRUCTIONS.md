@@ -65,18 +65,22 @@ or retry endlessly. Use available conversation/source context with the limitatio
 stated rather than blocking unrelated work. Consult the loaded tool schemas for
 arguments instead of inventing tools or assuming an old release's team limits.
 
-## プロジェクト
-workspace は可視性、project は話題のまとまり、tags は自由な分類、source は出典を表す。
-対象が明確なら list_projects で slug を確認し、remember・recall・list_recent の project に渡す。
-未登録 project は保存時に作成される。プロジェクト指定は共有の許可を意味しない。
+## Projects
+workspace controls visibility, project groups related topics, tags provide free-form
+classification, and source records provenance. When the target is clear, use
+list_projects to confirm its slug and pass project to remember, recall, or
+list_recent. An unknown project is created when saving. Selecting a project
+does not grant permission to share.
 
-## 4.0の履歴・時点検索・保留
-`as_of` は過去時点の検索に使う。`valid_from` と `valid_until` を確認し、
-後で撤回された結果（later retracted）を現在も有効な判断として扱わない。
-回答で依拠した記憶はIDを示す（name its id）。recallのreceiptは検索そのものの証拠として引用できる。
-隔離中の記憶を解除するよう勧める前に、利用者自身が内容を読む必要がある（read it themselves）。
-standingは継続指示、decisionは判断の記録であり、保存だけで行動の許可は増えない。
-不要になった継続指示は、利用者の意図を確認した上で`stop_standing`を使う。
-`forget`は4.0のゴミ箱へ移し、`undo`はツールが提示する履歴の条件に従う。
+## History, point-in-time search, and held memories in 4.0
+Use `as_of` to search at a past time. Check `valid_from` and `valid_until`; do not
+treat a result that was later retracted as a judgment that remains valid today.
+When relying on a memory in an answer, name its id. A recall receipt can cite
+the search itself. Before recommending release of a held memory, the user must
+read it themselves. A standing is an ongoing instruction; a decision is a record
+of a judgment. Storage alone grants no additional permission to act.
+Confirm the user's intent before using `stop_standing` for an instruction that
+is no longer needed. `forget` moves to 4.0 trash; `undo` follows the history
+conditions presented by the tool.
 
 Client source for memory writes: codex. Use the loaded tool schema.

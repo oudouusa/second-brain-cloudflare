@@ -1,5 +1,5 @@
-# installer実装は上流と同一だが、このforkは独自の配布・署名・releaseを提供しない。
-# 手動実行でもタグreleaseへ進まない。互換性確認は上流の手順で別途実施する。
+# The installer matches upstream; this fork does not distribute, sign, or release its own installer.
+# Manual dispatch does not create a tagged release. Check compatibility separately using upstream procedures.
 name: Upstream installer (disabled)
 
 on:
@@ -13,4 +13,4 @@ jobs:
     if: ${{ false }}
     runs-on: ubuntu-latest
     steps:
-      - run: echo "このforkのinstaller配布は未対応です。"
+      - run: echo "Installer distribution is not supported by this fork."

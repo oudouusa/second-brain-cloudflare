@@ -1,24 +1,17 @@
-# 夜間処理の隔離診断
+# Isolated nightly diagnostics
 
-PR #80 の残る性能受入に向けたローカル診断。実際の `Worker.scheduled()`、
-SQLite、write fence、CLIProxy adapterを使い、provider応答とKVを模擬する。
-productionの入口・処理・SQLを複製しない。Cloudflareへの通信は行わない。
+Local diagnostics for the remaining performance acceptance work from PR #80. Use actual `Worker.scheduled()`, SQLite, and write fences, with provider responses and KV simulated. The original harness exercised the then-current CLIProxy adapter. Do not duplicate production entry points, processing, or SQL. No requests are sent to Cloudflare by the local probe.
 
-## 実行
+## Running
 
-Node 24と既存lockfileの依存を使用する。出力先は新しい空ディレクトリとし、Gitへ追加しない。
+Use Node 24 and dependencies from the existing lockfile. Select a new empty output directory and keep it out of Git.
 
 ```sh
 NIGHTLY_PROBE_OUTPUT=/tmp/nightly-candidate \
   npx --no-install vitest run --config experiments/nightly-perf/vitest.config.ts
 ```
 
-基準mainと候補を別worktreeで実行し、同じprobe、config、`test/helpers/sqlite-d1.ts`、
-`test/helpers/make-env.ts`、`vitest.setup.ts`を使う。特に基準mainの旧SQLite補助実装は
-`meta.changes`を返さず不要なCAS再試行を作るため、候補の修正済み補助実装を両方で使う。
-これは試験adapterの統一であり、基準側のproductionコードを変更する操作ではない。
-`src/`、schema、wrangler、packageに未commit差分があればprobeは拒否する。
-同じUTC日に実行し、両armの固定時刻・fixture・adapterのhashを必ず照合する。
+Run baseline main and candidate in separate worktrees using identical probe, configuration, `test/helpers/sqlite-d1.ts`, `test/helpers/make-env.ts`, and `vitest.setup.ts`. In particular, the baseline's old SQLite helper did not return `meta.changes` and caused unnecessary CAS retries; use the candidate's corrected helper for both arms. This aligns test adapters without changing baseline production code. The probe rejects uncommitted changes to `src/`, schema, wrangler, or package files. Run both arms on the same UTC day and verify identical fixed time, fixture, and adapter hashes.
 
 ```sh
 node experiments/nightly-perf/summarize.mjs \
@@ -26,50 +19,26 @@ node experiments/nightly-perf/summarize.mjs \
   BASELINE_FULL_SHA CANDIDATE_FULL_SHA /tmp/nightly-comparison.json
 ```
 
-6条件の欠落、SHA/adapter/schema/fixture違い、記憶欠落、対象外workspace変更、
-SQL失敗、計数不一致を拒否する。成功しても `remoteAcceptancePassed=false` を維持する。
-probeは通常のVitest/coverage対象から除外されたexperimentで、Worker CIの独立stepでも
-このコマンドを実行する。基準との比較は両armの証拠を揃えて別に検査する。
+Reject missing conditions among the six cases, SHA/adapter/schema/fixture mismatches, lost memories, changes to other workspaces, SQL failures, and inconsistent counters. Even success leaves `remoteAcceptancePassed=false`. This experiment is excluded from normal Vitest/coverage selection; Worker CI runs it as a separate step. Baseline comparison requires evidence from both arms and a separate check.
 
-## fixtureと計数
+## Fixtures and counting
 
-- workspace当たり200/1,000/10,000件、それぞれ1または2 workspace。
-  2 workspaceの最大DBは**合計20,000件**。各workspaceで77件が有効、残りは処理対象外の合成ノイズ。
-- 基準は圧縮とgraph/stalenessの2 invocation、候補は1 invocation。
-  SQLのbatch内各文を計数する。EXPLAINは診断用として別に実行し、計数へ加えない。
-- 原文・ID・workspaceのhashを確認する。上流仕様のdigest参照追記は、今回生成した
-  実在digestへの末尾参照だけを除去して原文保持を判定する。
-- 別workspaceはタグ等も含め全行の不変を確認する。
-- 生SQL・束縛値は合成データに限定。出力はmode 0600で新規作成する。
+- 200/1,000/10,000 entries per workspace, with either one or two workspaces. The largest two-workspace database contains **20,000 entries total**. Each workspace has 77 eligible entries; the rest are excluded synthetic noise.
+- The baseline uses two invocations for compression and graph/staleness; the candidate uses one. Count every statement inside SQL batches. Run EXPLAIN separately for diagnostics and exclude it from the counts.
+- Check source-content, ID, and workspace hashes. To assess content preservation, strip only trailing upstream-style digest references pointing to an actual digest generated in this run.
+- Verify all rows in other workspaces remain unchanged, including tags.
+- Raw SQL and bound values are synthetic only. Create new output files with mode 0600.
 
-SQL数が一定でも走査行数一定とは言えない。EXPLAINのSCANには小さい管理表や
-VALUESも含まれるため、全てを問題扱いしない。実CPU、D1課金rows、KV費用、
-p95遅延、実モデル品質をこの診断で測ったとは扱わない。
-低コスト側では一晩の処理件数も小さい。両armのSQL数から性能改善率を計算しない。
+Constant SQL counts do not imply constant rows scanned. EXPLAIN SCAN also covers small administration tables and VALUES, so not every scan is a problem. These diagnostics do not measure real CPU, D1 billed rows, KV cost, p95 latency, or live-model quality. The lower-cost arm also processes fewer items per night; do not compute performance improvements from the two arms' SQL counts alone.
 
-過去の実測結果は運用者の非公開領域に保全します。遠隔測定を行う場合は、隔離した試験用資源、
-合成データ、実行予算、資格情報の送信先を事前に確認し、本番の記憶へ接続しません。
+Keep historical measurements in private operator storage. Before remote measurement, confirm isolated test resources, synthetic data, execution budgets, and credential destinations. Do not connect production memories.
 
-## 隔離した遠隔診断
+## Isolated remote diagnostics
 
-`prepare-remote.mjs 出力ディレクトリ` は新しい空ディレクトリに200件の合成fixture、
-schema、hash、試験用秘密値を作り、ローカルSQLiteで投入を検査する。出力はGitへ追加しない。
-`remote-worker.ts` を両production版で同一にbundleし、一時D1を別々に接続する。
-認証済みの `/run` は実scheduled入口を実行し、`/reset` は試験専用表を確認してから
-write admissionを通してfixtureを復元する。通常のwrangler設定からは参照しない。
+`prepare-remote.mjs OUTPUT_DIRECTORY` creates a 200-entry synthetic fixture, schema, hashes, and test secrets in a new empty directory, verifying insertion in local SQLite. Keep output out of Git. Bundle the same `remote-worker.ts` against both production revisions and bind separate temporary D1 databases. Authenticated `/run` invokes the real scheduled entry point. `/reset` verifies test-only tables before restoring the fixture through write admission. Normal Wrangler configuration does not reference this adapter.
 
-D1の各result metadataを認証済みレスポンスへ返し、全背景処理の終了を待つ。
-既存のログ秘匿は維持し、許可済みの `http_request.operation` と試料IDで
-Cloudflare TailのCPUに対応づける。SQL本文や認証秘密はログへ出さない。
-生成・Vectorize・KVは模擬、HTTP経由の計測adapterを含むCPUであり、実モデル品質や
-通常のcron発火経路を測ったことにはならない。
+Return per-result D1 metadata through authenticated responses and wait for all background work. Preserve existing log redaction; associate Cloudflare Tail CPU using allowlisted `http_request.operation` and sample IDs. Do not log SQL text or authentication secrets. Generation, Vectorize, and KV are simulated. CPU includes the HTTP measurement adapter; it does not measure live-model quality or the ordinary cron-trigger path.
 
-測定前にsource/bundle/adapter/fixture hash、回数、費用上限、合否条件を私有manifestへ
-固定する。配備コード・binding・versionを読み戻し、欠測や失敗を0へ置換しない。
-初期化・reset・readbackも予算に含め、証拠保存後は作った一時資源だけを撤去する。
+Before measurement, pin source/bundle/adapter/fixture hashes, sample count, cost ceiling, and acceptance criteria in a private manifest. Read back deployed code, bindings, and version. Do not replace missing or failed measurements with zero. Include initialization, reset, and readback in the budget. After preserving evidence, remove only the temporary resources created for the test.
 
-夜間DO候補の試験では同一adapterの `NightlyProbeExecutor` subclassを専用bindingへ
-接続する。実productionの `runNightly` を呼び、終了後のD1メタデータを一度だけRPCで
-回収する。保持は直近1試料だけのメモリ内で、productionにはこの収集methodを追加しない。
-公開WorkerとDOのCPUを別々のTailイベントで照合し、公開側のD1実行0も検査する。
-初回・継続の値、診断を継続できる条件、実行先別の合格条件を測定前に固定する。
+For the nightly-DO candidate, attach the same adapter's `NightlyProbeExecutor` subclass to a dedicated binding. It calls production `runNightly` and collects final D1 metadata once through RPC. Only the latest sample is held in memory; do not add this collection method to production. Match public-Worker and DO CPU in separate Tail events and also verify zero D1 executions in the public Worker. Predeclare cold/continuing measurements, conditions for continuing diagnostics, and acceptance criteria for each execution location.

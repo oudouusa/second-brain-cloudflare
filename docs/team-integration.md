@@ -1,35 +1,37 @@
-# Team Edition 統合メモ
+# Team Edition integration notes
 
-この文書は、個人用 Second Brain fork に upstream の Team Edition を取り込む際の設計判断と、安全な導入順序をまとめたものです。
+This document records the design decisions and rollout sequence used to integrate upstream Team Edition into the personal Second Brain fork.
 
-## 統合後の構成
+**Historical scope:** the topology, model defaults, cron allocation, upstream target, and deployment results below describe the 2026-08-30 integration. For current setup and ownership, use [DEPLOYMENT.md](fork/DEPLOYMENT.md), [ARCHITECTURE.md](fork/ARCHITECTURE.md), and [UPSTREAM_SYNC.md](fork/UPSTREAM_SYNC.md). The Vectorize metadata-index migration caveat remains relevant to existing indexes.
 
-- 所有者は最初の管理者です。
-- 各メンバー（AI エージェントを含む）には、個別の Bearer token と個人 workspace を1つ発行します。
-- 全員が読める company workspace は1つだけです。
-- 通常の記憶は個人 workspace に入り、明示的に共有した記憶だけが company workspace へ移動します。
-- company workspace の記憶は全員が読めますが、変更、削除、共有解除は作成者または管理者だけが行えます。
-- 管理者権限はメンバー管理用であり、他メンバーの個人 workspace を読む権限ではありません。
+## Integrated topology
 
-エージェントごとに記憶を分ける場合は、Team 画面でエージェントを1メンバーとして追加し、そのエージェント専用 token を MCP クライアントへ設定します。同じ token を複数エージェントで共有すると同一人物として扱われるため、分離したい単位ごとに token を分けます。
+- The owner is the first administrator.
+- Each member, including an AI agent, receives a separate Bearer token and one personal workspace.
+- There is one company workspace readable by everyone.
+- Normal memories enter a personal workspace; only explicitly shared memories move to company.
+- Everyone can read company memories, but only their author or an administrator can modify, delete, or unshare them.
+- Administrator authority manages members; it does not grant access to another member's personal workspace.
 
-## 維持するモデル
+To separate agents' memories, add each agent as a member through the Team screen and configure its dedicated token in its MCP client. Sharing one token makes multiple agents the same identity, so use distinct tokens for each intended isolation boundary.
 
-Team Edition 統合ではモデルを変更しません。
+## Retained models
 
-| 用途 | モデル |
+The Team Edition integration did not change models.
+
+| Purpose | Model |
 | --- | --- |
-| 通常のテキスト生成、分類、recall 補助 | `@cf/meta/llama-4-scout-17b-16e-instruct` |
-| embedding | `@cf/google/embeddinggemma-300m` |
-| Vectorize | 128次元、cosine、EmbeddingGemma の MRL 128 profile |
+| Normal generation, classification, recall assistance | `@cf/meta/llama-4-scout-17b-16e-instruct` |
+| Embedding | `@cf/google/embeddinggemma-300m` |
+| Vectorize | 128 dimensions, cosine, EmbeddingGemma MRL 128 profile |
 
-週次 insight 用の独立設定も既存 fork の値をそのまま維持します。Team Edition を使うために embedding モデルを変更する必要はありません。
+The separate weekly-insight configuration retained its existing fork value. Team Edition does not require changing the embedding model.
 
-## Vectorize の workspace 分離
+## Vectorize workspace isolation
 
-正確なアクセス制御は D1 の `workspace_id` 条件で行います。Vectorize の `workspace_id` filter は、他 workspace の候補が検索枠を消費しないようにする検索品質・効率上の補助です。filter が利用できない場合は一度だけ非絞り込み検索へ退避し、その候補を D1 で再度 workspace 絞り込みするため、他メンバーの個人記憶が応答へ混ざることはありません。
+Authoritative access control uses D1 `workspace_id` conditions. Vectorize's `workspace_id` filter helps quality and efficiency by preventing candidates from other workspaces from consuming search slots. If the filter is unavailable, search falls back once to an unfiltered query and then reapplies strict workspace filtering in D1. Other members' personal memories cannot enter the response.
 
-新しい Vectorize 索引を作る場合は、最初の vector を書く前に次を実行します。
+For a new Vectorize index, run the following before writing its first vector:
 
 ```bash
 npm run vectors:create
@@ -37,66 +39,66 @@ npm run vectors:index-parent
 npm run vectors:index-workspace
 ```
 
-`vectors:index-workspace` は `workspace_id` の string metadata index を作成します。
+`vectors:index-workspace` creates a string metadata index for `workspace_id`.
 
-既に vector が入っている本番索引では、`vectors:index-workspace` だけを後付けしないでください。Cloudflare Vectorize は、metadata index 作成前に upsert 済みだった vector をその index へ自動登録しません。索引を追加しても、既存 vector を作成後に再 upsert するまでは filter 対象にならず、古い記憶の意味検索結果が減る可能性があります。
+Do not simply add `vectors:index-workspace` to an already populated production index. Cloudflare Vectorize does not automatically include vectors upserted before creation of a metadata index. Until those vectors are re-upserted after index creation, they are unavailable to that filter, potentially reducing semantic results for older memories.
 
-したがって既存環境の初回 Team 更新では、次のどちらかを選びます。
+For the first Team upgrade of an existing deployment, choose either:
 
-1. 現在の索引を維持し、workspace filter の非対応時フォールバックと D1 の厳密な絞り込みを使う。今回の既定方針です。
-2. 別の128次元索引を作り、`parentId` と `workspace_id` の metadata index を先に作成してから全記憶を再構築し、検証後に binding を切り替える。モデルは同じままで構いません。
+1. Retain the existing index, using the unsupported-workspace-filter fallback and strict D1 filtering. This was the integration's default approach.
+2. Create another 128-dimensional index, create `parentId` and `workspace_id` metadata indexes first, rebuild all memories, verify results, then switch the binding. The model can remain unchanged.
 
-2は既存 vector の再構築と切替を伴うため、このマージコミットでは自動実行しません。
+Option 2 rebuilds existing vectors and changes the binding, so the integration merge did not run it automatically.
 
-## cron 配分
+## Cron allocation
 
-Cloudflare Free plan の上限に合わせ、cron trigger は5本のままです。
+The integration retained five cron triggers to fit the Cloudflare Free plan limit.
 
-| UTC | 用途 |
+| UTC | Purpose |
 | --- | --- |
-| `0 1 * * *` | nightly compression |
-| `10 1 * * *` | graph backfill と staleness |
-| `30 * * * *` | integration sync。割当リセット後の一部 slot は AI 復旧にも利用 |
-| `45 1 * * *` | insight candidate accrual |
-| `15 2 * * SUN` | 個人向け週次 insight |
+| `0 1 * * *` | Nightly compression |
+| `10 1 * * *` | Graph backfill and staleness |
+| `30 * * * *` | Integration sync; some slots after quota reset also handle AI recovery |
+| `45 1 * * *` | Insight candidate accrual |
+| `15 2 * * SUN` | Personal weekly insights |
 
-Team の company insight は6本目を追加せず、日曜 02:30 UTC の integration slot を利用します。通常の integration sync、AI quota 復旧、company insight は同一 invocation で重ねず、D1 subrequest budget を守ります。
+Company insights used the Sunday 02:30 UTC integration slot instead of adding a sixth trigger. Normal integration sync, AI quota recovery, and company insights did not overlap in one invocation, protecting the D1 subrequest budget.
 
-## 既存環境からの更新手順
+## Upgrade sequence for existing deployments
 
-統合作業中は deploy と push を行わず、全gateが成功した統合commitだけを次の順序で本番へ反映します。2026-08-30の最新同期では、この手順を完了しています。
+During integration, do not deploy or push. Deploy only an integration commit that has passed every gate, in the following order. This sequence was completed for the 2026-08-30 synchronization.
 
-1. 現行 Worker、D1、Vectorize、KV、R2 の read-only inventory を取得します。
-2. 現行版で R2 backup を作成し、manifest と件数を確認します。
-3. `npm run check:scope`、`npm run typecheck`、`npm test`、Wrangler dry-run が成功した統合 commit を選びます。
-4. 既存の populated Vectorize には、この段階で `workspace_id` metadata index を後付けしません。
-5. Worker を deploy します。初回起動時に owner、owner personal workspace、company workspace が作られ、既存 D1 記憶と edge は owner personal workspace へ移されます。
-6. owner token で health、recall、remember、forget を smoke test します。
-7. Team 画面からエージェント／メンバーを追加し、それぞれ専用 token を設定します。
-8. 2人の個人 workspace が相互に見えず、company へ共有した記憶だけが双方から読めることを確認します。
-9. 必要なら、別索引での metadata index 先行作成と全 vector 再構築を独立した移行作業として行います。
+1. Obtain a read-only inventory of the current Worker, D1, Vectorize, KV, and R2.
+2. Create an R2 backup with the current version and check its manifest and counts.
+3. Select an integration commit passing `npm run check:scope`, `npm run typecheck`, `npm test`, and a Wrangler dry run.
+4. Do not add a `workspace_id` metadata index to populated Vectorize at this stage.
+5. Deploy the Worker. First startup creates the owner, owner personal workspace, and company workspace, then assigns existing D1 memories and edges to the owner personal workspace.
+6. Smoke-test health, recall, remember, and forget with the owner token.
+7. Add agents/members through the Team screen and configure dedicated tokens.
+8. Verify two members cannot see each other's personal workspaces and can both read only memories shared to company.
+9. If needed, separately migrate to a new index with metadata indexes created first and all vectors rebuilt.
 
-## R2 backup / restore の範囲
+## R2 backup / restore scope
 
-R2 の memory export は、各 entry の `workspace_id` と `actor_id`、各 edge の `workspace_id` を保持します。信頼済み restore ではこれらを復元し、通常の HTTP import では外部から渡された偽の tenancy metadata を採用しません。
+R2 memory exports retain each entry's `workspace_id` and `actor_id`, and each edge's `workspace_id`. Trusted restore restores those fields. Ordinary HTTP import does not adopt forged tenancy metadata supplied externally.
 
-ただし現在の R2 manifest は、Team directory の `users`、`workspaces`、`memberships`、token credential、admin audit を完全な別 D1 へ復元する disaster-recovery archive にはなっていません。同じ D1 の memory rollback には使えますが、新しい D1 へ Team 全体を復旧する場合は owner とメンバーを再作成し、token を再発行する必要があります。この制約が解消するまでは、Team directory を含む完全復旧済みとは扱いません。
+The R2 manifest is not a disaster-recovery archive that restores Team directory `users`, `workspaces`, `memberships`, token credentials, and admin audit into an entirely separate D1. It supports memory rollback in the same D1. Restoring an entire Team into new D1 requires recreating the owner and members and reissuing tokens. Until this limitation is resolved, do not describe it as complete recovery of the Team directory.
 
-## upstream 追従方針
+## Upstream synchronization policy at integration time
 
-- `upstream/feat/v3-team-edition` の変更は、隔離 worktree で監査してから fork の `main` 候補へ取り込みます。
-- 2026-08-30時点では`7e30fde714c3f0b6106d49713f9b3d31400db8eb`まで取り込み、READMEの重複説明とupstreamで削除された`docs/local-testing.md`をfork側でも縮退しました。
-- `npm run upstream:audit`はTeam Edition branchを差分基準にしつつ、`upstream/main`の未取込commitも同時に検知します。
-- fork 固有のモデル、128次元 embedding profile、障害時の keyword fallback、quota 復旧、R2 整合性、5本 cron を回帰条件として固定します。
-- upstream の同等修正が入ったときは fork 側の一時 patch を削除し、二重実装を避けます。
-- scope checker と workspace 隔離テストを必須 gate とし、管理者 API であっても他メンバーの個人 memory を読み書きできるという扱いにはしません。
+- Audit `upstream/feat/v3-team-edition` changes in an isolated worktree before integrating them into the fork's main candidate.
+- As of 2026-08-30, integration reached `7e30fde714c3f0b6106d49713f9b3d31400db8eb`. Duplicate README explanations and `docs/local-testing.md`, removed upstream, were also removed in the fork.
+- At that time, `npm run upstream:audit` used Team Edition as its comparison base and also detected unintegrated commits on `upstream/main`.
+- Pin fork-specific models, 128-dimensional embeddings, keyword fallback on failure, quota recovery, R2 consistency, and five cron schedules as regression conditions.
+- Remove temporary fork patches when equivalent upstream fixes arrive, avoiding duplicate implementations.
+- Require scope checking and workspace-isolation tests. Even administrator APIs do not imply permission to read or write another member's personal memories.
 
-### 2026-08-30 同期結果
+### 2026-08-30 synchronization results
 
-- active upstream: `upstream/feat/v3-team-edition@7e30fde714c3f0b6106d49713f9b3d31400db8eb`
-- 旧READMEの一般説明と`docs/local-testing.md`はupstreamのwiki移行に合わせて削除し、fork固有README差分を運用プロファイルと参照リンクに限定しました。
-- Cursor instructions、配布用Cursor Rule、`cursor-response`のaxis tagをupstream実装のまま採用しました。
-- Team共有移動とlegacy tenancy backfillは、fork固有D1 write fenceのmarker契約へ合わせました。
-- 検証: focused 140 tests、full 240 files / 3,307 tests、write-path focused 96 tests、TypeScript、scope 113 queries、60-query benchmark evidence、Wrangler 4.126.0 dry-run、startup analysis、active upstream auditがすべて成功しました。
-- 生成モデル、EmbeddingGemma MRL-128 profile、Vectorize索引、D1 schema、Cloudflare本番resourceは変更していません。commit `5f437e8`を`origin/codex/team-edition-integration`へpushし、Worker version `8dac656b-98c2-4909-955a-d98b17e7bb74`として100%配備しました。
-- 配備後は`team=false`のsolo mode、health、実MCP recall／append／get、D1 tenancy・write fence整合性、配備後brain-v3 backup `2026/08/1788063923062`を確認しました。
+- Active upstream: `upstream/feat/v3-team-edition@7e30fde714c3f0b6106d49713f9b3d31400db8eb`.
+- General README explanations and `docs/local-testing.md` were removed in line with upstream's wiki migration, limiting fork README differences to the operational profile and reference links.
+- Cursor instructions, the distributed Cursor Rule, and the `cursor-response` axis tag were adopted unchanged from upstream.
+- Team sharing moves and legacy tenancy backfill were adapted to the fork's D1 write-fence marker contract.
+- Successful checks: 140 focused tests; full suite of 240 files / 3,307 tests; 96 write-path tests; TypeScript; scope checks for 113 queries; 60-query benchmark evidence; Wrangler 4.126.0 dry run; startup analysis; active upstream audit.
+- Generation model, EmbeddingGemma MRL-128 profile, Vectorize index, D1 schema, and Cloudflare production resources were unchanged. Commit `5f437e8` was pushed to `origin/codex/team-edition-integration` and deployed at 100% as Worker version `8dac656b-98c2-4909-955a-d98b17e7bb74`.
+- Postdeployment checks covered solo mode with `team=false`, health, real MCP recall/append/get, D1 tenancy/write-fence consistency, and brain-v3 backup `2026/08/1788063923062`.

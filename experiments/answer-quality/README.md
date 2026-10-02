@@ -1,52 +1,29 @@
-# 日本語の回答生成：固定小試験
+# Japanese answer generation: small fixed test
 
-`cases.json` の合成資料2件を `/chat` に直列送信する。モデル設定は変更しない。
-所有者が実通信を許可した環境で、既存の安全な資格情報取得手段から
-`SB_AUTH_TOKEN` を環境変数に渡して実行する。トークンをコマンド文字列へ書かない。
+Send the two synthetic documents in `cases.json` to `/chat` sequentially without changing model configuration. Run only in an environment where the owner has authorized live requests. Set `SB_AUTH_TOKEN` through an existing secure credential-retrieval mechanism; do not put the token in command text.
 
 ```sh
 python3 experiments/answer-quality/run.py --endpoint https://YOUR_WORKER --output /tmp/answer-quality-new.jsonl
 ```
 
-既定は各3回、要求間隔5秒、再試行なし。既存の出力は上書きしない。
-HTTP/SSE完了、非空、引用番号と必要な根拠の引用、日本語・英字以外の文字混入を
-機械確認する。すべての資料の引用は要求しない。
-文字検査はこのfixture専用で、一般の多言語回答へ適用しない。
+Defaults are three repetitions per case, five seconds between requests, and no retries. Existing output is not overwritten. Mechanical checks cover HTTP/SSE completion, nonempty output, citation numbers and required source quotations, and unexpected characters outside Japanese/Latin scripts. Not every document must be cited. Character checks are specific to this fixture, not general multilingual answers.
 
-`machine_pass` は品質合格の判定ではない。各回答を `review_required` と照合し、
-未完了・未定を取り違えていないか、根拠にない断定がないかを目視確認する。
-少数の成功だけで常時の品質・性能・無料枠内運用を保証しない。
-Issue #54 の比較用source・fixture・性能合否とは独立した試験である。
+`machine_pass` is not a quality verdict. Compare every answer with `review_required` and manually check for confusion between incomplete and undecided states or unsupported assertions. A few successful samples do not guarantee ongoing quality, performance, or operation within free allowances. This test is independent of Issue #54's comparison source, fixtures, and performance gates.
 
-資料にない西暦の補完も警告対象にする。この検出は年の出現差分に限られ、
-条件・否定・日付の意味的な誤りを網羅しない。検出器の回帰確認：
+Also warn when a Gregorian year absent from source material is supplied. This detects only differences in year occurrences, not all semantic errors involving conditions, negation, or dates. Run detector regressions with:
 
 ```sh
 python3 -B -m unittest discover -s experiments/answer-quality -p 'test_*.py'
 ```
 
-2026-09-08の本番測定は6/6でHTTP200・SSE完了、日本語・有効な必要引用を確認したが、
-目視で1/6に資料のない「2025年」があった。**生成品質は未合格**とし、
-検出器に年補完の警告を追加した。元の測定結果は保存し、再実行で置き換えていない。
-今回プロンプトとモデルは変更していない。少数試験での1/6を恒常的な誤答率とは扱わない。
+The 2026-09-08 production measurement showed HTTP 200, completed SSE, Japanese output, and valid required citations in 6/6 samples. Manual review found an unsupported “2025” in 1/6. **Generation quality was not accepted.** A year-invention warning was added to the detector. Original measurements were preserved rather than replaced by reruns; neither prompt nor model changed. Do not interpret 1/6 in a small test as a stable error rate.
 
-測定原本は `results/20260908.jsonl`、後付け検査と目視評価は
-`results/20260908-review.json`。本番sourceは
-`da945308d0aa090827081b482426f30fa46e1176`、Worker versionは
-`bededc76-c34d-4fa5-8475-e139af17cd66`、answer経路はCLIProxyのLuna。
-元の `machine_pass` は年補完検査追加前の値なので、目視評価と併せて読む。
+Original measurements are in `results/20260908.jsonl`; retrospective checks and human review are in `results/20260908-review.json`. Production source was `da945308d0aa090827081b482426f30fa46e1176`, Worker version `bededc76-c34d-4fa5-8475-e139af17cd66`, and the answer path was then CLIProxy Luna. Original `machine_pass` values predate the year-invention check and must be read alongside human review. These are historical results, not the current direct-connection deployment.
 
-## 完了判定の再レビュー
+## Completion-check review
 
-SSEはイベント単位で読み、`finish_reason=stop`の後に独立した`data: [DONE]`イベントが
-完結した場合だけ通信完了とする。本文中のDONE、length/content_filter終了、壊れたJSON、
-終了後の追加data、末尾の未完イベントは不合格。応答は2 MiBに制限する。
-認証ヘッダーの転送を避けるためリダイレクトには追従せず、URL内の認証情報・query・fragmentを拒否する。
+Read SSE by event. Completion requires `finish_reason=stop` followed by a complete, separate `data: [DONE]` event. DONE inside content, length/content_filter termination, malformed JSON, additional data after termination, and an unfinished final event fail. Responses are limited to 2 MiB. Do not follow redirects, to avoid forwarding authentication headers; reject credentials, queries, or fragments in endpoint URLs.
 
-年の根拠は資料本文に限る。質問中の年を回答の根拠と扱わず、全角数字も正規化して検出する。
-これらはテストの誤合格を減らす変更であり、モデルの生成品質を修正する変更ではない。
+Year evidence comes only from source documents, not the question. Normalize full-width digits too. These changes reduce false passes in the test; they do not fix model generation quality.
 
-強化後の本番合成2ケースは `results/20260908-strict-stream.jsonl`。両方とも
-HTTP200、stop→DONE、言語・引用・年の機械検査を通過した。目視では延期ケースが
-「検証に合格するまで」を「検証が完了するまで」と弱めており、条件の意味までは
-機械検査で保証できない。旧6件の失敗を解消済みとは扱わない。
+The two production synthetic cases after tightening checks are in `results/20260908-strict-stream.jsonl`. Both passed HTTP 200, stop → DONE, language, citation, and year checks. Human review found the postponement case weakened “until validation passes” to “until validation finishes.” Mechanical checks do not guarantee the semantics of conditions. These results do not resolve the failures in the older six samples.

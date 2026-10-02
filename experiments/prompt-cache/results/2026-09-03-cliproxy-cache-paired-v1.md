@@ -2,10 +2,7 @@
 
 ## Verdict
 
-同一の一時JSONLから、認定manifestと運用測定manifestを分離生成した。両方の
-`evidence_sha256`は
-`b2b8e9fbf23cbb0e4ef775f32a95a4aa0754164cf963f1360876e8ad5eadfa41`で一致し、
-どちらも`verified: true`である。
+Separate qualification and operational-measurement manifests were generated from the same temporary JSONL. Both have `evidence_sha256` equal to `b2b8e9fbf23cbb0e4ef775f32a95a4aa0754164cf963f1360876e8ad5eadfa41` and both report `verified: true`.
 
 - [Qualification](./2026-09-03-cliproxy-cache-paired-v1.qualification.json)
 - [Measurement](./2026-09-03-cliproxy-cache-paired-v1.measurement.json)
@@ -23,36 +20,26 @@ warm-input cache ratio:     30,464 / 36,461 = 83.55%
 cached tokens per hit:      1,792
 ```
 
-Capsuleは本番WorkerからMCP Managed OAuthで取得し、Core Capsuleは8,727文字、
-complete、全requestでbyte-identicalだった。推論は固定されたCLIProxyAPI transportを
-経由した。公式OpenAI API keyとSecond Brain static bearerは使用していない。
+The complete 8,727-character Core Capsule was fetched from the production Worker through MCP Managed OAuth and was byte-identical across requests. Inference used the fixed CLIProxyAPI transport. No official OpenAI API key or Second Brain static bearer was used.
 
 ## Qualification attempts
 
-同じ固定条件で最初に実行した候補は、20/20 requestが成功したものの、後続hitが
-15/19（78.95%）で80%閾値に1件届かず不合格になった。成功扱いにはせず、同条件の
-次バッチで17/19（89.47%）を観測したmanifestを正本とした。この差からも、hit率は
-単一リクエストごとの保証ではなく、一定回数で評価する運用指標として扱う。
+The first candidate under the same fixed conditions had 20/20 successful requests but only 15/19 later hits (78.95%), one hit short of the 80% threshold, so it failed. It was not relabeled successful. The next batch under identical conditions produced the canonical manifest with 17/19 hits (89.47%). This variation also shows why hit rate is an operational metric across multiple requests, not a per-request guarantee.
 
 ## Claim boundary
 
-- 実キャッシュread: 認定済み
-- initial cache write: 未観測
-- cache write counter: 20 responseすべて0
-- 公式Responses APIとの等価性: 未検証
-- providerの料金割引: 未検証
-- API費用推計: 未算出
-- latency改善の因果関係: 未認定
+- Actual cache reads: qualified.
+- Initial cache write: unobserved.
+- Cache-write counter: zero for all 20 responses.
+- Equivalence with official Responses: unverified.
+- Provider pricing discount: unverified.
+- API cost estimate: not calculated.
+- Causal latency improvement: not established.
 
-今回のhit sampleはmiss sampleより遅く、non-streaming response全体には生成、ネット
-ワーク、proxy処理が含まれる。そのため、キャッシュreadの観測結果をlatency改善へ
-読み替えない。
+Hits were slower than misses in this run. Complete non-streaming response time includes generation, network, and proxy processing, so observed cache reads must not be reinterpreted as improved latency.
 
 ## Credential boundary
 
-ライブ実測時のCLIProxy受信キー取得元は`environment`である。値はmanifest、ログ、
-repositoryへ保存していない。`systemd-credential`対応は実装・テスト済みの推奨運用
-経路だが、今回のライブ実測条件には含めない。
+The live CLIProxy inbound key came from `environment`. Its value was not saved in manifests, logs, or the repository. `systemd-credential` support is implemented and tested as the recommended operational path, but it was not part of these live measurement conditions.
 
-外側の`prompt-cache-proxy-artifacts.v1` envelopeと生JSONLは共有証拠へ保存して
-いない。永続化したのは、同じevidence hashを持つ2つのsanitized manifestだけである。
+Neither the outer `prompt-cache-proxy-artifacts.v1` envelope nor raw JSONL was retained as shared evidence. Only the two sanitized manifests with matching evidence hashes were persisted.

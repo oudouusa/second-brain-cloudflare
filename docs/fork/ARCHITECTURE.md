@@ -1,309 +1,164 @@
-# 現行アーキテクチャと保守責任
+# Current architecture and maintenance ownership
 
-この文書は4.0.0統合branchのソースの責務を説明する。本番反映とは区別する。
-同期時の移動先は `UPSTREAM_SYNC.md`、自己配備の手順は `DEPLOYMENT.md` を参照する。
-配備ごとの実資産ID・実記憶・実測記録は、このソースとは別の所有者の保管場所で管理する。
+This document describes source responsibilities on the 4.0.0 integration branch, separately from production deployment. See `UPSTREAM_SYNC.md` for moved implementations and `DEPLOYMENT.md` for self-hosting. Keep each deployment's real resource IDs, memories, and measurements in separate owner-controlled storage.
 
 ```text
-Claude / ChatGPT / Codex / Cursor / ブラウザー
+Claude / ChatGPT / Codex / Cursor / Browser
                       |
-         公開 Worker: 認証・routing
+         Public Worker: authentication and routing
             /         |          \
-     REST / Assets    MCP       既存scheduled処理
+     REST / Assets    MCP       Existing scheduled work
             |         |          |
             |   MCP_EXECUTOR     |
             |   Durable Object   |
             +---------+----------+
                       |
-        D1: 本文・関係・履歴・運用台帳の正本
+        D1: authoritative content, relationships, history, ledgers
           |           |                 |
     Vectorize      Workers AI      OAUTH_KV
-     派生索引      固定Gemma128     OAuth・連携・補助状態
+   Derived index   Fixed Gemma128  OAuth, integrations, auxiliary state
           |
-   vectorize/cleanup: D1の削除台帳と遠隔削除の整合
+   vectorize/cleanup: reconcile D1 deletion records and remote deletion
 
-明示backup/restore ── R2: brain-v5 chunk / manifest
-生成処理          ── 選択済みprovider（直接ChatGPT / Workers AI）
-Dashboard等       ── Cloudflare Accessの検証
+Explicit backup/restore -- R2: brain-v5 chunks / manifest
+Generation              -- Selected provider (direct ChatGPT / Workers AI)
+Dashboard and others    -- Cloudflare Access validation
 ```
 
-MCP_EXECUTORはMCPと夜間処理のCPU境界であり、記憶本文の別DBではない。
-3.2.1ではMCPを `mcp-v1`、夜間を `nightly-v1` の別object名へ送り、同じclass/bindingを再利用する。
-上図のscheduled処理のうち `0 1 * * *` だけがこの境界を通る。
-MCPの利用者に依存しない入力スキーマはモジュール単位で再利用する。
-server・callback・env・認証コンテキストはリクエストごとに作成し、記憶や権限を共有しない。
-関数引数でスキーマを受け取るrolloverは呼出単位で組み立てる。
-ChatGPT管理・直接回答、週次の読取専用プレビュー、`POST /recall`は認証後に `mcp-v1` へ転送する。
-REST検索は転送前に実バイト32 KiBを確認し、同じREST本体でidentity・scopeと
-usage/recall_logのwrite admissionを再適用する。検索本体と要約応答の解析を公開WorkerのCPU枠から移す。
-移設と総計算量の削減は区別する。fork字句処理のSegmenterと短い語のUTF-8計数を再利用し、
-上流tokenizerと検索結果の契約は維持する。検索語・本文・利用者情報の共有cacheは追加しない。
-JSONを含む応答本文は送信完了・切断までDOの文脈を保持し、RPCの途中切断を防ぐ。
-他のRESTと他4 cronは従来の実行先。夜間RPCはD1の権限解放と動的な背景処理が
-全て終了するまで待つ。RPC失敗時にWorker内へ戻して重複実行することはない。
-新しいclass/binding/migration、DO storageへの本文保存、alarm、queueは追加しない。
+MCP_EXECUTOR is a CPU boundary for MCP and nightly work, not another memory-content database. In 3.2.1, MCP uses object `mcp-v1` and nightly work uses `nightly-v1`, sharing one class/binding. Of the scheduled jobs above, only `0 1 * * *` crosses this boundary. User-independent MCP input schemas are reused at module scope. Servers, callbacks, env, and authentication contexts are created per request, without sharing memories or permissions. Rollover, which receives schemas as function arguments, assembles them per call.
 
-MCPの応答スキーマ互換処理は`mcp/sanitize.ts`を上流と完全一致で保つ。
-forkのwrite admission判定は既存`mcp/handler.ts`内に置く。純読取8種類（get、list_projects、list_recent、get_hot_context、
-get_prompt_capsule、connections、history、list_teams）とprotocol要求を許可する。
-recall・未知tool・書込を含むbatchは書込として扱う。認証とworkspace認可は省略しない。
+ChatGPT administration, direct answers, the read-only weekly preview, and `POST /recall` are forwarded to `mcp-v1` after authentication. REST search checks the actual 32 KiB body limit before forwarding. The same REST implementation reapplies identity, scope, and write admission for usage/recall_log. Search and summary-response parsing move out of the public Worker's CPU allowance. Relocation is distinct from reducing total computation. Reuse the fork lexical Segmenter and UTF-8 counts for short terms while retaining upstream tokenizer and search-result contracts. Do not add shared caches of search terms, content, or user information. Response bodies, including JSON, retain the DO execution context until transmission finishes or disconnects, preventing RPC interruption.
 
-DOの無操作時稼働を防ぐため、MCPはstateless/JSON/keepAliveMs=0に加え、
-SDKの `maxSubscriptions=0` でmodern `subscriptions/listen` の常時SSEを無効にする。
-keep-aliveの無効化だけでは購読streamは閉じない。legacy GETは実SDKが405で閉じ、
-通常の有限tools/call/listは維持する。ブラウザを開いたままにする購読接続は作らない。
+Other REST paths and the other four cron schedules keep their existing execution locations. Nightly RPC waits until D1 admission release and all dynamically scheduled background work finish. RPC failure does not fall back to duplicate execution in the Worker. No new class, binding, migration, DO content storage, alarm, or queue is added.
 
-夜間専用RPCはimport開始から背景処理・解放まで実時間5分を上限とし、
-期限超過で `ctx.abort(..., { retryAlarm: false })` により専用objectを強制終了する。
-Promiseの待機だけをやめて裏のI/Oを残す方式ではない。同時nightly呼出は拒否し、
-新しい呼出で最初の期限を延長しない。正常終了・通常例外では必ずタイマーを解除する。
-MCP用objectにはこの停止を適用しない。強制終了ではfinallyの解放を保証できないため、
-既存の期限付きadmission（最終更新から16分）、CAS、journal、次回回復経路を維持する。
-完了済みD1書込を巻き戻したり、途中処理を即時再試行したりしない。
-この5分は1回の夜間稼働の上限であり、アカウント全体の日次費用上限ではない。
+Keep MCP response-schema compatibility in `mcp/sanitize.ts` byte-identical to upstream. Fork write-admission checks remain in `mcp/handler.ts`. Allow protocol requests and eight pure reads: get, list_projects, list_recent, get_hot_context, get_prompt_capsule, connections, history, and list_teams. Treat recall, unknown tools, and batches containing writes as writes. Authentication and workspace authorization still apply.
 
+To avoid idle DO activity, MCP is stateless, uses JSON and keepAliveMs=0, and sets SDK `maxSubscriptions=0` to disable persistent modern `subscriptions/listen` SSE. Disabling keep-alive alone does not close subscription streams. The real SDK closes legacy GET with 405 while preserving finite tools/call/list requests. Do not create subscriptions that remain open with a browser tab.
 
-## 設定済みbindingの責任
+Nightly-only RPC has a five-minute wall-clock limit from import start through background work and admission release. On expiry, `ctx.abort(..., { retryAlarm: false })` terminates the dedicated object rather than merely abandoning a promise while I/O continues. Concurrent nightly calls are rejected and cannot extend the first deadline. Normal completion and exceptions clear the timer. This termination does not apply to the MCP object. Since forced termination cannot guarantee finally-block release, retain expiring admission (16 minutes after its last update), CAS, journals, and subsequent recovery paths. Do not roll back completed D1 writes or immediately retry interrupted work. Five minutes bounds one nightly invocation, not total daily account cost.
 
-`wrangler.jsonc`を配備設定の正本とする。以下は同じ設定を人間向けに説明する表であり、
-新しい設定ファイルや汎用プラグイン基盤を作らない。binding名の一致をunit testで検査する。
+## Configured binding responsibilities
+
+`wrangler.jsonc` is authoritative for the shared deployment configuration. These tables explain it for readers; they do not introduce another configuration file or generic plugin framework. Unit tests check binding-name parity.
 
 <!-- runtime-bindings:start -->
-| Binding | 種別 | 責任・欠落時の扱い |
+| Binding | Type | Responsibility and behavior when unavailable |
 | --- | --- | --- |
-| `DB` | D1 | 本文、tags、tier、関係、履歴、write admission、復元cursor、削除台帳の正本。必須。 |
-| `VECTORIZE` | Vectorize | 固定128次元の再生成可能な派生索引。障害時の文字検索は完全な検索品質を保証しない。 |
-| `AI` | Workers AI | 固定EmbeddingGemma。ChatGPT未選択の構成では既存推論も担当。利用枠不足時は既存の縮退・回復処理を使う。 |
-| `OAUTH_KV` | KV | OAuth、外部連携、quota観測、補助cache等。本文の正本やD1との同時点snapshotではない。 |
-| `ARCHIVE` | R2 | privateな手動brain-v5 backup/restore。未設定時のbackup APIは503。通常保存とのdual-writeはしない。 |
-| `MCP_EXECUTOR` | Durable Object | MCPと夜間処理のCPU隔離。別object名で実行。現行配備の運用要件。ローカルfallbackがあっても削除を推奨しない。 |
-| `ASSETS` | Workers Assets | 同一WorkerのUI資産。Dashboard経路の認証はWorker側で先に処理する。 |
+| `DB` | D1 | Authoritative content, tags, tiers, relationships, history, write admission, restore cursors, and deletion records. Required. |
+| `VECTORIZE` | Vectorize | Rebuildable fixed 128-dimensional derived index. Lexical degradation during outages does not guarantee full search quality. |
+| `AI` | Workers AI | Fixed EmbeddingGemma, plus existing inference when ChatGPT is unselected. Existing degradation/recovery applies when quota is exhausted. |
+| `OAUTH_KV` | KV | OAuth, external integrations, quota observations, auxiliary caches. Neither authoritative memory content nor a point-in-time snapshot with D1. |
+| `ARCHIVE` | R2 | Private manual brain-v5 backup/restore. Backup APIs return 503 when unconfigured. No dual writes with normal persistence. |
+| `MCP_EXECUTOR` | Durable Object | CPU isolation for MCP and nightly work using separate object names. An operational requirement of the current deployment; local fallback does not make removal advisable. |
+| `ASSETS` | Workers Assets | UI assets on the same Worker. The Worker authenticates dashboard routes first. |
 <!-- runtime-bindings:end -->
 
-Accessはbindingではなく、次のsecretと `src/lib/cloudflare-access.ts` による認証境界である。
-現行configの `secrets.required` は次のとおり。値は文書・ログ・テストへ保存しない。
+Access is an authentication boundary using the following secrets and `src/lib/cloudflare-access.ts`, not a binding. The current configuration's `secrets.required` is listed below. Do not store values in documentation, logs, or tests.
 
 <!-- deployment-secrets:start -->
-| Secret | 用途 |
+| Secret | Purpose |
 | --- | --- |
-| `AUTH_TOKEN` | 既存の認証契約 |
-| `ACCESS_TEAM_DOMAIN` | Accessの検証先 |
-| `ACCESS_AUD` | MCP等のAccess audience |
-| `DASHBOARD_ACCESS_AUD` | DashboardのAccess audience |
-| `ACCESS_ALLOWED_EMAIL` | 許可する利用者 |
+| `AUTH_TOKEN` | Existing authentication contract |
+| `ACCESS_TEAM_DOMAIN` | Access validation domain |
+| `ACCESS_AUD` | Access audience for MCP and related paths |
+| `DASHBOARD_ACCESS_AUD` | Dashboard Access audience |
+| `ACCESS_ALLOWED_EMAIL` | Allowed user |
 <!-- deployment-secrets:end -->
 
-`CHATGPT_CREDENTIAL_KEY`は直接接続を使う所有者だけが設定する任意secret。通常起動の必須secretには含めない。
+`CHATGPT_CREDENTIAL_KEY` is optional and configured only by owners using direct access. It is not required for normal startup.
 
-PR #117を2026-10-01に本番反映し、生成のVPS経路を撤去した。VPC binding、旧adapter、CLIProxyの旧選択設定と
-API key要件は持たず、直接接続の通常モデルは `CHATGPT_MODEL` で選ぶ。
-自己配備と更新の手順は `DEPLOYMENT.md` を参照する。
-候補の生成モデルと選択処理は以下のとおり。
+PR #117 was deployed on 2026-10-01 and removed the VPS generation path. There is no VPC binding, legacy adapter, CLIProxy selection setting, or API-key requirement. `CHATGPT_MODEL` selects the normal direct-connection model. See `DEPLOYMENT.md` for self-hosting and updates. Candidate generation models and operations are:
 
-| operation | モデル | 障害時 |
+| Operation | Model | Failure behavior |
 | --- | --- | --- |
-| classify | gpt-5.6-luna（CHATGPT_MODEL） | 分類は未処理のまま |
-| recall-summary / answer | gpt-5.6-luna（CHATGPT_MODEL） | 要約は空、回答開始失敗は503、途中失敗はストリームエラー |
-| smart-merge / contradiction | gpt-5.6-terra | 統合見送り、矛盾未判定 |
-| digest / weekly-insight | gpt-5.6-terra | ダイジェスト保存見送り、週次候補は再試行可能 |
+| classify | gpt-5.6-luna (CHATGPT_MODEL) | Classification remains pending |
+| recall-summary / answer | gpt-5.6-luna (CHATGPT_MODEL) | Empty summary; 503 if answer startup fails; stream error on interruption |
+| smart-merge / contradiction | gpt-5.6-terra | Skip merging; contradiction remains undetermined |
+| digest / weekly-insight | gpt-5.6-terra | Skip digest persistence; weekly candidates remain retryable |
 
-`CHATGPT_OPERATIONS`の明示選択を維持し、選択済み処理の障害でWorkers AIへ自動fallbackしない。
+Keep explicit `CHATGPT_OPERATIONS` selection. Failed selected operations do not automatically fall back to Workers AI.
 
-2026-09-30に公開Responses APIへのChatGPT直接接続を追加した。
-`CHATGPT_OPERATIONS`へ明示した処理だけを直接接続へ送り、未選択の処理は上流のWorkers AI経路を使う。
-新規導入の既定は未選択。`CHATGPT_OWNER_WORKSPACE_ID`と資格情報内のowner束縛が一致し、
-実際の範囲が所有者の個人workspaceだけの場合に限って選択した処理を直接接続へ送る。
-Team・member・別admin・範囲不明・混在は通常のWorkers AIを使う。
-現行4.0のquery-tagsは既知タグの照合で、LLM呼出しを復活させない。
-呼出元は`src/lib/chatgpt.ts`へ直接依存し、処理ごとの有限予算と保存JSONの検証も同じmoduleが所有する。
-モデル選択と保存判断のJSON検証は変えず、直接接続の障害でも他のproviderへ自動fallbackしない。
-初回認証はローカルの127.0.0.1 callbackで行い、署名・issuer・audience・nonceを検証して
-Workerが保持するstable hostで認証し、資格情報を所有者専用APIへ転送する。WorkerもID/access tokenの署名とgrantを検証する。
-接続管理APIと固定promptのprobeは所有者認証後に既存`mcp-v1` DOへforwardする。
-直接接続の`/chat`も利用者認証後に同じDOへ送り、資格情報の復号・ResponsesのSSE解析を公開Workerの10 ms枠から隔離する。
-転送は入口での認証・本文上限確認の直後に行い、DB初期化と回答用の利用者情報取得はDOで行う。
-回答SSEの転送はDOのwaitUntilで完了・切断まで追跡し、RPC返却後も実行文脈と生成ログを保持する。
-DOは資格情報を永続化せず、binding・class・cron・Gemma128を追加・変更しない。
-公開Responsesは`store:false`、`stream:true`で呼び、systemをdeveloperへ変換する。
-`response.completed`だけを成功として扱い、failed/incomplete/切断・不正JSON・出力超過は拒否する。
-previewでは`max_output_tokens`を送れない。既存の入力・期限と、要求token数×8のローカル文字上限、
-SSE全体256 KiBの上限で中止する。従来のserver側token上限や実消費の保証とは異なる。
+Direct ChatGPT access through the public Responses API was added on 2026-09-30. Only operations explicitly listed in `CHATGPT_OPERATIONS` use it; unselected operations use upstream Workers AI. New installations default to no selection. Direct dispatch requires matching `CHATGPT_OWNER_WORKSPACE_ID` and credential owner binding, with actual scope limited to the owner's personal workspace. Team, member, other-admin, unknown, and mixed scopes use normal Workers AI. Current 4.0 query-tags matches known tags; do not restore an LLM call.
 
-`src/lib/chatgpt-session.ts`はowner接続時に専用D1 table `chatgpt_session`を作る。
-memory schema versionは変えず、entries/edgesのwrite fenceとは分離する。
-資格情報全体をランダムIVと固定AADのAES-256-GCMで暗号化する。鍵はWorker secretに置き、
-R2 brain-v5 backup/exportへ資格情報も鍵も含めない。D1 Time Travelには暗号文が残る。
-D1のprimary上の条件付きUPDATEで更新を排他し、replacementをrevision付きで原子的に保存する。
-結果が不確かなrefreshを再送しない。中断した更新は再認証が必要になり得る。
-接続・probe・失効と復旧手順は[CHATGPT_DIRECT.md](CHATGPT_DIRECT.md)を参照する。
+Callers depend directly on `src/lib/chatgpt.ts`, which also owns per-operation bounded budgets and persistence-JSON validation. Preserve model selection and JSON validation of persistence decisions; direct-access failures never automatically switch providers. Initial authentication uses a local 127.0.0.1 callback with signature, issuer, audience, and nonce validation, authenticates for the Worker's stable host, and transfers credentials to an owner-only API. The Worker also verifies ID/access token signatures and grant.
 
-検索要約・ダイジェスト・週次推論の単純テキスト生成は、既存`src/lib/ai.ts`の
-`generateText`で接続先を選ぶ。プロンプト、トークン上限、Workers AI用のモデルは呼出元が渡し、
-週次推論は`INSIGHT_LLM_MODEL`を維持する。結果の解釈・trim・失敗時の空応答や再試行可否は
-呼出元に残す。分類のquota記録、smart mergeのJSON契約、chatのSSEはこの関数へ統合しない。
-生成の共通化に新しいcache・再試行・状態・依存・bindingは追加しない。
-全選択時もGemma128埋め込みはWorkers AIを使う。無料枠枯渇が絶対に起きない保証ではない。
-本文・認証情報を記録せず、`ai_provider_call`にoperation/model/status/latencyを記録する。
-短文処理は15秒、追加生成処理は25秒、入力と出力は処理別に制限する。超過入力を切り詰めて保存判断に使わない。
-生成本文は完了イベント、空本文、保存判断のJSON型を検査する。
-回答はsystem/userの役割を保持したSSEへ変換し、完了前にstopやDONEを返さない。
+Connection-management APIs and fixed-prompt probes forward to existing `mcp-v1` after owner authentication. Direct `/chat` likewise forwards after user authentication, isolating credential decryption and Responses SSE parsing from the public Worker's 10 ms allowance. Forward immediately after entry authentication and body-limit checks; DB initialization and answer-user lookup happen inside the DO. DO waitUntil tracks answer SSE through completion/disconnect, retaining execution context and generation logs after RPC returns. The DO does not persist credentials or add/change bindings, classes, cron schedules, or Gemma128.
 
-## 上流とフォークの分担
+Call public Responses with `store:false`, `stream:true`, and system converted to developer. Only `response.completed` counts as success; reject failed/incomplete streams, disconnects, invalid JSON, and excess output. Preview does not accept `max_output_tokens`. Existing input limits and deadlines, a local character cap of requested tokens × 8, and a total SSE limit of 256 KiB bound processing. These differ from a server-enforced token limit or a guarantee about actual consumption.
 
-| 責任 | 実装の正本 | 変更時に守ること |
+`src/lib/chatgpt-session.ts` creates dedicated D1 table `chatgpt_session` during owner connection without changing the memory schema version; it is separate from entries/edges write fences. Encrypt the entire credential with AES-256-GCM, a random IV, and fixed AAD. The key is a Worker secret. R2 brain-v5 backups/exports contain neither credentials nor the key, while D1 Time Travel retains ciphertext. Conditional UPDATE on D1 primary serializes refresh and atomically stores the replacement with a revision. Do not resend uncertain refreshes; interrupted refresh may require reauthentication. See [CHATGPT_DIRECT.md](CHATGPT_DIRECT.md) for connection, probes, revocation, and recovery.
+
+Simple text generation for recall summaries, digests, and weekly reasoning selects the provider through existing `generateText` in `src/lib/ai.ts`. Callers supply prompts, token limits, and Workers AI models; weekly reasoning retains `INSIGHT_LLM_MODEL`. Interpretation, trimming, empty responses on failure, and retry eligibility remain with callers. Do not fold classification quota records, smart-merge JSON contracts, or chat SSE into this function. Shared generation adds no new cache, retry, state, dependency, or binding.
+
+Gemma128 embeddings continue using Workers AI even when every operation is selected; this does not guarantee free allowances will never be exhausted. Record operation/model/status/latency in `ai_provider_call`, without content or authentication information. Short operations have 15-second deadlines; additional generation operations have 25 seconds. Inputs and outputs have per-operation bounds. Do not truncate oversized input and use it for persistence decisions. Validate completion events, empty text, and persistence-JSON types. Convert answers to SSE while preserving system/user roles, and do not emit stop or DONE before completion.
+
+## Upstream and fork responsibilities
+
+| Responsibility | Authoritative implementation | Constraints on changes |
 | --- | --- | --- |
-| 基礎tokenizer・graph・通常recall | active upstream | `src/text/tokenize.ts` はbyte-identical。上流が同等機能を実装したら独自部分を縮める。 |
-| 固定embedding profile | `src/embedding/profile.ts` | `embeddinggemma-mrl128-v1`、128次元、query/document入力、閾値を一組として扱う。 |
-| 日本語・識別子のD1検索制約 | `src/text/lexical-query.ts` と既存recall | 上流scoringを複製しない。FTS5で全probeを表現できる語だけ派生索引へ送り、複合語・CJK bigramは従来のLIKEへ送る。128候補は走査・課金行数の上限ではない。 |
-| write admission / migration / restore barrier | `src/migration/write-lock.ts` とD1 trigger | 保存・削除・graph更新が共通契約を通る。保護を無効化して差分を減らさない。 |
-| 不要vectorの削除と再試行 | `src/vectorize/cleanup.ts` | D1台帳、参照確認、capability更新、mutation receipt、再確認、ページ上限を一か所に置く。 |
-| 保存・更新・追記の調停 | `src/capture/store.ts` | cleanupを呼び、本文のCAS・before-image・graph更新順序を維持する。 |
-| 履歴・論理tier・rollover | `src/memory/` の既存fork module | D1を正本とし、tier変更だけでvectorを再生成しない。 |
-| Prompt Capsule | `src/prompt-capsule/` と既存route/tool | 決定性・認可・既存APIを維持。利用価値を測らず削除しない。 |
-| HTTP運用保護・ChatGPT直接接続・MCP隔離 | 既存fork module | 上流共通helperへ独自ロジックを戻さない。外部接続には別の運用責任がある。 |
-| 有限bodyの読取 | `src/lib/body.ts` | バイト上限・中止通知・reader解放だけを共通化する。HTTP応答、認証、provider、Envへ依存しない。 |
+| Base tokenizer, graph, ordinary recall | Active upstream | Keep `src/text/tokenize.ts` byte-identical. Reduce fork code when upstream provides equivalent functionality. |
+| Fixed embedding profile | `src/embedding/profile.ts` | Treat `embeddinggemma-mrl128-v1`, 128 dimensions, query/document inputs, and thresholds as one unit. |
+| D1 search constraints for Japanese and identifiers | `src/text/lexical-query.ts` and existing recall | Do not duplicate upstream scoring. Use the derived index only when FTS5 can express every probe; compounds and CJK bigrams retain LIKE. A 128-candidate cap is not a scan or billed-row cap. |
+| Write admission, migration, restore barrier | `src/migration/write-lock.ts` and D1 triggers | Persistence, deletion, and graph updates share one contract. Do not disable protection to reduce differences. |
+| Obsolete-vector deletion and retry | `src/vectorize/cleanup.ts` | Centralize D1 records, reference checks, capability refresh, mutation receipts, rechecks, and page limits. |
+| Store, update, append coordination | `src/capture/store.ts` | Call cleanup while preserving source CAS, before-images, and graph-update ordering. |
+| History, logical tiers, rollover | Existing fork modules in `src/memory/` | D1 is authoritative; a tier change alone does not regenerate vectors. |
+| Prompt Capsule | `src/prompt-capsule/` and existing route/tool | Preserve determinism, authorization, and existing APIs. Do not remove it without assessing utility. |
+| HTTP operational protection, direct ChatGPT, MCP isolation | Existing fork modules | Do not move fork logic back into upstream common helpers. External connections have separate operational ownership. |
+| Bounded body reading | `src/lib/body.ts` | Share only byte limits, abort notification, and reader release. Do not depend on HTTP responses, authentication, providers, or Env. |
 
-HTTP入力・Notion JSON・Calendar ICS・ChatGPTの認証・モデル一覧JSONは同じ読取処理を使う。
-HTTPの呼出別上限、Notion 128 KiB、Calendar 32 KiB、ChatGPTの認証JSON 128 KiB・モデル一覧2 MiBは呼出元が決める。
-Content-Lengthを信用せず実バイト数も検査し、超過時は読取を中止する。中止処理の失敗や停滞で
-元のサイズ拒否を失わず、取得したreaderは成功・失敗のどちらでも解放する。
-非有限・不正な宣言値は早期拒否の根拠にせず、実バイト数で判定する（Notion/CalendarのInfinity宣言も含む）。
-HTTP 400/413への変換、JSON解析、ICS複雑度検査、ChatGPTの期限とエラー分類は各呼出元に残す。
-読取moduleはタイマーや常設接続を追加しない。全ログ呼出元はobservabilityを直接参照し、httpからの互換再公開は撤去した。
+HTTP input, Notion JSON, Calendar ICS, and ChatGPT authentication/model-catalog JSON share the reader. Callers choose limits: per-HTTP-call bounds, Notion 128 KiB, Calendar 32 KiB, ChatGPT auth JSON 128 KiB, and catalog 2 MiB. Check actual bytes rather than trusting Content-Length, and stop on overflow. Cancellation failure or stalling must not mask the original size rejection; always release an acquired reader. Nonfinite or malformed declared lengths are not grounds for early rejection; decide using actual bytes, including Infinity from Notion/Calendar. HTTP 400/413 mapping, JSON parsing, ICS complexity checks, and ChatGPT deadlines/error classification remain with callers. The reader adds no timers or permanent connections. Log callers import observability directly; compatibility re-exports from http were removed.
 
-cleanup moduleは `Env` の型、write-lock、呼出単位の `runtime/d1-budget` だけをimportし、
-capture orchestrationへ依存しない。予算moduleのimportはEnvの型のみで、別サービスや永続台帳を作らない。
-drain・bulk submit・schedule定数はcron・migration・adminからcleanupを直接参照する。
-`store.ts` の互換再公開は撤去し、削除台帳・receipt・ページ上限の実装は維持する。
-`lifecycle.ts`のforget/deprecateも確定後の索引削除を`submitLifecycleVectorCleanup()`へ委譲する。
-本文CAS・履歴を含む削除transaction・公開結果と非致命的なログはlifecycle側に残す。
-この経路は1回だけ送信し、従来の配列形式の台帳を60秒後の再確認へ残す。空配列は
-既存のdelete marker＋DELETE batchで消す。通常cleanupの3回再送・receipt形式とは区別し、
-権限更新→任意hook→遠隔削除→台帳更新の順序を維持する。
+The cleanup module imports only the Env type, write-lock, per-invocation `runtime/d1-budget`, constants, and the batch module; it does not depend on capture orchestration. The budget module imports only the Env type and creates no service or persistent ledger. Cron, migration, and admin import drain, bulk-submit, and scheduling constants directly from cleanup. Compatibility re-exports from `store.ts` were removed while preserving deletion-ledger, receipt, and page-limit implementations.
 
-権限解放の3回retryは`migration/write-lock.ts:releaseMemoryWriteAdmissionWithRetry()`が正本。
-通常要求の応答終端/waitUntil追跡と解放用Envは`beginMemoryWriteAdmission()`が持ち、
-認証初期化は必要時だけ権限を取得して同じ解放を使う。失敗時のログは各callerに残し、
-確定した処理を500へ変えず、既存の16分TTLを維持する。
+Lifecycle forget/deprecate also delegates post-commit index deletion to `submitLifecycleVectorCleanup()`. Source CAS, the deletion transaction including history, public results, and nonfatal logs remain in lifecycle. This path submits once and leaves its legacy array-form ledger for a recheck after 60 seconds. Empty arrays are cleared through the existing delete marker plus DELETE batch. Keep this distinct from ordinary cleanup's three retries and receipt format, preserving capability refresh → optional hook → remote deletion → ledger update ordering.
 
-entry/edgeのimportで使うwrite fence判定は、既存`isMemoryWriteFenceError()`が正本。
-batchでロック拒否を受けた場合は逐次fallbackへ進まない。SQL生成と結果処理は上流と
-同じ配置を維持し、個別行の失敗、hook、ページ上限、SQL本数、復元leaseの扱いを変えない。
+The authoritative three-attempt admission release is `migration/write-lock.ts:releaseMemoryWriteAdmissionWithRetry()`. `beginMemoryWriteAdmission()` owns ordinary response-end/waitUntil tracking and the release Env. Authentication initialization acquires admission only when needed and uses the same release. Failure logging remains with callers; do not turn a committed operation into HTTP 500. Retain the existing 16-minute TTL.
 
-通常更新と索引障害時の更新は、既存 `src/memory/history.ts` の
-`commitSourceWithHistory()` で「旧版INSERT → 本文UPDATE → 履歴edge」の1 batchを共有する。
-本文のCAS条件・成功判定・遠隔処理との順序は引き続き `store.ts` が決める。
-履歴なしの更新は従来どおり本文UPDATEのrunだけを実行し、再試行や新しい書き込み権限を追加しない。
-これで書き込み保護全体が分離されたわけではない。本文CASと遠隔更新の調停は依然として残る。
+Entry/edge import uses existing `isMemoryWriteFenceError()` for fence classification. A batch rejected by the lock must not proceed to sequential fallback. Keep SQL generation and result handling in their upstream locations; preserve individual-row failures, hooks, page limits, SQL counts, and restore-lease behavior.
 
-派生cacheのD1世代番号は、既存の調停module `migration/write-lock.ts` に置く。
-世代番号の全呼出元は調停moduleを直接参照し、`migration/embedding.ts` の互換再公開は撤去済み。
-これにより `store → vocabulary → embedding migration → store` の実行時import循環を解く。
-世代番号のtable/key、作成時の競合処理、reset時の更新、SQL本数は変えず、新moduleも増やさない。
+Normal updates and index-failure updates share existing `src/memory/history.ts:commitSourceWithHistory()` for one batch: old-version INSERT → source UPDATE → history edge. `store.ts` still decides source CAS conditions, success detection, and ordering relative to remote operations. Updates without history execute only the existing source UPDATE run, without adding retries or new admission. Write protection is not fully separated by this extraction: source CAS and remote-update coordination remain.
 
+Derived-cache D1 generations belong to existing coordinator `migration/write-lock.ts`. All generation callers import it directly; compatibility re-exports from `migration/embedding.ts` were removed. This breaks the runtime cycle `store → vocabulary → embedding migration → store` without changing generation tables/keys, creation-race handling, reset updates, SQL counts, or adding modules.
 
-## 正本・復旧・運用の境界
+## Source of truth, recovery, and operations
 
-Hot/Warm/ColdはD1の論理状態で、Cold本文をR2へ退避しない。Coldも通常recallから自動除外しない。
-VectorizeはD1から再生成する派生索引で、異なるprofileを同じindexへ混ぜない。
+Hot/Warm/Cold are logical D1 states; Cold content is not offloaded to R2 or automatically excluded from normal recall. Vectorize is rebuildable from D1; never mix different profiles in one index.
 
-HTTP exportの生成前見積り・生成後byte検査は`entries/export.ts`が担当し、
-`routes/entries.ts`はR2実装を参照しない。内部例外は`ExportError`とし、
-409/413のHTTP応答文言とpaged案内を維持する。完全exportの500行・見積り512 KiB・
-生成後768 KiBはここを正本とする。`backup/r2.ts`は旧定数名を同じ値のaliasとして
-直接importし、旧brain-v2復元の制限を保つ。互換再exportは撤去済み。R2操作の例外は従来の`BackupError`を使う。
+`entries/export.ts` owns pre-generation estimates and post-generation byte checks for HTTP export; `routes/entries.ts` does not import R2 implementation. Internal failures use `ExportError`, preserving HTTP 409/413 wording and paged guidance. This module owns the complete-export limits of 500 rows, estimated 512 KiB, and actual 768 KiB. `backup/r2.ts` imports the same values under legacy constant aliases to preserve brain-v2 restore bounds. Compatibility re-exports were removed. R2 failures retain `BackupError`.
 
-4.0統合branchはschema 9と上流entry_versions／entries_trash／recall_logを採用する。
-R2の現行形式は `brain-v5`。entry・型付きedge・Projects設定と4テーブルの履歴をchunk/manifestで保持し、
-旧 `brain-v2` / `brain-v3` / `brain-v4` も読取り可能。復元はentry・edge・project・historyの
-4種の永続cursorとleaseで再開する。3.7.0の配備済み版はschema 8／brain-v4である。
-Projectsも通常のwrite admissionと復元排他へ参加する。memory-only backupであり、
-OAuth、外部連携の資格情報、workspace定義、利用者config、同期cursor、Vectorize索引は復元しない。
-rowのworkspace ID保持は、workspace定義や認証環境の復元とは別である。
-現行backupは連携の明示切断・mirror除去を前提とする。自動purgeは追加せず、詳細手順は
-`BACKUP_RESTORE.md` に一本化する。実運用の切断・purge・再接続・再埋め込みは別承認で行う。
+The 4.0 integration branch uses schema 9 and upstream entry_versions / entries_trash / recall_log. Current R2 format `brain-v5` stores entries, typed edges, Project settings, and four history tables in chunks/manifests; it also reads `brain-v2` / `brain-v3` / `brain-v4`. Restore resumes with four durable cursors (entries, edges, projects, history) and a lease. The deployed 3.7.0 version used schema 8 / brain-v4. Projects participate in ordinary write admission and exclusive restore. Backups are memory-only: they do not restore OAuth, integration credentials, workspace definitions, user configuration, sync cursors, or Vectorize indexes. Preserving a row's workspace ID is separate from restoring workspace definitions or authentication.
 
-3.2.1の構成も5 cronとし、圧縮・graph・stalenessは一つの夜間枠へ統合する。
-解放した枠を上流のteam weekly triggerへ戻す。backup専用cronや常駐プロセスは追加しない。
-夜間と時間別同期・PushはSQL送信前の共有計数を通り、最初にadmission解放3文を予約する。
-cleanupは開始前に最大8文を予約し、最後は残予算を使う。遠隔操作の受付記録を先に予約する。
-グラフのworkspace別候補はKVのkeyset cursorで進む。未処理・失敗・KV不整合は完了の証拠ではない。
-[夜間予算と繰越](NIGHTLY_D1_BUDGET.md) に保持条件、回帰試験、残る走査量/性能課題を記載する。
-CI成功・ローカルSQLite成功・dry-runは本番CPU、D1課金行数、p95応答時間の測定ではない。
-ソースの統合と各所有者の配備を分ける。配備手順は `DEPLOYMENT.md`、測定条件は `SEARCH_QUALITY.md` を参照する。
+Current backups require explicit integration disconnection and mirror removal. No automatic purge is added. Keep detailed procedures in `BACKUP_RESTORE.md`. Real disconnection, purge, reconnection, and re-embedding require separate authorization.
 
+The 3.2.1 configuration also has five cron schedules, combining compression, graph, and staleness in one nightly slot and returning the freed slot to upstream's team-weekly trigger. No backup cron or resident process is added. Nightly work and hourly sync/Push share pre-dispatch SQL counting and first reserve three statements for admission release. Cleanup reserves up to eight statements before starting; final cleanup uses remaining budget. Reserve remote-operation acceptance records before dispatch. Per-workspace graph candidates advance using KV keyset cursors. Unprocessed work, failure, or KV inconsistency is not evidence of completion. [Nightly budgets and carry-over](NIGHTLY_D1_BUDGET.md) documents preservation rules, regression tests, and remaining scan/performance concerns.
 
-## Workers AI枯渇時の縮退運転（2026-09-08）
+CI success, local SQLite success, and dry runs do not measure production CPU, D1 billed rows, or p95 latency. Source integration and each owner's deployment are separate. See `DEPLOYMENT.md` for deployment and `SEARCH_QUALITY.md` for measurement conditions.
 
-新規保存と追記はD1へ保持し、意味検索用の索引作成を保留する。検索はキーワードへ縮退する。
-新規保存時の分類は処理先で分け、ChatGPTを選択していれば埋め込みの枯渇中も非同期実行する。
-ChatGPT失敗時はWorkers AIへ戻さず未分類のまま保持する。分類成功は埋め込みの回復証拠ではないため、
-Workers AIのquota観測は解除しない。全文置換のupdateは従来どおり失敗時に本文を変えず、回復時刻を返す。
+## Degraded operation during Workers AI exhaustion (2026-09-08)
 
-REST captureの`classification_status`は`scheduled`（非同期受付）または`deferred`（枯渇で延期）。
-`scheduled`は分類成功を保証しない。既存`classification_pending`は枯渇による延期を示す互換フィールドで、
-全ての未完了分類の件数・状態ではない。MCPと画面の保存レシートは保存成功と索引待ちを区別する。
-`/health`の既存`ok`は準備状態の判定を維持し、`status: degraded`と`database.status: reachable`を追加する。
-D1到達は読み取り・初期化経路の確認であり、全ての書込みや外部生成の成功保証ではない。
-`no_known_outage`も能動的なAI成功確認ではなく、既知の障害を観測していない状態である。
+New memories and appends remain in D1 with semantic indexing deferred; search degrades to keywords. New-memory classification follows its selected provider: with ChatGPT selected, it still runs asynchronously during embedding exhaustion. ChatGPT failure leaves the memory unclassified without falling back to Workers AI. Classification success is not evidence of embedding recovery and does not clear Workers AI quota observations. Full-replacement update retains its existing contract: failure leaves content unchanged and returns the recovery time.
 
-索引回復は既存の少量バッチとcron枠を維持し、quota失敗時はそのバッチを停止する。
-手動`/vectorize-pending`は既知のquota中でも一度実問い合わせするため、連打しない。
-`/classify-pending`は外部分類の回復にも使えるが、既存の対象条件（status/kind未付与）を変えない。
-D1/Workers本体の無料枠枯渇まで継続できる二重基盤やオフライン同期は今回追加しない。
+REST capture reports `classification_status` as `scheduled` (accepted asynchronously) or `deferred` (postponed by exhaustion). Scheduled does not guarantee classification success. Existing `classification_pending` is a compatibility field for exhaustion deferral, not a count/state of all incomplete classification. MCP/UI receipts distinguish storage success from pending indexing. `/health` retains the existing readiness meaning of `ok` and adds `status: degraded` and `database.status: reachable`. D1 reachability verifies read/initialization paths, not all writes or external generation. `no_known_outage` is a passive absence of observed outages, not an active AI-success check.
 
-AIだけが回復してもタグ検索で未索引の新規記憶を失わないよう、既存のタグ候補内で
-`vector_ids=[]`かつ全検索語が明確に字面一致する行を統合候補へ戻す。
-未索引救済では`Cedarの移行`や`SB-024を反映`の日本語と識別子の文字種境界も認めるが、
-`Cedarwood`や`SB-0249`等の部分一致は認めず、通常の検索重みは変えない。
-AIの可用性によらず、取得済みのD1適格性（workspace、タグ、kind、期間、廃止状態）で
-MMRの上位選択前に除外し、対象外の行が必要な候補の枠を消費することを防ぐ。
-候補数・SQL本数・workspace/時刻/kind/statusの絞り込みは変えない。
-通常のタグなし検索の順位問題や、索引済み記憶の追記部分の検索保証を解決する変更ではない。
+Index recovery retains existing small batches and cron slots, stopping a batch on quota failure. Manual `/vectorize-pending` makes one real request even during a known quota outage; do not repeatedly trigger it. `/classify-pending` can also recover external classification, with existing eligibility (missing status/kind) unchanged. This work adds no second platform or offline synchronization to survive exhaustion of D1/Workers allowances themselves.
 
-`/stats`の既存集計で`oldest_unvectorized_at`を返す。猶予期間と廃止済みを除く
-新規未索引記憶の最古作成日時であり、追記passageの待ち時間ではない。
-画面は既存の合計待ち件数とこの経過時間を表示し、手動修復は1操作で1バッチのみ実行する。
-直近の処理・失敗・残件を表示し、残件があっても自動で次バッチを送らない。
-復元フローの複数バッチ処理は別の既存契約として維持する。
+To retain newly stored, unindexed memories in tagged search after AI recovers, return rows with `vector_ids=[]` and clear lexical matches for every query term to the merged candidate pool within existing tag candidates. This rescue accepts script boundaries between Japanese and identifiers, such as `Cedarの移行` or `SB-024を反映`, but rejects substrings such as `Cedarwood` or `SB-0249`; normal search weights stay unchanged. Regardless of AI availability, filter using already-fetched D1 eligibility (workspace, tag, kind, time, deprecated state) before MMR top selection so ineligible rows cannot consume needed slots. Candidate counts, SQL counts, and workspace/time/kind/status filters are unchanged. This does not solve ordinary untagged ranking or guarantee retrieval of appended text in already-indexed memories.
 
-生成の言語・根拠・引用は`experiments/answer-quality`の合成固定2ケースで確認する。
-機械検査と目視評価を分け、モデル変更や自動再生成は追加しない。
-この改善をIssue #54の固定比較用source・fixtureへ混ぜない。
+Existing `/stats` aggregation returns `oldest_unvectorized_at`: the oldest creation time of newly unindexed memories outside the grace period and excluding deprecated rows, not append-passage waiting time. The UI shows total pending count and age. Each manual repair action runs one batch and reports recent work, failures, and remaining items without automatically submitting another batch. Restore's multi-batch flow retains its separate contract.
 
-検索連続性の回帰試験は、保存済みの合成行から実際の`/vectorize-pending`へ進む。
-枯渇時の1件失敗での停止、復旧後の埋め込み・Vectorize upsert・D1更新、再検索、
-write admission解放まで確認する。AIとVectorizeはテスト用応答で、実サービス品質の証拠ではない。
-従来のSQLによる索引済み状態の直接設定は、この回帰試験から除去した。
+Generation language, evidence, and quotations are checked with two fixed synthetic cases in `experiments/answer-quality`. Separate mechanical checks from human review; do not add model changes or automatic regeneration. Keep this improvement out of Issue #54's fixed comparison source and fixtures.
 
-上流所有の正本は監査の `UPSTREAM_OWNED_PATHS`。Projectsのfilter/resolveを追加し、
-既存のPrompt Capsule本体・routeなどとともに上流との完全一致を必須とする。
-Projectsのregistry/autocreateに残るwrite admission等は引き続きfork境界として保守する。
-夜間SQL予算はFree/ Paidの明示定数を使い、未使用の旧名 `NIGHTLY_D1_SQL_LIMIT` は撤去した。
+Search-continuity regression tests start from stored synthetic rows and call the real `/vectorize-pending` route. They check stopping after one quota failure, then recovered embedding, Vectorize upsert, D1 update, repeat search, and admission release. AI and Vectorize use test responses; this is not evidence of live-service quality. Direct SQL assignment of indexed state was removed from this regression test.
 
-## 3.5.0の期限と通知
+`UPSTREAM_OWNED_PATHS` is authoritative for upstream ownership. Project filter/resolve were added alongside existing Prompt Capsule implementation/routes and must match upstream exactly. Project registry/autocreate write admission remains a fork boundary. Nightly SQL budgets use explicit Free/Paid constants; the unused legacy `NIGHTLY_D1_SQL_LIMIT` name was removed.
 
-期限4列はD1 entriesの正本であり、capture・MCP追記・snooze/clear・夜間抽出が
-既存admissionとsource更新triggerを通る。MCP追記は本文と期限を一緒にCAS確定する。
-HTTP export / R2 brain-v5は任意列として期限を保持し、旧形式はnullにする。
-夜間抽出はworkspace別cursor、最大2モデル呼出、古さの再判定も2件ずつとする。
-失敗・競合・予算不足では完了summaryを作らず、cursorを残して次回に繰り越す。
+## Deadlines and notifications in 3.5.0
 
-Push購読はD1 push_subscriptions、VAPID鍵と配達補助状態は既存OAUTH_KVに置く。
-これらの資格情報は記憶export/backupから除外する。追加のbinding/cronは持たない。
-時間別同期後のPushは同じ50 SQL予算からworkspaceごと6文を予約し、
-1回4 workspace・40送信まで。途中の端末はKV配達記録で再開する。
-KVの結果整合性と外部配達があるため、厳密な一度きり配達の保証ではない。
-AI回復専用時刻は従来の回復処理に使い、通知は通常同期時刻で行う。
+Four deadline columns are authoritative in D1 entries. Capture, MCP append, snooze/clear, and nightly extraction pass through existing admission and source-update triggers. MCP append commits content and deadline together through CAS. HTTP export / R2 brain-v5 retain deadlines as optional columns; legacy formats set them to null. Nightly extraction uses per-workspace cursors, at most two model calls, and stale reassessment in batches of two. Failure, conflict, or insufficient budget does not produce a completion summary; retain the cursor for the next run.
 
-期限通知の候補は日時・IDで巡回し、workspaceも送信上限にかかわらず巡回する。
-配達途中の成功端末を保持し、失敗端末は次回の定期巡回で再試行する。
-配達記録の整理はD1の現存期限と1回30記録を照合する。30日を超えた期限も、
-現在の記憶に同じ期限が残っている限り配達記録を保持する。
-夜間の期限抽出は末尾到達の次回から再走査する。古い記憶のタスク化を拾う一方、
-候補2件のモデル予算を維持する。正常な辞退判断だけは入力の指紋で最大30日再利用し、
-モデルの再実行を省略する。本文・タグ・workspace・モデル・timezone・判定方針が変わると
-次の走査で再評価する。本文やモデル出力はキャッシュに保存しない。
-キャッシュは既存KVの補助状態であり、欠落・破損・障害・期限切れは通常の判定へ戻る。
-モデル失敗と必須判定のない応答はキャッシュせず、失敗回数も入力ごとに分ける。
-D1列・SQL・依存は追加せず、候補ごとのKV読取と正常な辞退判断のKV書込だけを追加する。
+Push subscriptions are in D1 push_subscriptions; VAPID keys and delivery support state use existing OAUTH_KV. Exclude those credentials from memory exports/backups. Add no binding or cron. After hourly sync, Push reserves six statements per workspace from the shared 50-SQL budget, with at most four workspaces and 40 sends per invocation. Resume partial device delivery from KV records. KV eventual consistency and external delivery preclude strict exactly-once guarantees. Dedicated AI-recovery times remain for recovery; notifications run at normal sync times.
+
+Deadline candidates rotate by date/time and ID; workspaces rotate regardless of send limits. Preserve successful devices during partial delivery and retry failed devices on the next scheduled pass. Delivery-record cleanup compares at most 30 records with current D1 deadlines. Keep records even for deadlines older than 30 days while the same deadline remains on the current memory.
+
+Nightly deadline extraction restarts scanning on the invocation after reaching the end, catching old memories newly classified as tasks while retaining the two-candidate model budget. Reuse only successful abstention decisions by input fingerprint for at most 30 days to skip model reruns. Changes to content, tags, workspace, model, timezone, or decision policy force reassessment on the next scan. Cache no content or model output. This is auxiliary state in existing KV; missing, corrupt, unavailable, or expired cache falls back to normal assessment. Do not cache model failures or responses lacking required decisions; track failure counts per input. Add no D1 columns, SQL, or dependencies—only per-candidate KV reads and writes for successful abstentions.

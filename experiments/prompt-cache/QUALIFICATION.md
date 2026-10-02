@@ -1,26 +1,24 @@
-# Prompt Cache経路認定
+# Prompt-cache path qualification
 
-`qualify.mjs`は、Prompt CapsuleとLLMキャッシュ経路を、本文や資格情報を
-証拠へ混入させずに認定するための厳格なoperatorです。利用形態に合わせて
-2種類の契約を明示的に分けます。
+`qualify.mjs` is a strict operator tool for qualifying Prompt Capsules and LLM cache paths without putting content or credentials into evidence. Two explicit contracts cover different usage patterns.
 
-## 推奨: CLIProxyAPIのみを使う構成
+This experiment documents the historical CLIProxyAPI path. It is not required by the current Worker's direct ChatGPT connection; see [CHATGPT_DIRECT.md](../../docs/fork/CHATGPT_DIRECT.md).
 
-OpenAI Platform APIへ直接接続せず、CLIProxyAPIが保持するCodex OAuthだけを
-使う場合は`proxy-only`を指定します。
+## For CLIProxyAPI-only configurations
+
+Use `proxy-only` when relying solely on Codex OAuth held by CLIProxyAPI, without connecting directly to the OpenAI Platform API.
 
 ```text
-MCP Managed OAuthで本番Capsule取得
+Fetch production Capsule through MCP Managed OAuth
         ↓
-固定されたCLIProxyAPI経路
+Pinned CLIProxyAPI path
         ↓
-初回cache write＋後続cache read
+Initial cache write + later cache read
         ↓
 prompt-cache-proxy-qualification.v1
 ```
 
-このモードは`OPENAI_API_KEY`と`SECOND_BRAIN_AUTH_TOKEN`を読みません。
-`direct`は成功扱いに偽装せず、次のように明記されます。
+This mode does not read `OPENAI_API_KEY` or `SECOND_BRAIN_AUTH_TOKEN`. It explicitly marks direct access as follows instead of presenting it as successful:
 
 ```json
 {
@@ -29,14 +27,9 @@ prompt-cache-proxy-qualification.v1
 }
 ```
 
-### 1. 実行ホスト自身をMCP Managed OAuthへ一度認可
+### 1. Authorize the execution host once through MCP Managed OAuth
 
-認定を実行するホスト上でOAuth clientを登録し、そのホスト専用のrefreshable
-credentialを作ります。Dashboard cookieは使いません。初回consentではSecond Brainの
-setup credentialをブラウザへ一度入力しますが、実験clientはその値を受け取らず、
-保存もしません。以後の認定処理はroutineのstatic bearerなしで動作します。
-credentialは絶対pathのmode `0600`ファイルへ保存され、OAuth tokenや認可codeは
-出力されません。
+Register an OAuth client on the host running qualification and create a refreshable credential dedicated to that host. Do not use dashboard cookies. Initial consent requires entering the Second Brain setup credential once in the browser; the experiment client neither receives nor stores it. Subsequent qualification runs need no routine static bearer. Store the credential at an absolute path with mode `0600`; OAuth tokens and authorization codes are not printed.
 
 ```bash
 install -d -m 700 "$HOME/.local/state/second-brain-cf"
@@ -46,30 +39,19 @@ node experiments/prompt-cache/mcp-authorize.mjs \
   --credential-file "$HOME/.local/state/second-brain-cf/prompt-cache-oauth.json"
 ```
 
-clientは`--worker-url`からAccess非依存の`/oauth-mcp`を導出します。既存`/mcp`へ
-置き換えてはいけません。本番Cloudflare Accessがその経路を先に捕捉し、Workerの
-Managed OAuth challengeを置き換えるためです。
+The client derives the Access-independent `/oauth-mcp` endpoint from `--worker-url`. Do not substitute `/mcp`: production Cloudflare Access intercepts that path before the Worker and replaces its Managed OAuth challenge.
 
-表示された一時URLをブラウザで完了すると、loopback callbackへ戻り認可が完了します。
-リモートホストでは、同じcallback portをSSHのlocal forwardでそのホストへ結び、
-ブラウザをforward元のPCで開きます。iPhone単体でURLを開くと`127.0.0.1` callbackが
-iPhone自身へ戻るため、このhost-local認可は完了しません。credential fileを別ホストから
-コピーしてはいけません。
+Complete the displayed temporary URL in a browser to return to the loopback callback. For a remote host, use SSH local forwarding of the same callback port to that host and open the browser on the forwarding PC. An iPhone alone returns `127.0.0.1` to itself and cannot complete this host-local authorization. Do not copy a credential file from another host.
 
-以後はrefresh tokenが自動更新されます。再認可が必要な場合、非対話の認定処理は
-`mcp_oauth_authorization_required`でfail closedし、認可URLを証拠へ混入させません。
+Refresh tokens rotate automatically afterward. If reauthorization is required, noninteractive qualification fails closed with `mcp_oauth_authorization_required` and does not put authorization URLs into evidence.
 
-### 2. CLIProxy受信キーを内部credentialとして渡す
+### 2. Supply the CLIProxy inbound key as an internal credential
 
-CLIProxyAPIの受信キー自体は防御層として残します。ただし、利用者が値を
-exportする必要はありません。systemdの`LoadCredential`または
-`LoadCredentialEncrypted`で、固定名`prompt-cache-proxy-api-key`として渡します。
-runnerは`CREDENTIALS_DIRECTORY`配下のこのファイルだけを読みます。
+The CLIProxyAPI inbound key remains a defense layer, but the user need not export its value. Supply it through systemd `LoadCredential` or `LoadCredentialEncrypted` under fixed name `prompt-cache-proxy-api-key`. The runner reads only this file within `CREDENTIALS_DIRECTORY`.
 
-後方互換用として`PROMPT_CACHE_PROXY_API_KEY`も受理しますが、認定manifestには
-値ではなく`environment`または`systemd-credential`という取得元だけを残します。
+`PROMPT_CACHE_PROXY_API_KEY` remains accepted for backward compatibility. The manifest records only its source, `environment` or `systemd-credential`, never its value.
 
-### 3. proxy-only認定を実行
+### 3. Run proxy-only qualification
 
 ```bash
 node experiments/prompt-cache/qualify.mjs \
@@ -86,32 +68,23 @@ node experiments/prompt-cache/qualify.mjs \
   > /private/path/prompt-cache-proxy-qualification.json
 ```
 
-合格条件はすべて満たす必要があります。
+All acceptance conditions must hold:
 
-- Capsule sourceが`worker-mcp-oauth`（後方互換では`worker-access`）
-- CLIProxyAPIのscheme、host、port、base pathを含むtransport hashが完全一致
-- dry-runではない
-- explicit requestがすべて成功
-- run 2以降で`cached_tokens > 0`
-- 後続hit率が指定した閾値以上
-- Capsuleがcomplete（明示的に緩和した場合を除く）
+- Capsule source is `worker-mcp-oauth` (or legacy `worker-access`).
+- The CLIProxyAPI transport hash matches exactly, including scheme, host, port, and base path.
+- This is not a dry run.
+- Every explicit request succeeds.
+- A run from run 2 onward reports `cached_tokens > 0`.
+- The later-hit rate meets the selected threshold.
+- The Capsule is complete unless explicitly relaxed.
 
-CLIProxyAPI／Codex OAuth経路が`cache_write_tokens`を返す場合は、従来どおり
-初回writeと後続readの両方を認定します。write counterを返さず後続
-`cached_tokens`だけを返す場合は、`cache_proof.basis`を`cache-read-observed`、
-`cache_write_observed`を`false`として認定します。この緩和は
-`initial_cache_write_missing`だけが唯一の未達条件で、後続read、全request成功、
-transport、OAuth sourceなど他の条件がすべて合格した場合に限ります。
+If CLIProxyAPI/Codex OAuth returns `cache_write_tokens`, qualify both the initial write and later reads as before. If it returns only later `cached_tokens`, qualify with `cache_proof.basis=cache-read-observed` and `cache_write_observed=false`. This exception is allowed only when `initial_cache_write_missing` is the sole unmet condition and later reads, all-request success, transport, OAuth source, and every other condition pass.
 
-したがって、観測していないwriteを成功扱いにはしません。認定するのは
-CLIProxyAPI経路での実キャッシュreadです。
+Do not claim an unobserved write succeeded. Qualification establishes observed cache reads through CLIProxyAPI. Because the official direct path was not run, it does not establish equivalence with the official API.
 
-公式direct経路を実行していないため、公式APIとの等価性は認定しません。
+### 4. Emit an operational measurement manifest
 
-### 4. 運用測定manifestを出力
-
-認定に加えて、リクエストヒット率、入力トークンのキャッシュ率、レスポンス全体の
-latencyを集計する場合は`--output measurement`を指定します。
+Use `--output measurement` to aggregate request-hit rate, cached-input-token ratio, and complete-response latency alongside qualification.
 
 ```bash
 node experiments/prompt-cache/qualify.mjs \
@@ -129,32 +102,23 @@ node experiments/prompt-cache/qualify.mjs \
   > /private/path/prompt-cache-proxy-measurement.json
 ```
 
-出力schemaは`prompt-cache-proxy-measurement.v1`です。次を分けて記録します。
+The output schema is `prompt-cache-proxy-measurement.v1`. It records separately:
 
-- run 2以降のリクエストヒット率
-- 全runとrun 2以降それぞれのcached/input token比
-- non-streaming Responses全体のmin/median/p90/max/mean latency
-- 後続cache hitとmissを分けたlatency、およびhitごとのcached token数
-- cache write counterの観測sample数
-- 初回write観測と、全sample中のwrite観測を分離したclaim
-- API料金割引と公式API等価性が未検証であること
+- Request-hit rate from run 2 onward.
+- Cached/input token ratios for all runs and for runs from run 2 onward.
+- Min/median/p90/max/mean latency of complete non-streaming Responses.
+- Later-hit and later-miss latency, plus cached tokens for each hit.
+- Number of samples with an observed cache-write counter.
+- Separate claims for the initial write and a write anywhere in the sample set.
+- Unverified API discounts and official-API equivalence.
 
-`input_tokens`、`cached_tokens`、`output_tokens`、`total_tokens`、`latency_ms`の
-いずれかが欠ける場合、集計値を0へ丸めず`usage_counters_incomplete`でfail closed
-します。CLIProxyAPI/Codex OAuthのusageはOpenAI Platform請求書ではないため、
-`estimated_cost`は常に`null`です。
+If any of `input_tokens`, `cached_tokens`, `output_tokens`, `total_tokens`, or `latency_ms` is missing, fail closed with `usage_counters_incomplete` rather than rounding aggregates to zero. CLIProxyAPI/Codex OAuth usage is not an OpenAI Platform invoice; `estimated_cost` is always `null`.
 
-2026-09-03の最初の20回ライブ測定は、後続request hit率84.21%、全入力tokenの
-cache率74.71%、warm区間78.64%で合格しました。このmeasurement単独の集計値と
-claim boundaryは
-[`results/2026-09-03-cliproxy-cache-live-v1.md`](./results/2026-09-03-cliproxy-cache-live-v1.md)
-を正本とします。ゴール完了認定の正本は、次節のペアmanifestです。
+The first live 20-request measurement on 2026-09-03 passed with 84.21% later-request hits, 74.71% cached tokens across all input, and 78.64% in the warm portion. The authoritative standalone measurement aggregates and claim boundaries are in [`results/2026-09-03-cliproxy-cache-live-v1.md`](./results/2026-09-03-cliproxy-cache-live-v1.md). The paired manifests below are authoritative for the completed qualification goal.
 
-### 5. 同じ実測から認定と測定を分離保存
+### 5. Save qualification and measurement separately from one run
 
-ゴール完了証拠を作る場合は`--output artifacts`を使います。1回だけ生成した一時
-JSONLから、`prompt-cache-proxy-qualification.v1`と
-`prompt-cache-proxy-measurement.v1`を同時に構築します。
+Use `--output artifacts` for goal-completion evidence. It builds `prompt-cache-proxy-qualification.v1` and `prompt-cache-proxy-measurement.v1` together from one temporary JSONL stream generated once.
 
 ```bash
 node experiments/prompt-cache/qualify.mjs \
@@ -172,32 +136,25 @@ node experiments/prompt-cache/qualify.mjs \
   > /private/path/prompt-cache-proxy-artifacts.json
 ```
 
-外側の`prompt-cache-proxy-artifacts.v1`は安全な受け渡し用envelopeです。永続化する
-正本は、内側の`qualification`と`measurement`を別々のJSONファイルへ保存します。
-両方の`evidence_sha256`が一致するため、同じ実測から作られたことを機械的に確認
-できます。生JSONLは保存せず、既存measurementからqualificationを逆生成しません。
-2026-09-03の完了証拠は
-[`results/2026-09-03-cliproxy-cache-paired-v1.md`](./results/2026-09-03-cliproxy-cache-paired-v1.md)
-に記録しています。
+The outer `prompt-cache-proxy-artifacts.v1` is a safe transfer envelope. Persist its inner `qualification` and `measurement` as separate authoritative JSON files. Matching `evidence_sha256` values mechanically establish that both came from the same measurement. Do not save raw JSONL or reconstruct qualification from an existing measurement. Completion evidence from 2026-09-03 is recorded in [`results/2026-09-03-cliproxy-cache-paired-v1.md`](./results/2026-09-03-cliproxy-cache-paired-v1.md).
 
-## 既存: 公式directとproxyを比較する構成
+## Existing official-direct versus proxy comparison
 
-公式Responses APIとの独立比較が必要な場合は、従来どおり`compare`を使います。
-このモードは後方互換のため残しており、既定値も`compare`です。
+Use `compare` when an independent comparison with the official Responses API is required. This mode is retained for backward compatibility and remains the default.
 
 ```text
-本番Worker Capsule
+Production Worker Capsule
         ↓
-公式Responses API A/B
-        ↓ direct gate合格が必須
+Official Responses API A/B
+        ↓ direct gate must pass
 CLIProxyAPI
-        ↓ proxy gate合格が必須
-同一Capsule／model／breakpoint比較
+        ↓ proxy gate must pass
+Compare identical Capsule / model / breakpoints
         ↓
 prompt-cache-qualification.v1
 ```
 
-必要な資格情報は次です。
+Required credentials are:
 
 ```bash
 export SECOND_BRAIN_AUTH_TOKEN='...'
@@ -215,14 +172,11 @@ node experiments/prompt-cache/qualify.mjs \
   --pretty
 ```
 
-`--source-auth mcp-oauth --mcp-credential-file PATH`を追加すれば、compareでも
-Second Brain bearerの代わりにManaged OAuthを使えます。ただし公式direct用
-`OPENAI_API_KEY`は必要です。`--source-auth access`も後方互換で残ります。
+Adding `--source-auth mcp-oauth --mcp-credential-file PATH` uses Managed OAuth instead of the Second Brain bearer in compare mode too. Official direct access still requires `OPENAI_API_KEY`. `--source-auth access` remains available for backward compatibility.
 
-## project／company Capsule
+## Project and company Capsules
 
-project Capsuleを含める場合は`--project-id`を追加します。company workspaceでは
-`--workspace company`を使い、所属先が複数なら`--team`も指定します。
+Add `--project-id` to include a project Capsule. Use `--workspace company` for company scope and specify `--team` when membership is ambiguous across multiple teams.
 
 ```bash
 node experiments/prompt-cache/qualify.mjs \
@@ -238,23 +192,16 @@ node experiments/prompt-cache/qualify.mjs \
   --pretty
 ```
 
-## 出力と終了コード
+## Output and exit codes
 
-出力にはhash、集約済みcache metrics、boolean、固定failure codeだけを含めます。
-Capsule本文、model出力、Worker／proxy URL、Bearer、Access JWT、API key、project／
-team id、生JSONLは含めません。
+Output contains only hashes, aggregate cache metrics, booleans, and fixed failure codes. It excludes Capsule content, model output, Worker/proxy URLs, Bearer tokens, Access JWTs, API keys, project/team IDs, and raw JSONL.
 
 ```text
-0  選択した認定契約に合格
-1  CLI、資格情報取得、child process、または証拠構造が不正
-2  証拠構造は正しいが認定条件に未達
+0  Selected qualification contract passed
+1  Invalid CLI, credential retrieval, child process, or evidence structure
+2  Valid evidence structure but qualification criteria not met
 ```
 
-`proxy-only`のschemaは`prompt-cache-proxy-qualification.v1`、従来比較のschemaは
-`prompt-cache-qualification.v1`です。同じ名前にせず、direct未実施を後から
-成功済みと誤読できないようにしています。
+Proxy-only uses `prompt-cache-proxy-qualification.v1`; the existing comparison uses `prompt-cache-qualification.v1`. Separate names prevent an untested direct path from later being mistaken for a success.
 
-child processへ渡す環境は経路ごとに分離します。proxy-onlyでは親processに
-古い`OPENAI_API_KEY`や`SECOND_BRAIN_AUTH_TOKEN`が残っていてもchildから削除し、
-systemd credential directoryも引き継ぎません。CLIProxy受信キーは必要なchildの
-`Authorization`へだけ移し替えます。
+Separate child-process environments by path. Proxy-only removes inherited `OPENAI_API_KEY` and `SECOND_BRAIN_AUTH_TOKEN` even when they remain in the parent; it also does not forward the systemd credential directory. Transfer the CLIProxy inbound key only to the Authorization value of the child that needs it.

@@ -178,9 +178,9 @@ describe("offline distribution and update compatibility", () => {
     expect(agents).toMatch(/No memory\s+lookup or memory write is required merely/);
     const guide = read("AI_Instructions/README.md");
     expect(guide).toContain("connect-ai-clients.sh/.ps1");
-    expect(guide).toContain("上流のraw URL");
+    expect(guide).toContain("upstream raw URLs");
     expect(guide).toContain("appended-legacy-kept");
-    expect(guide).toContain("モデル評価は未実行");
+    expect(guide).toContain("model evaluation has not been run");
   });
 });
 

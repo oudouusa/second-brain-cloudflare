@@ -2,12 +2,9 @@
 
 ## Verdict
 
-Second BrainのCore Capsuleだけでは、この固定タスク集合に対する有意な
-改善は観測されなかった。Coreとタグ付きcurrent-state recallを併用した
-Full armでは、Controlに対して小さいが正の効果が観測された。
+Core Capsule alone showed no significant improvement on this fixed task set. The Full arm, combining Core with tagged current-state recall, showed a small positive effect relative to Control.
 
-この結果が支持するのは、履歴依存の開発判断を再現する際の文脈効果で
-あり、開発速度全体の改善率ではない。
+This supports a context effect when recovering history-dependent development decisions, not an improvement rate for overall development speed.
 
 Canonical evidence:
 [`2026-09-03-dev-effect-live-v4.json`](./2026-09-03-dev-effect-live-v4.json)
@@ -20,8 +17,7 @@ trials:           48 / 48 successful
 JSON-valid:       48 / 48
 ```
 
-Capsule/recallはMCP Managed OAuth、推論はCLIProxyAPI/Codex OAuthを利用した。
-公式OpenAI API keyとSecond Brainの静的Bearerは使用していない。
+Capsule/recall used MCP Managed OAuth; inference used CLIProxyAPI/Codex OAuth. No official OpenAI API key or Second Brain static bearer was used.
 
 ## Primary result
 
@@ -31,23 +27,19 @@ Capsule/recallはMCP Managed OAuth、推論はCLIProxyAPI/Codex OAuthを利用�
 | Durable Core Capsule | 0.8083 | 62.50% | 25.00% | +0.0083 (95% interval -0.0407 to +0.0573) |
 | Core + tagged current-state recall | 0.9771 | 87.50% | 12.50% | +0.1771 (95% interval +0.0009 to +0.3533) |
 
-`full-context-effect-observed`の判定条件は満たしたが、区間下限はゼロに
-非常に近い。16対応ペアだけの近似区間なので、強い一般化はできない。
+
+The `full-context-effect-observed` criterion was met, but the interval's lower bound is very close to zero. This is an approximate interval from only 16 paired observations and does not support strong generalization.
 
 ## What produced the effect
 
-FullとControlの差は、次の2タスクだけから生じた。
+Only two tasks contributed to the Full-versus-Control difference:
 
-- Current production lineage: Control 0.0、Core 0.0、Full 1.0
-- Deployment preflight: Control 0.5000、Core 0.6667、Full 0.9167
+- Current production lineage: Control 0.0, Core 0.0, Full 1.0.
+- Deployment preflight: Control 0.5000, Core 0.6667, Full 0.9167.
 
-Access/OAuth境界、handler normalization、Capsule決定性、credential境界、
-公開証拠privacyは全armで1.0だった。これらは問題文と選択肢から推論可能で、
-この実験ではSecond Brain固有の効果を識別できなかった。
+Access/OAuth boundaries, handler normalization, Capsule determinism, credential boundaries, and public-evidence privacy scored 1.0 in every arm. They could be inferred from the questions and choices, so this experiment did not isolate a Second Brain-specific effect for them.
 
-Cache-evidence classificationはControl 0.9、Core 0.8、Full 0.9だった。
-文脈があっても`cache_write_tokens=0`を「観測済み」と誤分類する試行があり、
-認定には引き続き決定的なmachine gateが必要である。
+Cache-evidence classification scored Control 0.9, Core 0.8, and Full 0.9. Some trials classified `cache_write_tokens=0` as “observed” despite context. Qualification still requires deterministic machine gates.
 
 ## Cost and latency
 
@@ -57,40 +49,33 @@ Cache-evidence classificationはControl 0.9、Core 0.8、Full 0.9だった。
 | Core | 2,088.0 | 3,584 | 10.7% | 3,233 ms | 3,879 ms |
 | Full | 4,398.0 | 15,104 | 21.5% | 2,920 ms | 5,945 ms |
 
-FullはControlの約8.8倍のinput tokenを使った。median model latencyは
-約11%短かった一方、p90は約17%長かった。Provider cacheと小標本の影響が
-あるため、latency改善とは認定しない。
 
-Core取得は1,333 ms、タグ付きrecall取得は2,319 msだった。これはtrial前に
-各1回だけ取得した値で、通常の対話で毎回recallする場合の遅延ではない。
+Full used about 8.8 times Control's input tokens. Median model latency was about 11% lower, while p90 was about 17% higher. Provider caching and the small sample prevent a claim of improved latency.
+
+Core acquisition took 1,333 ms and tagged recall 2,319 ms. Each was fetched once before trials; these are not measurements of latency when recalling on every conversational turn.
 
 ## Review correction
 
-初回v3では自由文を正規表現で採点していたため、否定文や却下した代替案でも
-キーワード一致により加点される可能性があった。また、transport failureを
-0点のmodel observationとして効果量へ混ぜる余地があった。
+Initial v3 scored free text with regular expressions, allowing keywords in negations or rejected alternatives to earn points. Transport failures could also enter effect estimates as zero-score model observations.
 
-v4では次のように修正して再測定した。
+V4 corrected this and repeated measurement:
 
-- 全criterionを列挙選択式の構造化回答へ変更
-- exact key setとallowed valueだけを受理
-- unsafe choiceも構造化値から判定
-- transport failureはarm scoreとpaired effectから除外
-- 1件でもHTTP failureがあればeffect conclusionを`incomplete-run`へ固定
-- schemaを`second-brain-development-effect.v2`へ更新
+- Use enumerated structured answers for every criterion.
+- Accept only the exact key set and allowed values.
+- Determine unsafe choices from structured values too.
+- Exclude transport failures from arm scores and paired effects.
+- Force the effect conclusion to `incomplete-run` if even one HTTP failure occurs.
+- Update the schema to `second-brain-development-effect.v2`.
 
-このためv3の大きな効果量はcanonical evidenceとして扱わず、v4を正本とする。
+The larger v3 effect is therefore not canonical evidence; v4 is authoritative.
 
 ## Limits
 
-- 8タスクは同じ完了済み開発履歴から作ったhistorical decision-recovery問題。
-- 16対応ペア、1モデル、1 proxy path、2反復だけの小標本。
-- 列挙選択式は否定表現の誤採点を防ぐ一方、実際の自由回答より問題を易しくする。
-- Current lineageの1タスクが効果量の大部分を占める。
-- Unsafe-choiceは選択肢上の判定であり、実際に危険操作を実行した件数ではない。
-- 独立repositoryで実装・test・reviewを比較していないため、wall-clock速度、
-  defect rate、clarification回数の改善は未検証。
+- Eight historical decision-recovery tasks were built from the same completed development history.
+- Only 16 pairs, one model, one proxy path, and two repetitions.
+- Enumerated choices prevent negation-scoring errors but make the task easier than free-form responses.
+- One current-lineage task contributes most of the effect.
+- Unsafe-choice rates describe selected answers, not actual unsafe actions executed.
+- No comparison of implementation, tests, and review in independent repositories was performed, so improvements in wall-clock speed, defect rate, and clarification count remain unverified.
 
-次の強い検証は、記憶へ保存する前に未知の小規模issueを固定し、隔離した
-Control/Full agentで実装させ、passing tests、review findings、unsafe actions、
-clarification turns、elapsed timeを比較することである。
+A stronger next evaluation would fix unfamiliar small issues before saving them into memory, have isolated Control/Full agents implement them, and compare passing tests, review findings, unsafe actions, clarification turns, and elapsed time.

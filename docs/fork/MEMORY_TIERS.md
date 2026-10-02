@@ -1,37 +1,26 @@
 # Manual memory tiers
 
-- `warm`: 新規memoryの既定値。
-- `hot`: 明示的にHot contextへ含める。
-- `cold`: D1とVectorizeに残したまま整理する。通常recallから除外しない。
-- `pinned=1`: tierに関係なくHot contextへ含める。
+- `warm`: the default for new memories.
+- `hot`: explicitly included in Hot context.
+- `cold`: organized without removing it from D1 or Vectorize; still included in normal recall.
+- `pinned=1`: included in Hot context regardless of tier.
 
-操作はすべて手動かつ可逆で、tier/pin変更だけでは再埋め込みしない。Hot contextは `pinned=1 OR memory_tier='hot'` を重要度、更新時刻の順に並べ、廃止済みmemoryを除外し、12,000文字以内に制限する。通常recallで返したmemoryには `last_recalled_at` を記録する。
+All operations are manual and reversible. Changing a tier or pin alone does not re-embed a memory. Hot context selects `pinned=1 OR memory_tier='hot'`, orders by importance and update time, excludes deprecated memories, and is capped at 12,000 characters. Memories returned by normal recall record `last_recalled_at`.
 
-AI clientは会話冒頭のintent-framed `recall`を先に実行し、継続中projectやcurrent goal / priority / operating constraintを扱う時だけ、その後に`get_hot_context`を1回呼ぶ。Hot contextはtopic-specific recallを置き換えない。pinはuser-confirmedなactive goalまたはoperating constraintの小さな集合に限定し、同一projectの細切れsummaryより統合したcurrent-state entryを優先する。完了・失効時はunpinしてwarm/coldへ戻す。
+Following the current [memory policy](../../AI_Instructions/MEMORY_POLICY.md), AI clients use intent-framed `recall` when missing prior context could affect the answer. Use `get_hot_context` afterward when an ongoing project or current goal, priority, or operating constraint needs a small working set. Hot context supplements topic-specific recall. Limit pins to a small set of user-confirmed active goals or operating constraints; prefer a consolidated current-state entry over fragmented summaries for the same project. Unpin and return to warm/cold when work ends or expires.
 
-RESTは `POST /memory/tier`、`POST /memory/pin`、`GET /hot-context`、MCPは `set_memory_tier`、`pin_memory`、`unpin_memory`、`get_hot_context` を使用する。
+REST uses `POST /memory/tier`, `POST /memory/pin`, and `GET /hot-context`. MCP uses `set_memory_tier`, `pin_memory`, `unpin_memory`, and `get_hot_context`.
 
-## 現在状態と履歴の保存粒度
+## Current state and history granularity
 
-固定記憶には確認日と現行状態を記載し、PRのOPEN→MERGEDなど状態が置き換わった場合は
-`update`で旧版をhistoryへ保持する。可変な状態と恒久的な権限制約を混同せず、過去の承認を
-別作業の許可へ拡張しない。古い記憶の日付だけを今日へ書き換えない。
+Pinned memories should include the verification date and current state. When a state changes, such as a PR moving from OPEN to MERGED, use `update` to preserve the previous version in history. Distinguish mutable status from enduring permission constraints; do not extend past approval to unrelated work. Do not merely replace an old memory's date with today's date.
 
-重要な決定・制約・成果はユーザーの保存方針と除外条件に従って残す。同じ案件の新しい事実は
-既知IDへappendし、訂正や現行状態の置換はupdate、独立した検索対象はrememberする。
-本文は決定・根拠・確認日時・継続条件と原本への参照を中心にまとめる。
-長いテスト一覧や変更なし確認を繰り返し新規記憶へ積み上げない。
+Retain important decisions, constraints, and outcomes according to the user's storage policy and exclusions. Append new facts about the same matter to a known ID; use update for corrections or replacement of current state, and remember for independently retrievable topics. Focus the content on the decision, rationale, verification time, continuing conditions, and references to original sources. Avoid accumulating new memories for long test lists or repeated unchanged checks.
 
-appendの8,000字でのrollover推奨／10,000字での継続前rollover要求に従い、原文をcoldに保持し、根拠日付を明記した
-短い継続記憶へ移る。古い検証結果しかない場合はその限界を本文にも残し、今日の本番状態と
-扱わない。既存のcold履歴を文字数だけで再整理しない。duplicate-candidateはレビュー候補であり、
-削除根拠ではない。これらの運用説明はクライアント全体の指示を自動変更しない。
+Follow the append rollover recommendation at 8,000 characters and the requirement to roll over before continuing at 10,000 characters. Keep the original cold and continue in a short memory with explicit evidence dates. If only old verification results exist, retain that limitation in the content instead of presenting them as today's production state. Do not reorganize existing cold history based on length alone. Duplicate candidates require review; they are not grounds for deletion. These operating guidelines do not automatically change client-wide instructions.
 
-## 要約の話題
+## Digest topics
 
-`personal`・`work`・`task`・`idea`・`context`・`codex-response`は汎用分類タグとして保存・検索に
-引き続き使えるが、夜間digest・直接digestの対象や管理画面の要約候補には使わない。
-案件横断の分類を一つの話題として要約すると、無関係な原記憶までrolled-upとなるためである。
-検索のタグ推定・補助検索と通常のタグ表示は変更しない。案件名などの具体的なタグは従来どおり使う。大文字小文字を無視した完全一致で除外し、
-`work-notes`や`context-menu`等の別のタグまで除外しない。
-既存digestと元記憶には自動的な変更を加えず、必要な箇所だけ根拠を確認して整理する。
+`personal`, `work`, `task`, `idea`, `context`, and `codex-response` remain available as general classification tags for storage and search, but are excluded from nightly/direct digest targets and administration summary suggestions. Summarizing a cross-project classification as a single topic would mark unrelated source memories as rolled up.
+
+Search tag inference, auxiliary search, and normal tag display are unchanged. Specific tags, such as project names, remain available. Exclusion uses case-insensitive exact matches and does not exclude other tags such as `work-notes` or `context-menu`. Existing digests and source memories are not automatically changed; review evidence before organizing individual cases.

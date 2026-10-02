@@ -1,7 +1,7 @@
 name: Store Merged PR to Second Brain
 
-# 薄フォークでは PR を外部 Second Brain へ自動保存しない。
-# upstream 同期時に差分を追跡しやすいよう定義は残すが、job は明示的に無効化する。
+# This fork does not automatically store PRs in an external Second Brain.
+# Retain the definition to track upstream differences, but explicitly disable the job.
 on:
   workflow_dispatch:
 

@@ -1,16 +1,16 @@
-# 合成記憶による遠隔検索計測
+# Remote search measurements with synthetic memories
 
-このツールはsynthetic fixtureだけで検索のCPU・D1 metadataを観測します。実記憶の投入と本番の測定は行いません。個人の過去の配備・測定記録は公開ソースへ含めません。
+This tool observes search CPU and D1 metadata using only synthetic fixtures. It does not ingest real memories or measure production. Personal deployment and measurement records are excluded from public source.
 
-公開版のリモートhostnameは例示です。初期状態ではlocalhostで使い、遠隔測定を行う場合は`protocol.mjs`の2ホスト固定allowlistを自身の専用検証先へ変更してから、安全性の回帰試験を実行します。実行の前に、隔離環境、対象版、予算、credentialの送信先を明示して承認します。
+Remote hostnames in the public version are examples. Start on localhost. For remote measurement, replace the fixed two-host allowlist in `protocol.mjs` with your dedicated test targets, then run the safety regressions. Before execution, explicitly authorize the isolated environment, revisions, budget, and credential destinations.
 
 ```sh
 npx --no-install vitest run test/unit/remote-d1-metrics.test.ts test/unit/remote-measurement-safety.test.ts
 ```
 
-ローカル時間・SQL文数・合成fixtureの順位は、CloudflareでのCPU、課金行数、実記憶での品質の証拠とは分けます。実測結果には対象版、fixture hash、サンプル数、未完了の条件を記録してください。
+Distinguish local timing, SQL-statement counts, and synthetic-fixture rankings from evidence of Cloudflare CPU, billed rows, or quality on real memories. Record revision, fixture hash, sample count, and incomplete conditions with measurements.
 
-## 準備と予算
+## Preparation and budget
 
 Use Node 24+ and an empty private output directory:
 
@@ -42,7 +42,7 @@ requires the temporary owner bearer token and is never a production route.
 Before resource creation, record approval, the exact account, baseline/candidate
 commits, names, hashes, maximum requests/time and cleanup. For the 2026-09-06 plan:
 
-資源を作る場合は、本番とは別の空の検証環境を用意します。固定Gemma128、metadata index、既存DO migrationと秘密情報の設定は[自己配備手順](../../docs/fork/DEPLOYMENT.md)を参照してください。計測対象のprofile、資源名・ID、Worker versionは各実施者が非公開で記録します。
+Create resources only in an empty test environment separate from production. See the [self-hosting guide](../../docs/fork/DEPLOYMENT.md) for fixed Gemma128, metadata indexes, existing DO migration, and secrets. Each operator privately records the measured profile, resource names/IDs, and Worker version.
 
 ## Collect and evaluate
 
@@ -71,7 +71,7 @@ summary checks expected recall/empty results but always leaves
 For each sample, join the `sb54` and `sb54-d1` records in the public and DO
 invocations separately. Header counters are joined by the same sample id. `sb54-d1` records use actual result metadata and include
 background statements after the response; check contiguous sequence numbers.
-旧ログは参考記録とし、修正版では完了マーカー付きのpublic/DOヘッダーを使用する。 Unknown
+Treat older logs as reference records; the corrected version uses public/DO headers with completion markers. Unknown
 metadata stays null. The `first()` adapter uses the same SELECT via `all()` to
 obtain metadata. Batches unwrap their original statements and execute once.
 
@@ -106,20 +106,22 @@ Metric semantics: [D1 metrics](https://developers.cloudflare.com/d1/observabilit
 [Worker invocation logs](https://developers.cloudflare.com/workers/observability/logs/workers-logs/),
 and [observability query fields](https://developers.cloudflare.com/api/resources/workers/subresources/observability/subresources/telemetry/methods/query/).
 
-## 保存済みsmokeの自動監査
+## Automated audit of saved smoke evidence
 
-HTTP200と検索結果だけでは、今回発見したresetのDO canceledを検知できない。
-`audit-smoke.mjs` は1 fixture・4 provider modes・warmupと本試行の計8件を要求し、
-明示された配備versionとsample hashでpublic/do/resetログを一意に照合する。
-欠落・重複・canceled・例外・truncated・CPU/D1不明値は失敗にする。
-生のrequest headersや例外本文をレポートへコピーしない。
+HTTP 200 and search results alone cannot detect the reset DO cancellation found
+during this work. `audit-smoke.mjs` requires eight records: one fixture, four
+provider modes, warmup and measurement. It uniquely matches public/do/reset logs
+using the explicit deployment version and sample hash. Missing, duplicate,
+canceled, exceptional, truncated, or unknown CPU/D1 records fail. Do not copy
+raw request headers or exception bodies into reports.
 
 ```sh
 node experiments/recall-remote/audit-smoke.mjs \
   /PRIVATE/samples.jsonl /PRIVATE/tail.jsonl DEPLOYMENT_VERSION /PRIVATE/audit.json
 ```
 
-成功時の `telemetryPassed=true` は計測経路の健全性だけを示す。
-検索品質・baseline比較・全fixture・p95/D1閾値の受入を代替せず、
-`remoteGatePassed=false` を維持する。入力ファイルのSHA-256を結果へ記録し、
-既存結果ファイルは上書きしない。保存済み証拠の監査はCloudflareへ接続しない。
+Success with `telemetryPassed=true` establishes only measurement-path integrity.
+It does not replace acceptance of search quality, baseline comparison, all fixtures,
+or p95/D1 thresholds; `remoteGatePassed=false` remains. Record input-file SHA-256
+hashes and do not overwrite existing result files. Auditing saved evidence does
+not connect to Cloudflare.

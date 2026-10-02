@@ -1,29 +1,29 @@
-# 採用した設計と理由
+# Design decisions and rationale
 
-## D1を正本にする
+## D1 is authoritative
 
-本文と関係をVectorizeの成否から切り離します。CAS、before-image、削除receiptとwrite admissionで並行更新と復元を保護し、VectorizeはD1から再生成します。R2 backupは記憶の復旧用で、通常保存とのdual-writeにはしません。
+Memory content and relationships are independent of Vectorize availability. CAS, before-images, deletion receipts, and write admission protect concurrent updates and recovery. Vectorize can be rebuilt from D1. R2 backups support memory recovery; normal writes are not dual-written to R2.
 
-## 埋込みを固定する
+## Fixed embeddings
 
-EmbeddingGemmaの出力を128次元へ縮約・正規化する既存profileを維持します。モデル・次元・世代の違うvectorを同じindexへ混ぜません。新規indexは最初の書込み前に`parent_id`と`workspace_id`のmetadata indexを作ります。既存の異なるprofileからの移行には別indexと再索引が必要です。
+Retain the existing profile that reduces and normalizes EmbeddingGemma output to 128 dimensions. Do not mix models, dimensions, or vector generations within an index. Create the `parentId` and `workspace_id` metadata indexes before the first write to a new index. Migrating from a different profile requires a separate index and reindexing.
 
-## 上流の検索を使う
+## Use upstream search
 
-上流のtokenizer、FTS、reranker、Prompt Capsule、project解決を維持します。CJK・全角識別子と埋込み障害時に必要な補正は利用側へ限定し、scopeとLIMIT前の回答適格性を保持します。合成fixtureの改善を、実記憶での品質や課金行数の改善と同一視しません。
+Retain the upstream tokenizer, FTS, reranker, Prompt Capsule, and project resolution. Keep adjustments for CJK text, full-width identifiers, and embedding failures at the consumer boundary, preserving scope and answer eligibility before LIMIT. Improvements on synthetic fixtures do not establish improvements in real-memory quality or billed rows.
 
-## 生成を任意にする
+## Optional generation provider
 
-通常構成はWorkers AIです。ChatGPT直接接続は、所有者が本人のプラン利用を許可し、対象処理と個人workspaceを明示した場合だけ選択します。暗号化資格情報、Workerに属するstable host、refreshの競合保護を使います。選択済みproviderの失敗で別providerへ自動的に送らず、保存処理は構造化出力・完了状態を検査します。
+Workers AI is the default. Direct ChatGPT access is selected only after the owner authorizes use of their plan and explicitly selects operations and a personal workspace. Use encrypted credentials, a stable host belonging to the Worker, and refresh-race protection. Do not automatically send a failed selected operation to another provider. Persistence paths validate structured output and completion status.
 
-## 既存DOへ処理を移す
+## Dispatch to the existing DO
 
-MCP、回答、REST検索、管理probe、夜間処理を既存McpExecutorへ送ります。入口で認証・本文上限を確認し、内側でもscopeと管理操作の権限を確認します。レスポンスのstreamとwrite admissionを終了まで保持します。移送は無料枠や総CPUの保証ではありません。
+MCP, answers, REST search, administration probes, and nightly work run in the existing McpExecutor. Authenticate and enforce body limits at entry, and recheck scope and administrative permissions inside it. Hold response streams and write admission until completion. Dispatch is not a guarantee about free allowances or total CPU.
 
-## 運用情報と公開ソースを分ける
+## Separate operations from public source
 
-共通configへ実資産ID・個人workspace・資格情報を入れません。実配備にはGit対象外の設定を明示し、配備version、D1復元地点、バックアップ、実測は所有者の保管場所へ保存します。公開候補は上流の履歴と整理済みのfork差分で構成し、私的な枝・PR・Actions履歴を運びません。
+Keep real resource IDs, personal workspaces, and credentials out of the shared configuration. Explicitly select an ignored configuration for real deployments. Store deployment versions, D1 recovery points, backups, and measurements in owner-controlled storage. Public candidates retain upstream history and reviewed fork changes without bringing private branches, PRs, or Actions history with them.
 
-## 上流との依存境界を維持する
+## Preserve upstream dependency boundaries
 
-上流所有21ファイル、依存定義とlockfile、installerの一致を機械的に検査します。脆弱性監査の検出を隠しません。指摘の利用条件と到達性を確認し、依存を変える修正は上流の修正と同期して検証します。
+Mechanically check alignment of the 21 upstream-owned files, dependency declarations, lockfile, and installer. Keep vulnerability findings visible. Assess usage conditions and reachability, and synchronize dependency changes with upstream fixes before validating them.

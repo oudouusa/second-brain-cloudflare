@@ -24,17 +24,17 @@ jobs:
         with:
           node-version: "22"
           cache: npm
-      - name: upstream remote を読み取り専用で設定
+      - name: Configure a read-only upstream remote
         run: |
           git remote add upstream https://github.com/rahilp/second-brain-cloudflare.git
           git config remote.upstream.pushurl DISABLED
-      - name: 依存install前にfork境界とlifecycle scriptを監査
-        # Feature PRではfork境界をhard gateにし、upstreamの新着・merge競合は
-        # reportに留める。最新追従そのものは定期Upstream Auditがhard gateする。
+      - name: Audit fork boundaries and lifecycle scripts before installing dependencies
+        # Feature PRs enforce fork boundaries; new upstream commits and merge conflicts
+        # are reported only. The scheduled Upstream Audit requires a current upstream base.
         run: npm run upstream:audit:boundary
-      - name: 公開用treeの検査
+      - name: Check the public source tree
         run: node scripts/check-publication.mjs
-      - name: 依存監査の回帰試験（外部通信なし）
+      - name: Dependency audit regression tests (offline)
         run: node --test experiments/dependency-audit/*.test.mjs
       - run: npm ci --legacy-peer-deps
       - name: Prompt Capsule / cache experiment contract
@@ -50,7 +50,7 @@ jobs:
           test "$(wc -l < /tmp/prompt-cache-ab.jsonl)" -eq 6
           node experiments/prompt-cache/verify.mjs --input /tmp/prompt-cache-ab.jsonl --gate structure > /tmp/prompt-cache-evidence.json
           node -e 'const m=JSON.parse(require("node:fs").readFileSync("/tmp/prompt-cache-evidence.json","utf8")); if (m.schema !== "prompt-cache-evidence.v1" || m.verified !== true) process.exit(1)'
-      - name: 回答品質の検出器（外部通信なし）
+      - name: Answer quality detector tests (offline)
         run: python3 -B -m unittest discover -s experiments/answer-quality -p 'test_*.py'
       - run: npm run typecheck
       # The "no unscoped corpus query" rule from src/lib/scope.ts, machine-checked.
@@ -61,29 +61,29 @@ jobs:
       # run is noise); on here, so the log keeps a diffable record and a reason
       # drifting away from its SQL shows up in the diff.
       - run: npm run check:scope -- --inventory
-      # Vitestの既定値はCPU数−1。2 CPU runnerでも両CPUを使い、既存15分枠で後続gateまで実行する。
+      # Vitest defaults to CPUs minus one. Use both CPUs on a two-CPU runner to fit all gates within 15 minutes.
       - run: npm run test:coverage -- --maxWorkers=100%
       # The CPU-budget tests above skip their timing assertions under coverage
       # instrumentation (v8 coverage adds per-call overhead the budgets were
       # never meant to absorb); this re-run, without --coverage, is what
       # actually enforces those budgets on CI.
-      - name: CPU予算の計測（coverageなし）
+      - name: Measure CPU budgets without coverage
         run: npx vitest run test/unit/quarantine-cold-cpu.test.ts test/unit/quarantine-score.test.ts test/unit/versions-chain.test.ts
-      - name: 夜間SQLの隔離診断（外部通信なし）
+      - name: Isolated nightly SQL diagnostics (offline)
         env:
           NIGHTLY_PROBE_OUTPUT: ${{ runner.temp }}/nightly-perf
         run: npx --no-install vitest run --config experiments/nightly-perf/vitest.config.ts
       - run: npm run benchmark:validate
-      - name: 最新 Wrangler 4.x で型定義を再生成して差分確認
+      - name: Regenerate types with pinned Wrangler 4.x and check for differences
         run: |
           npx --yes wrangler@4.146.0 types
           npx tsc --noEmit
           git diff --exit-code -- worker-configuration.d.ts
-      - name: Worker のビルド確認
+      - name: Check the Worker build
         run: npx --yes wrangler@4.146.0 deploy --dry-run
-      - name: Worker startup を確認
+      - name: Check Worker startup
         run: npx --yes wrangler@4.146.0 check startup --outfile /tmp/worker-startup.cpuprofile
-      - name: PR にカバレッジを投稿
+      - name: Post coverage to the PR
         if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
         uses: davelosert/vitest-coverage-report-action@v2
 
@@ -102,16 +102,16 @@ jobs:
           node-version: "22"
       # No install, lifecycle scripts, package updates, secrets, or new scheduled job.
       # Findings stay visible as "findings"; operational failures still fail this job.
-      - name: 本番・全依存の読み取り専用監査
+      - name: Read-only audit of production and full dependency graphs
         run: node scripts/audit-dependencies.mjs --report-only --output "$RUNNER_TEMP/dependency-audit"
-      - name: 監査結果をJob Summaryへ保存
+      - name: Save audit results to the job summary
         if: always()
         run: |
           if test -f "$RUNNER_TEMP/dependency-audit/audit.md"; then
             cat "$RUNNER_TEMP/dependency-audit/audit.md" >> "$GITHUB_STEP_SUMMARY"
           fi
 
-  # 上流の全evalは手動実行。通常のWorker試験にはsmokeを含む。
+  # Full upstream evals run manually. Normal Worker tests include smoke coverage.
   eval-full:
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest

@@ -185,9 +185,10 @@ or automatic model-specific prompting.
 
 ## Validation and remaining evidence
 
-2026-09-13のローカル実行では、prompt-cacheの110件の試験と二つの合成例が通りました。
-実装ファイルのhash、初回のfixture・環境の失敗、その後の成功を記録した証拠は、
-運用者の非公開領域に保全しています。この過去の記録を現在のSHAの検証結果として扱いません。
+On 2026-09-13, 110 prompt-cache tests and both synthetic examples passed locally.
+Evidence retaining implementation hashes, initial fixture/environment failures,
+and subsequent success is preserved in private operator storage. These historical
+records do not verify the current SHA.
 
 ```bash
 node --test experiments/prompt-cache/*.test.mjs
