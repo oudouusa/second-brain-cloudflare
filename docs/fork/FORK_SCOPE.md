@@ -6,8 +6,8 @@ This self-hosted fork preserves the history of [rahilp/second-brain-cloudflare](
 
 - Initial base: `99f1c1a2a005d8f835aef93c786cfe07f54780f3`.
 - Tag for that base: `upstream-base-2026-08-23`. Public candidates include this tag pointing to the upstream commit.
-- Current audit target: `upstream/release/4.0.0`. The integrated revision is `d550921a8c0ae25f6788ead3d8209f29fc4df6d6`.
-- Watch target: `upstream/main`. Update the audit target after the official upstream release.
+- Current audit target: `upstream/main`. The integrated revision is `4e30f973802e54740f7e709516c365078760febb`, which merged the upstream 4.0.0 release.
+- No separate watch target: both CI boundary checks and the scheduled synchronization audit now follow `upstream/main`.
 
 ## Contracts to preserve
 

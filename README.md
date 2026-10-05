@@ -9,7 +9,7 @@ A fork of [Second Brain](https://github.com/rahilp/second-brain-cloudflare) for 
 - **Bounded work and storage protection.** Write admission, workspace isolation, CAS, held-row isolation, and deletion receipts remain in place. MCP, generation, and nightly work run in the existing Durable Object.
 - **Optional direct ChatGPT connection.** Workers AI is the default. A ChatGPT plan is used only for the owner's personal workspace after the owner connects and enables it. No VPS or CLIProxyAPI is required.
 
-The current upstream base is the unreleased `release/4.0.0` branch at `d550921a8c0ae25f6788ead3d8209f29fc4df6d6`. This fork is not the official upstream 4.0.0 release.
+The current upstream base is `main` at `4e30f973802e54740f7e709516c365078760febb`, which merged the upstream 4.0.0 release. Audits now track `upstream/main`. This remains an independently maintained fork.
 
 ## Self-hosting
 

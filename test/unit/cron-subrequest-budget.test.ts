@@ -212,11 +212,14 @@ describe("nightly cron D1 subrequest cost", () => {
   });
 
   it.each([[false, false], [true, false], [true, true]])("counts SQL and other bindings separately with active work (Sunday=%s, long=%s)", async (sunday, long) => {
-    // Use the next weekend, not a past frozen timestamp: SQLite's real clock
-    // validates write-admission expiry independently of the JavaScript clock.
+    // Use a future weekend: SQLite validates admission expiry against its real clock.
+    // Keep Saturday at maintenance phase 0 and Sunday at phase 1. The phase-2
+    // index-first pass can legitimately defer compression within the shared budget;
+    // this fixture asserts a complete digest run, not that every phase completes it.
     const current = new Date();
-    const nextSaturday = Date.UTC(current.getUTCFullYear(), current.getUTCMonth(),
+    let nextSaturday = Date.UTC(current.getUTCFullYear(), current.getUTCMonth(),
       current.getUTCDate() + 7 + ((6 - current.getUTCDay() + 7) % 7), 1);
+    while (Math.floor(nextSaturday / 86400000) % 3 !== 0) nextSaturday += 7 * 86400000;
     vi.spyOn(Date, "now").mockReturnValue(nextSaturday + (sunday ? 86400000 : 0));
     const errors: unknown[][] = [];
     vi.spyOn(console, "error").mockImplementation((...args) => { errors.push(args); });
