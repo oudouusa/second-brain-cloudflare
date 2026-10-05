@@ -2,7 +2,7 @@
 
 ## Audit targets
 
-The current audit target is the unreleased `upstream/release/4.0.0`; the watch target is `upstream/main`. The initial base tag, `upstream-base-2026-08-23`, points to upstream commit `99f1c1a2a005d8f835aef93c786cfe07f54780f3`. After the official upstream release, integrate and verify it before switching the audit target.
+The current audit target is `upstream/main`. The integrated revision is `4e30f973802e54740f7e709516c365078760febb`, which merged the upstream 4.0.0 release. Its tree matches the previously integrated release branch, so taking in the merge history did not change application files. No separate watch target is needed. The initial base tag, `upstream-base-2026-08-23`, points to upstream commit `99f1c1a2a005d8f835aef93c786cfe07f54780f3`.
 
 ```sh
 git remote add upstream https://github.com/rahilp/second-brain-cloudflare.git

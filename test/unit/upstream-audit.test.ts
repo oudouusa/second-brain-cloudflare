@@ -129,7 +129,7 @@ describe("upstream sync audit", () => {
     for (const name of ["upstream:audit", "upstream:audit:boundary"]) {
       const args = parseArgs(pkg.scripts[name].split(" ").slice(2));
       expect(args).toMatchObject({
-        upstreamRef: "upstream/release/4.0.0", watchRefs: ["upstream/main"], fetch: true, checkPushBlock: true,
+        upstreamRef: "upstream/main", watchRefs: [], fetch: true, checkPushBlock: true,
         requireCurrent: name === "upstream:audit",
         requireMergeable: name === "upstream:audit",
       });
