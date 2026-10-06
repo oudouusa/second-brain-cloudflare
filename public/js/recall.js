@@ -32,7 +32,7 @@ function extractChatChunkText(d) {
   return typeof content === 'string' ? content : ''
 }
 
-function consumeChatSseLine(line, onText, onComplete) {
+function consumeChatSseLine(line, onText, onComplete, onSources) {
   if (!line.startsWith('data:')) return
   // SSE permits exactly one optional space after the field colon.
   const payload = line.slice(line.startsWith('data: ') ? 6 : 5)
@@ -43,6 +43,10 @@ function consumeChatSseLine(line, onText, onComplete) {
   }
   try {
     const d = JSON.parse(payload)
+    if (d.type === 'sources' && Array.isArray(d.sources)) {
+      if (onSources) onSources(d.sources)
+      return
+    }
     const text = extractChatChunkText(d)
     if (text) onText(text)
   } catch (e) {
@@ -63,13 +67,13 @@ function consumeChatSseLine(line, onText, onComplete) {
  * consumeChatSseLine once the stream ends. Mirrors the buffering loop in
  * src/lib/ai.ts's readStreamText.
  */
-function feedChatStream(buffer, decodedChunk, onText, onComplete) {
+function feedChatStream(buffer, decodedChunk, onText, onComplete, onSources) {
   buffer += decodedChunk
   const lines = buffer.split('\n')
   // The last element is either "" (buffer ended on a newline) or an
   // incomplete line — either way it stays buffered for the next call.
   buffer = lines.pop() ?? ''
-  for (const line of lines) consumeChatSseLine(line, onText, onComplete)
+  for (const line of lines) consumeChatSseLine(line, onText, onComplete, onSources)
   return buffer
 }
 
@@ -140,7 +144,7 @@ async function sendRecall(retryQuery) {
       // created_at and source travel with the card now: a source you cannot
       // date or place is hard to weigh, and the answer above cites these by
       // number, so each card has to be able to say which number it is.
-      const entries = data.results.map((m) => ({
+      let entries = data.results.map((m) => ({
         id: m.id,
         content: m.content,
         tags: m.tags || [],
@@ -185,10 +189,19 @@ async function sendRecall(retryQuery) {
       const res = await fetch(`${WORKER_URL}/chat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${AUTH_TOKEN}` },
-        body: JSON.stringify({ query, memories,
+        body: JSON.stringify({ query, memories, tag: recallBody.tag, project: recallBody.project,
           workspace: (!layer || layer === 'personal') && data.results.every(m => m.workspace === 'personal') ? 'personal' : undefined }),
       })
 
+      if (res.status === 409) {
+        const failure = await res.json()
+        if (failure.code === 'no_personal_memories') {
+          answerBubble.remove()
+          appendBrainBubble(msgs, t('recall.empty'), 'recall-sys')
+          document.getElementById('recall-clear-btn').style.display = 'flex'
+          return
+        }
+      }
       if (!res.ok || !res.body) throw new Error("Answer generation is temporarily unavailable")
       const usesChatGpt = res.headers.get('X-Second-Brain-AI-Provider') === 'chatgpt'
       if (usesChatGpt) {
@@ -202,6 +215,12 @@ async function sendRecall(retryQuery) {
       let fullText = ''
       let buffer = ''
       let completed = false
+      let receivedSources = false
+      const onSources = (sources) => {
+        if (!usesChatGpt) return
+        entries = sources
+        receivedSources = true
+      }
       const onComplete = () => { completed = true }
       const onText = (chunk) => {
         fullText += chunk
@@ -213,16 +232,16 @@ async function sendRecall(retryQuery) {
           if (done) break
           // { stream: true } holds back a trailing partial multi-byte
           // sequence until the bytes that complete it arrive next read.
-          buffer = feedChatStream(buffer, decoder.decode(value, { stream: true }), onText, onComplete)
+          buffer = feedChatStream(buffer, decoder.decode(value, { stream: true }), onText, onComplete, onSources)
           msgs.scrollTop = msgs.scrollHeight
         }
         // Flush any bytes the decoder was holding back, then process a
         // final line that may have arrived with no trailing newline.
         buffer += decoder.decode()
-        if (buffer) consumeChatSseLine(buffer, onText, onComplete)
+        if (buffer) consumeChatSseLine(buffer, onText, onComplete, onSources)
         // DOから転送したstreamの途中エラーは、HTTPでは単なるEOFになる場合がある。
         // 直接経路はserverが検証して出した完了通知まで確認し、部分回答を残さない。
-        if (usesChatGpt && !completed) throw new Error('ChatGPT response did not complete')
+        if (usesChatGpt && (!completed || !receivedSources)) throw new Error('ChatGPT response did not complete')
       } catch (error) {
         if (usesChatGpt) answerBubble.remove()
         throw error

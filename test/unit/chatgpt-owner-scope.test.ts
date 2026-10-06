@@ -62,12 +62,15 @@ describe("実際の認証とworkspaceを使うHTTP境界", () => {
     method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json", "X-Second-Brain-ChatGPT-Workspace": "owner" }, body: JSON.stringify(body),
   }), env, { waitUntil: vi.fn() } as unknown as ExecutionContext);
   it("所有者が個人範囲を指定した回答だけがプランを使い、使用量導線を識別できる", async () => {
-    const response = await call("/chat", env.AUTH_TOKEN, { query: "状態は？", memories: "合成記憶", workspace: "personal" });
+    await db.db.prepare("INSERT INTO entries (id, content, tags, source, created_at, workspace_id) VALUES ('answer-source', '状態は良好', '[]', 'test', ?, ?)")
+      .bind(Date.now(), roots.ownerPersonalWorkspaceId).run();
+    env.CHATGPT_OPERATIONS = "answer";
+    const response = await call("/chat", env.AUTH_TOKEN, { query: "状態", memories: "合成記憶", workspace: "personal" });
     expect(response.status).toBe(200);
     expect(await response.text()).toContain("個人の回答");
     expect(response.headers.get("X-Second-Brain-AI-Provider")).toBe("chatgpt");
     expect(fetcher).toHaveBeenCalledOnce();
-    expect(env.AI.run).not.toHaveBeenCalled();
+    expect(vi.mocked(env.AI.run).mock.calls.every(([, input]) => !(input as { stream?: boolean }).stream)).toBe(true);
   });
   it.each([undefined, "company"])("所有者でも範囲 %s の回答はWorkers AIを使う", async workspace => {
     const response = await call("/chat", env.AUTH_TOKEN, { query: "状態は？", memories: "共有の合成記憶", workspace, CHATGPT_WORKSPACE_ID: roots.ownerPersonalWorkspaceId });

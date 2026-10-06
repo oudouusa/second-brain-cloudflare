@@ -122,6 +122,19 @@ describe("feedChatStream() — assembling the /chat answer", () => {
     expect(onComplete).toHaveBeenCalledOnce();
   });
 
+  it("分割された出典イベントを回答本文や完了通知と混同しない", () => {
+    const ctx = load();
+    const onText = vi.fn(), onComplete = vi.fn(), onSources = vi.fn();
+    const sources = [{ id: "server", content: "資料\n[DONE]" }];
+    const event = `data: ${JSON.stringify({ type: "sources", sources })}\n\n`;
+    const buffer = ctx.feedChatStream("", event.slice(0, 35), onText, onComplete, onSources);
+    expect(onSources).not.toHaveBeenCalled();
+    ctx.feedChatStream(buffer, event.slice(35), onText, onComplete, onSources);
+    expect(onSources).toHaveBeenCalledExactlyOnceWith(sources);
+    expect(onText).not.toHaveBeenCalled();
+    expect(onComplete).not.toHaveBeenCalled();
+  });
+
   it("末尾改行のない完了通知をEOFのflushで検出する", () => {
     const ctx = load();
     const onComplete = vi.fn();
@@ -185,13 +198,15 @@ describe("feedChatStream() — assembling the /chat answer", () => {
 
 describe("sendRecall()の直接接続完了確認", () => {
   it.each([
+    { name: "再検索で資料がなくなれば空結果を表示する", provider: "chatgpt", terminal: "", readError: false, success: false, empty: true },
+    { name: "出典が届かない直接回答は表示しない", provider: "chatgpt", terminal: "data: [DONE]", readError: false, success: false, omitSources: true },
     { name: "直接接続の完了通知があれば英語の使用量表示・回答・出典を表示する", provider: "chatgpt", terminal: "data: [DONE]", readError: false, success: true },
     { name: "イタリア語設定では直接接続の使用量表示も翻訳する", provider: "chatgpt", terminal: "data: [DONE]", readError: false, success: true, locale: "it" as const },
     { name: "直接接続の途中EOFでは部分回答を除去してエラーを表示する", provider: "chatgpt", terminal: "", readError: false, success: false },
     { name: "本文中のDONE文字列を直接接続の完了と誤認しない", provider: "chatgpt", terminal: 'data: {"response":"[DONE]"}\n', readError: false, success: false },
     { name: "直接接続のread失敗でも部分回答を残さない", provider: "chatgpt", terminal: "", readError: true, success: false },
     { name: "通常Workers AIのEOFで従来どおり回答と出典を表示する", provider: "workers-ai", terminal: "", readError: false, success: true },
-  ])("$name", async ({ provider, terminal, readError, success, locale }) => {
+  ])("$name", async ({ provider, terminal, readError, success, locale, omitSources, empty }) => {
     // DOMの接続状態を保持し、実際のsendRecallによる描画・除去を検査する。
     const makeElement = (): any => ({
       className: "", textContent: "", innerHTML: "", style: {}, dataset: {}, children: [], parent: null,
@@ -214,6 +229,7 @@ describe("sendRecall()の直接接続完了確認", () => {
     const stream = new ReadableStream({
       pull(controller) {
         if (chunk++ === 0) {
+          if (provider === "chatgpt" && !omitSources) controller.enqueue(encoder.encode('data: {"type":"sources","sources":[{"id":"server-source","content":"サーバーが採用した記憶","tags":[],"score":90}]}\n\n'));
           controller.enqueue(encoder.encode('data: {"response":"途中の回答"}\n'));
         } else if (readError) {
           controller.error(new Error("通信中断"));
@@ -227,7 +243,7 @@ describe("sendRecall()の直接接続完了確認", () => {
       .mockResolvedValueOnce(Response.json({ ok: true, results: [{
         id: "private-memory", content: "個人の記憶", score: 80, workspace: "personal", created_at: "2026-10-01",
       }] }))
-      .mockResolvedValueOnce(new Response(stream, { headers: { "X-Second-Brain-AI-Provider": provider } }));
+      .mockResolvedValueOnce(empty ? Response.json({ code: "no_personal_memories" }, { status: 409 }) : new Response(stream, { headers: { "X-Second-Brain-AI-Provider": provider } }));
     const ctx = load({
       document: {
         getElementById(id: string) {
@@ -236,21 +252,22 @@ describe("sendRecall()の直接接続完了確認", () => {
         createElement: makeElement,
       },
       fetch, TextDecoder, WORKER_URL: "https://worker.invalid", AUTH_TOKEN: "synthetic-test-auth",
-      selectedTag: "", selectedProject: "", autoResize: vi.fn(), appendUserBubble: vi.fn(),
+      selectedTag: "selected-tag", selectedProject: "selected-project", autoResize: vi.fn(), appendUserBubble: vi.fn(),
       appendLoading: () => makeElement(), appendBrainBubble: bubbles,
       escHtml: (text: string) => text,
       renderAnswerMarkdown: render,
     });
     installI18n(ctx, locale ?? "en");
     ctx.renderStandingFires = vi.fn();
-    ctx.makeRecallCard = () => makeElement();
+    ctx.makeRecallCard = vi.fn(() => makeElement());
     await ctx.sendRecall();
     expect(fetch).toHaveBeenCalledTimes(2);
-    expect(JSON.parse(fetch.mock.calls[1][1].body).workspace).toBe("personal");
+    expect(JSON.parse(fetch.mock.calls[1][1].body)).toMatchObject({ workspace: "personal", tag: "selected-tag", project: "selected-project" });
     expect(messages.children.filter((el: any) => el.className === "ex-a-row")).toHaveLength(success ? 1 : 0);
     expect(messages.children.filter((el: any) => el.className === "sources-toggle")).toHaveLength(success ? 1 : 0);
     if (success) {
       expect(render).toHaveBeenCalledWith("途中の回答");
+      expect(ctx.makeRecallCard.mock.calls[0][0].id).toBe(provider === "chatgpt" ? "server-source" : "private-memory");
       expect(bubbles).not.toHaveBeenCalled();
       const answer = messages.children.find((el: any) => el.className === "ex-a-row");
       const usage = answer.children.find((el: any) => el.className === "ex-a-provider");
@@ -264,7 +281,7 @@ describe("sendRecall()の直接接続完了確認", () => {
       }
     } else {
       expect(render).not.toHaveBeenCalled();
-      expect(bubbles).toHaveBeenCalledWith(messages, ctx.t("recall.error"), "recall-sys");
+      expect(bubbles).toHaveBeenCalledWith(messages, ctx.t(empty ? "recall.empty" : "recall.error"), "recall-sys");
     }
     expect(clear.style.display).toBe("flex");
   });

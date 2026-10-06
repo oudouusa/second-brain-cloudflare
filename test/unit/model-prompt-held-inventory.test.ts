@@ -42,6 +42,7 @@ interface Site { file: string; line: number }
 export function isChatCallSite(lines: string[], i: number): boolean {
   // provider共通helperに移したpromptも、呼出元のheld境界を列挙する。
   if (!/\bfunction\s+generateText\b/.test(lines[i]) && /\bgenerateText\(/.test(lines[i])) return true;
+  if (!/\bfunction\s+runChatGptGenerationAnswerStream\b/.test(lines[i]) && /\brunChatGptGenerationAnswerStream\(/.test(lines[i])) return true;
   if (!/\.run\(/.test(lines[i])) return false;
   const window = lines.slice(i, i + 6).join("\n");
   return /messages\s*:|contexts\s*:/.test(window);
@@ -63,6 +64,7 @@ function scanChatCalls(): Site[] {
 }
 
 const ACCOUNTED_FOR: { file: string; line: number; why: string }[] = [
+  { file: "src/routes/recall.ts", line: 492, why: "ChatGPT回答の参照本文は認証済み所有者のpersonal検索結果だけから構築する。recallEntriesの保留・有効期間・領域検査を再利用し、クライアント本文は渡さない。chatgpt-answer-sources.test.tsで保留化後の除外を実SQLiteで検証する。" },
   { file: "src/lib/ai.ts", line: 185, why: "generateTextはprovider共通の通信境界。本文の適格性は列挙したdigest・weekly-insight・recall-summaryの各呼出元で検査する。" },
   {
     file: "src/capture/classify.ts", line: 77,
@@ -97,8 +99,8 @@ const ACCOUNTED_FOR: { file: string; line: number; why: string }[] = [
     why: "judgeCommitment's prompt is built from candidateSql's own rows, which now adds NOT_HELD_SQL alongside its existing when_at/when_source/openLoopSql predicates (Codex review class E, T-0089.4.2).",
   },
   {
-    file: "src/routes/recall.ts", line: 480,
-    why: "POST /chat's body.memories is opaque client-composed text (see the route's own comment: the shipped client serializes a prior GET /recall response into it), never a server-side row read here -- there is no candidate query at this boundary to filter. The row-read boundary this rule protects is GET /recall and get(), which already exclude/warn on held content before the client ever sees it to compose from.",
+    file: "src/routes/recall.ts", line: 513,
+    why: "Workers AIの既存回答経路はクライアント本文を使い、ここではDBの行を取得しない。サーバーの行取得時の保留検査はrecall/getが担当する。ChatGPTのサーバー検索は別の呼出箇所として列挙する。",
   },
 ];
 
@@ -123,6 +125,10 @@ describe("every chat-completion call site's row source excludes held rows, or is
 // below is a shape a lookback-based scanner could never have caught, asserted directly against
 // isChatCallSite(), no fixture file needed.
 describe("structural probes the reviewer found unguarded (banned pattern, no binding tracing)", () => {
+  it("ChatGPT回答の通信呼出を検出し、関数定義は数えない", () => {
+    expect(isChatCallSite(["const stream = await runChatGptGenerationAnswerStream(env, messages);"], 0)).toBe(true);
+    expect(isChatCallSite(["export async function runChatGptGenerationAnswerStream(env, messages) {"], 0)).toBe(false);
+  });
   it("finds a chat call whose AI binding is aliased 3 lines above it", () => {
     const lines = [
       "const ai = env.AI;",
