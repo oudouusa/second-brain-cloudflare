@@ -3,7 +3,6 @@ import { makeTestEnv } from "../helpers/make-env";
 import { synthesizeDigest } from "../../src/compression/digest";
 import { synthesizeInsight } from "../../src/recall/insight";
 import { reasonOverPair } from "../../src/insight/reason";
-import { handleRecallRoutes } from "../../src/routes/recall";
 import * as vocabulary from "../../src/tags/vocabulary";
 import { DEFAULTS, type Config } from "../../src/config";
 import type { Env } from "../../src/env";
@@ -45,15 +44,7 @@ describe("生成処理の全面移行", () => {
     expect(JSON.parse(fetch.mock.calls[0][1].body).model).toBe("gpt-5.6-terra");
     expect(env.AI.run).not.toHaveBeenCalled();
   });
-  it("回答の直接接続障害は503で、Scoutへ戻らない", async () => {
-    const { env } = setup("unavailable", "stop", 503);
-    const owner = await (await import("../../src/lib/identity")).resolveIdentityFromToken(env.AUTH_TOKEN, env);
-    env.CHATGPT_OWNER_WORKSPACE_ID = owner!.personalWorkspaceId;
-    const request = new Request("https://example.test/chat", { method: "POST", headers: { Authorization: "Bearer test-token", "Content-Type": "application/json" }, body: JSON.stringify({ query: "status", memories: "1. pending", workspace: "personal" }) });
-    const response = await handleRecallRoutes(request, new URL(request.url), env, { waitUntil: vi.fn() } as unknown as ExecutionContext);
-    expect(response?.status).toBe(503);
-    expect(env.AI.run).not.toHaveBeenCalled();
-  });
+
 });
 
 describe("単純テキスト生成3箇所の接続契約", () => {

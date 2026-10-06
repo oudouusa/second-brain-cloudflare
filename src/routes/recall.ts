@@ -425,7 +425,7 @@ export async function handleRecallRoutes(
     const auth = await requireIdentity(request, env);
     if (auth instanceof Response) return auth;
 
-    const parsedBody = await readJsonBody<{ query?: unknown; memories?: unknown; workspace?: unknown }>(request, 256 * 1024);
+    const parsedBody = await readJsonBody<{ query?: unknown; memories?: unknown; workspace?: unknown; tag?: unknown; project?: unknown }>(request, 256 * 1024);
     if (!parsedBody.ok) return parsedBody.response;
     const body = parsedBody.value;
     if (typeof body.query !== "string" || !body.query.trim()) return json({ ok: false, error: "query is required" }, 400);
@@ -433,12 +433,12 @@ export async function handleRecallRoutes(
     if (body.workspace !== undefined && body.workspace !== "personal" && body.workspace !== "company") {
       return json({ ok: false, error: 'workspace must be "personal" or "company"' }, 400);
     }
-    // 本文はclient作成なので、範囲未指定は個人領域と推測しない。
-    // memberのpersonalWorkspaceIdは所有者の設定・資格情報束縛と一致しない。
+    // 範囲の申告は経路選択にだけ使い、参照本文の証明には使わない。
     env = chatGptEnvForWorkspaces(env, body.workspace === "personal" ? [auth.personalWorkspaceId] : []);
 
-    // The memories arrive numbered, dated and attributed (see the client's
-    // serializer in public/js/recall.js and the MCP tool's mirror of it), so
+    // 参照記憶は日付と番号を付ける。ChatGPTでは下記のサーバー検索結果を使い、
+    // Workers AIでは従来のクライアント本文を使う。
+    // The numbered, dated and attributed memories mean
     // the model has everything it needs to be specific — it just has to be
     // asked. The previous prompt ended "Be concise", and on a brain holding
     // three days of dense decisions "What did I decide recently?" came back as
@@ -458,16 +458,48 @@ Even if the match scores are low, extract any relevant facts and answer directly
 
 Be specific and complete. Concision means leaving out filler, never leaving out facts.`;
 
-    const userMessage = `Question: ${body.query}\n\nRelevant memories:\n${body.memories}`;
     const cfg = await resolveConfig(env);
 
     if (isChatGptOperationEnabled(env, "answer")) {
+      if (body.tag !== undefined && typeof body.tag !== "string") {
+        return json({ ok: false, error: "tag must be a string" }, 400);
+      }
+      const project = await readProjectParam(env, auth, url, { layer: "personal" }, body.project ?? null);
+      if (project instanceof Response) return project;
       try {
+        // 回答と同じ要求内でD1由来の個人検索結果を取得する。
+        // クライアントの本文・ID・receipt・workspace申告を出所証明にしない。
+        const { matches } = await recallEntries({
+          query: body.query.trim(), topK: 5, hops: 1,
+          tag: typeof body.tag === "string" ? body.tag.trim() || undefined : undefined,
+          project, synthesize: false, channel: "rest",
+        }, env, ctx, cfg, { identity: auth, workspaceFilter: "personal" });
+        if (!matches.length) {
+          return json({ ok: false, code: "no_personal_memories", error: "No matching personal memories were found" }, 409);
+        }
+        const sources = matches.map(m => ({
+          id: m.id, content: m.content, tags: m.tags, source: m.source,
+          score: Math.min(100, Math.round(m.score * 100)), hop: m.hop,
+          created_at: m.createdAt, workspace: m.workspace,
+          valid_from: m.validFrom, valid_from_stated: m.validFromStated,
+          valid_until: m.validUntil, validity_state: m.validityState,
+          superseded_by: m.supersededBy, retracted_source: m.retractedSource,
+        }));
+        const memories = sources.map((m, i) => {
+          const date = new Date(m.created_at).toLocaleDateString("en-US", { year: "numeric", month: "short", day: "numeric", timeZone: "UTC" });
+          return `${i + 1}. [${date} · ${m.source} [${m.tags.join(", ")}]] (${m.score}% match)${matches[i].isUpdate ? " [updated]" : ""}${m.hop > 0 ? ` [related, ${m.hop} hop]` : ""}\n${m.content}`;
+        }).join("\n\n");
         const stream = await runChatGptGenerationAnswerStream(env, [
           { role: "system", content: systemPrompt },
-          { role: "user", content: userMessage },
+          { role: "user", content: `Question: ${body.query}\n\nRelevant memories:\n${memories}` },
         ]);
-        return new Response(stream, {
+        // モデルに渡した順序・本文を画面にも渡す。終端と取消は元streamに従う。
+        const withSources = stream.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify({ type: "sources", sources })}\n\n`));
+          },
+        }));
+        return new Response(withSources, {
           headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-store", ...CORS_HEADERS,
             "X-Second-Brain-AI-Provider": "chatgpt", "Access-Control-Expose-Headers": "X-Second-Brain-AI-Provider" },
         });
@@ -476,6 +508,7 @@ Be specific and complete. Concision means leaving out filler, never leaving out 
       }
     }
 
+    const userMessage = `Question: ${body.query}\n\nRelevant memories:\n${body.memories}`;
     // Workers AI requires `as any` here — the SDK types don't cover all models
     const stream = await env.AI.run(cfg.LLM_MODEL as any, {
       messages: [

@@ -50,7 +50,11 @@ Supported settings are `classify,query-tags,smart-merge,contradiction,recall-sum
 
 Scope comes from authenticated HTTP/MCP identity, capture/mirror WriteContext, or the actual rows processed by nightly work. The encrypted session is also bound to the actual owner workspace. A configuration pointing to another workspace is rejected before refresh or Responses dispatch. Internal `CHATGPT_WORKSPACE_ID` is not a binding and is never taken from request headers or JSON. Scoping Env preserves KV, D1 budgets, and hidden write admission.
 
-`POST /chat` receives client-built `memories` strings, so the server cannot prove their provenance. Direct access requires `workspace:"personal"` and the authenticated owner's workspace. The included UI sends this declaration only when every actual search result belongs to the personal workspace. It shows “Using ChatGPT plan” and [Manage usage](https://chatgpt.com/settings/usage) through the existing en/it translations. The direct-connection UI requires a completion event; early EOF or read failure removes partial answers and shows an error. This does not guarantee the provenance of arbitrary content the owner submits through another client.
+`POST /chat` selects ChatGPT only for `workspace:"personal"` from the authenticated owner. It ignores client-built `memories`, entry IDs, and receipts as evidence: the server runs the existing `recallEntries` pipeline for that owner's personal workspace, with `synthesize:false`, five results, one graph hop, and the supplied tag/project filters. Existing D1 workspace, held-row, deletion, and validity predicates apply. Empty results return `409` with `code:"no_personal_memories"` before answer generation; search or generation failure does not fall back to client context or Workers AI.
+
+The answer stream begins with a `data:` JSON event `{type:"sources",sources:[...]}` containing the exact selected source text and citation order. The dashboard replaces its earlier search cards with these sources, requires both sources and completion before retaining an answer, and shows “Using ChatGPT plan” and [Manage usage](https://chatgpt.com/settings/usage). A source removed or moved before the answer's retrieval is excluded. Retrieval establishes a read-time snapshot: a later mutation cannot retract content already read or sent to the provider, and no lock spans inference. The user's question remains user-supplied text; this is a provenance guarantee for retrieved memory context, not for the question itself. Workers AI retains its existing client-context contract.
+
+This adds a second bounded retrieval for ChatGPT answers after the dashboard's initial search. It stays inside the existing executor DO and adds no synthesis pass, binding, dependency, or persistent authorization receipt. Local synthetic tests establish isolation and stream behavior, not production latency, billed D1 rows, or OpenAI eligibility.
 
 ## Registration and credentials
 
@@ -105,8 +109,9 @@ This is a design discussion, not a ready-to-merge upstream implementation.
 - No access to ChatGPT conversation history. No changes to search, embeddings,
   memory storage, the desktop installer, or existing authentication.
 
-An upstream patch would need server-established personal retrieval scope.
-Client-supplied workspace labels alone do not prove where answer context came from.
+The fork now establishes personal retrieval scope on the server for answers.
+An upstream patch should retain that boundary: client-supplied workspace labels
+and memory text are not provenance evidence. Hosting eligibility still requires confirmation.
 
 #### Authentication and inference boundaries
 

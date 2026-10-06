@@ -30,6 +30,7 @@ describe("ChatGPT直接接続のWorkers実ランタイム契約", () => {
       import { withVerifiedAuth } from "./src/lib/http";
       import { runChatGptText } from "./src/lib/chatgpt";
       import { createDefaultHandler } from "./src/routes/index";
+      import { beginMemoryWriteAdmission, memoryWriteMarker } from "./src/migration/write-lock";
       import { initializeDatabase } from "./src/db/init";
       import { chatGptSessionStatus } from "./src/lib/chatgpt-session";
       import { McpExecutor as BaseExecutor } from "./src/mcp/executor";
@@ -44,6 +45,19 @@ describe("ChatGPT直接接続のWorkers実ランタイム契約", () => {
         // 本番では接続後にvarsを明示設定する。合成Workerは保存された束縛を使う。
         env.CHATGPT_OWNER_WORKSPACE_ID = (await chatGptSessionStatus(env)).owner_workspace_id;
         const url = new URL(request.url);
+        if (url.pathname === "/fixture" && request.headers.get("X-Second-Brain-Auth-Verified") === "1") {
+          const tracked = await beginMemoryWriteAdmission(env, ctx);
+          try {
+            if (request.method === "POST") {
+              await env.DB.prepare("INSERT INTO entries (id, content, tags, source, created_at, workspace_id, write_marker) VALUES ('runtime-source', ?, '[]', 'test', ?, ?, ?)")
+                .bind(await request.text(), Date.now() - 1000, env.CHATGPT_OWNER_WORKSPACE_ID, memoryWriteMarker(tracked.env)).run();
+            } else {
+              await env.DB.prepare("UPDATE entries SET write_marker = ? WHERE id = 'runtime-source'").bind(memoryWriteMarker(tracked.env, "delete")).run();
+              await env.DB.prepare("DELETE FROM entries WHERE id = 'runtime-source'").run();
+            }
+            return Response.json({ ok: true });
+          } finally { await tracked.finish(); }
+        }
         if (["/chat", "/recall"].includes(url.pathname)) return await createDefaultHandler().fetch(request, env, ctx);
         if (url.pathname === "/insights/dry-run") {
           if (request.headers.get("X-Second-Brain-Auth-Verified") === "1") await initializeDatabase(env);
@@ -110,13 +124,24 @@ describe("ChatGPT直接接続のWorkers実ランタイム契約", () => {
     const status = await mf.dispatchFetch("https://brain/admin/chatgpt/status", { headers: owner });
     expect(await status.json()).toMatchObject({ state: "ready", connected: true });
   });
-  it("実際のDO RPCを通した回答SSEが停止と終端まで届く", async () => {
+  const withSource = async (test: () => Promise<void>, content = "接続確認") => {
+    const seeded = await mf.dispatchFetch("https://brain/fixture", { method: "POST", headers: owner, body: content });
+    expect(seeded.status).toBe(200);
+    try { await test(); }
+    finally {
+      const deleted = await mf.dispatchFetch("https://brain/fixture", { method: "DELETE", headers: owner });
+      expect(deleted.status).toBe(200);
+    }
+  };
+  it("実際のDO RPCを通した回答SSEが停止と終端まで届く", async () => withSource(async () => {
     const response = await mf.dispatchFetch("https://brain/chat", { method: "POST", headers: owner,
       body: JSON.stringify({ query: "接続確認", memories: "合成記憶", workspace: "personal" }) });
     expect(response.status).toBe(200);
     const sse = await response.text();
+    expect(sse).toContain('"type":"sources"');
+    expect(sse).toContain('"id":"runtime-source"');
     expect(sse).toContain("接続確認"); expect(sse).toContain('"finish_reason":"stop"'); expect(sse).toContain("data: [DONE]");
-  });
+  }));
   it("固定probeのJSONが実際のDO RPCで本文終端まで届く", async () => {
     const response = await mf.dispatchFetch("https://brain/admin/chatgpt/probe", { method: "POST", headers: owner,
       body: JSON.stringify({ model: "gpt-5.6-luna" }) });
@@ -150,13 +175,13 @@ describe("ChatGPT直接接続のWorkers実ランタイム契約", () => {
       body: JSON.stringify({ query: "接続確認", memories: "x".repeat(256 * 1024) }) });
     expect(response.status).toBe(413);
   });
-  it("DOの回答転送後も未完了のSSEを正常終了へ変換しない", async () => {
+  it("DOの回答転送後も未完了のSSEを正常終了へ変換しない", async () => withSource(async () => {
     const response = await mf.dispatchFetch("https://brain/chat", { method: "POST", headers: owner,
-      body: JSON.stringify({ query: "missing-terminal", memories: "合成記憶", workspace: "personal" }) });
+      body: JSON.stringify({ query: "接続確認 missing-terminal", memories: "合成記憶", workspace: "personal" }) });
     expect(response.status).toBe(200);
     // workerdのHTTP転送ではstream errorもEOFになり得る。正常終了のSSE終端を出さないことを確認する。
     const partial = await response.text();
     expect(partial).toContain("途中");
     expect(partial).not.toContain('"finish_reason":"stop"'); expect(partial).not.toContain("data: [DONE]");
-  });
+  }, "接続確認 missing-terminal"));
 });
