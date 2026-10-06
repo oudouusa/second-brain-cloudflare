@@ -27,6 +27,9 @@ import type { RecallDiagnostics } from "../../src/recall/types";
 
 /** A cron string that is not one of the special schedules — routes to the nightly maintenance branch. */
 const MAINTENANCE_CRON = "0 1 * * *";
+// 同夜のFTS修復を検査するケースはphase=0の保守順序に固定する。
+// 実行日の巡回phaseで先行保守のSQL消費が変わっても検査条件を変えない。
+const MAINTENANCE_TIME = Date.UTC(2026, 9, 4, 1);
 
 function makeCtx() {
   const pending: Promise<unknown>[] = [];
@@ -403,7 +406,7 @@ describe("scheduled() repairs entries_fts for nightly writes (S3)", () => {
     await breakByDroppingTable(d1);
     const { ctx, drain } = makeCtx();
 
-    await worker.scheduled({ cron: MAINTENANCE_CRON } as ScheduledEvent, rawEnv, ctx);
+    await worker.scheduled({ cron: MAINTENANCE_CRON, scheduledTime: MAINTENANCE_TIME } as ScheduledEvent, rawEnv, ctx);
     await drain();
 
     const row = d1.rows().find(r => r.id === "stale-1");
@@ -416,7 +419,7 @@ describe("scheduled() repairs entries_fts for nightly writes (S3)", () => {
     // once and the ready flag latched.
     expect(await ftsObjectNames(d1)).toEqual(ALL_FTS_OBJECTS);
     for (let retry = 0; retry < 3 && await rawEnv.OAUTH_KV.get(FTS_READY_KV_KEY) !== "1"; retry++) {
-      await worker.scheduled({ cron: MAINTENANCE_CRON, scheduledTime: Date.now() + (retry + 1) * 86400000 } as ScheduledEvent, rawEnv, ctx);
+      await worker.scheduled({ cron: MAINTENANCE_CRON, scheduledTime: MAINTENANCE_TIME + (retry + 1) * 86400000 } as ScheduledEvent, rawEnv, ctx);
       await drain();
     }
     expect(await rawEnv.OAUTH_KV.get(FTS_READY_KV_KEY)).toBe("1");
@@ -447,7 +450,7 @@ describe("scheduled() repairs entries_fts for nightly writes (S3)", () => {
     await breakByReshaping(d1);
     const { ctx, drain } = makeCtx();
 
-    await worker.scheduled({ cron: MAINTENANCE_CRON } as ScheduledEvent, rawEnv, ctx);
+    await worker.scheduled({ cron: MAINTENANCE_CRON, scheduledTime: MAINTENANCE_TIME } as ScheduledEvent, rawEnv, ctx);
     await drain();
 
     const row = d1.rows().find(r => r.id === "stale-1");
@@ -457,7 +460,7 @@ describe("scheduled() repairs entries_fts for nightly writes (S3)", () => {
     // names, and the backfill that ran right after latched ready.
     expect(await ftsObjectNames(d1)).toEqual(ALL_FTS_OBJECTS);
     for (let retry = 0; retry < 3 && await rawEnv.OAUTH_KV.get(FTS_READY_KV_KEY) !== "1"; retry++) {
-      await worker.scheduled({ cron: MAINTENANCE_CRON, scheduledTime: Date.now() + (retry + 1) * 86400000 } as ScheduledEvent, rawEnv, ctx);
+      await worker.scheduled({ cron: MAINTENANCE_CRON, scheduledTime: MAINTENANCE_TIME + (retry + 1) * 86400000 } as ScheduledEvent, rawEnv, ctx);
       await drain();
     }
     expect(await rawEnv.OAUTH_KV.get(FTS_READY_KV_KEY)).toBe("1");
@@ -497,7 +500,7 @@ describe("a corrupted index heals across nights (Task 5 end to end)", () => {
     await breakByDroppingTable(d1); // triggers still reference a table that is now gone: not live
 
     const { ctx: ctx1, drain: drain1 } = makeCtx();
-    await worker.scheduled({ cron: MAINTENANCE_CRON } as ScheduledEvent, rawEnv, ctx1);
+    await worker.scheduled({ cron: MAINTENANCE_CRON, scheduledTime: MAINTENANCE_TIME } as ScheduledEvent, rawEnv, ctx1);
     await drain1();
 
     // Night 1: rebuilt (table and triggers back), backfill started but did
@@ -509,12 +512,12 @@ describe("a corrupted index heals across nights (Task 5 end to end)", () => {
 
     resetDatabaseInit(); // a fresh cold-start probe, as a new night's isolate would run
     const { ctx: ctx2, drain: drain2 } = makeCtx();
-    await worker.scheduled({ cron: MAINTENANCE_CRON } as ScheduledEvent, rawEnv, ctx2);
+    await worker.scheduled({ cron: MAINTENANCE_CRON, scheduledTime: MAINTENANCE_TIME + 86400000 } as ScheduledEvent, rawEnv, ctx2);
     await drain2();
 
     // Night 2: the remaining tail is indexed and ready latches.
     for (let retry = 0; retry < 3 && await rawEnv.OAUTH_KV.get(FTS_READY_KV_KEY) !== "1"; retry++) {
-      await worker.scheduled({ cron: MAINTENANCE_CRON, scheduledTime: Date.now() + (retry + 1) * 86400000 } as ScheduledEvent, rawEnv, ctx2);
+      await worker.scheduled({ cron: MAINTENANCE_CRON, scheduledTime: MAINTENANCE_TIME + (retry + 2) * 86400000 } as ScheduledEvent, rawEnv, ctx2);
       await drain2();
     }
     expect(await rawEnv.OAUTH_KV.get(FTS_READY_KV_KEY)).toBe("1");
@@ -627,7 +630,7 @@ describe("same-row content drift heals within ceil(N/window) nights (FIX 2 end t
     ).run();
 
     const { ctx, drain } = makeCtx();
-    await worker.scheduled({ cron: MAINTENANCE_CRON } as ScheduledEvent, rawEnv, ctx);
+    await worker.scheduled({ cron: MAINTENANCE_CRON, scheduledTime: MAINTENANCE_TIME } as ScheduledEvent, rawEnv, ctx);
     await drain();
 
     const shadowOf = (id: string) => (d1.db.prepare(
@@ -636,7 +639,7 @@ describe("same-row content drift heals within ceil(N/window) nights (FIX 2 end t
     expect((await shadowOf("e1"))?.content).toBe("fresh violet 1"); // healed the same night
     expect((await shadowOf("e2"))?.content).toBe("fresh violet 2"); // neighbors untouched
     for (let retry = 0; retry < 3 && await rawEnv.OAUTH_KV.get(FTS_READY_KV_KEY) !== "1"; retry++) {
-      await worker.scheduled({ cron: MAINTENANCE_CRON, scheduledTime: Date.now() + (retry + 1) * 86400000 } as ScheduledEvent, rawEnv, ctx);
+      await worker.scheduled({ cron: MAINTENANCE_CRON, scheduledTime: MAINTENANCE_TIME + (retry + 1) * 86400000 } as ScheduledEvent, rawEnv, ctx);
       await drain();
     }
     expect(await rawEnv.OAUTH_KV.get(FTS_READY_KV_KEY)).toBe("1"); // healed in place, no backfill reset
